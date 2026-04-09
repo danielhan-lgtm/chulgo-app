@@ -1,0 +1,15 @@
+config.json
+__pycache__/
+*.pyc
+.env
+*.xlsx
+*.xls
+.claude/
+.gemini/
+.config/
+.firebaserc
+firebase.json
+public/
+Dockerfile
+entrypoint.sh
+배포방법.md

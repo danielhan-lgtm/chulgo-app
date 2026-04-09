@@ -929,6 +929,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 DEFAULT_MASTER = r"C:\Users\User\OneDrive\Desktop\업무\AI 실험\박스 히어로 마스터 파일.xlsx"
+# 서버 환경에서는 로컬 마스터 파일 없음 — 사이드바 업로드로 대체
+if not os.path.exists(DEFAULT_MASTER):
+    DEFAULT_MASTER = ""
 
 # ── 리셀러 가드 ────────────────────────────────────────────────
 _RG_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard", "data")

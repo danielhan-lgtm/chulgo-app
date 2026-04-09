@@ -26,13 +26,23 @@ GMAIL_SENDERS = ["inn1246919@nate.com", "gy.lee12@cj.net", "lgl10910@lglpartner.
 
 
 def load_config() -> dict:
+    cfg = {}
+    # 로컬: config.json 파일에서 읽기
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
         except Exception:
             pass
-    return {}
+    # 서버(Streamlit Cloud): st.secrets에서 읽기 (config.json 없을 때 보완)
+    try:
+        for key in ["api_token", "slack_token", "selected_location_id",
+                    "selected_location_name", "gmail_client_id", "gmail_client_secret"]:
+            if key not in cfg and key in st.secrets:
+                cfg[key] = st.secrets[key]
+    except Exception:
+        pass
+    return cfg
 
 
 def save_config(data: dict):

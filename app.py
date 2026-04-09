@@ -40,6 +40,17 @@ def load_config() -> dict:
                     "selected_location_name", "gmail_client_id", "gmail_client_secret"]:
             if key not in cfg and key in st.secrets:
                 cfg[key] = st.secrets[key]
+        # gmail_token (중첩 구조)
+        if "gmail_token" not in cfg and "gmail_token" in st.secrets:
+            gt = st.secrets["gmail_token"]
+            cfg["gmail_token"] = {
+                "token":         gt.get("token", ""),
+                "refresh_token": gt.get("refresh_token", ""),
+                "token_uri":     gt.get("token_uri", "https://oauth2.googleapis.com/token"),
+                "client_id":     gt.get("client_id", ""),
+                "client_secret": gt.get("client_secret", ""),
+                "scopes":        list(gt.get("scopes", ["https://www.googleapis.com/auth/gmail.readonly"])),
+            }
     except Exception:
         pass
     return cfg

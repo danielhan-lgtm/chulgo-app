@@ -11,12 +11,23 @@ import email.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 from rapidfuzz import fuzz
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
+
+# 무거운 패키지는 지연 로딩 (시작 메모리 절약)
+def _get_slack():
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+    return WebClient, SlackApiError
+
+WebClient, SlackApiError = _get_slack()
+
+def _get_google():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google_auth_oauthlib.flow import Flow
+    from googleapiclient.discovery import build
+    return Credentials, GoogleAuthRequest, Flow, build
+
+Credentials, GoogleAuthRequest, Flow, build = _get_google()
 
 BASE_URL = "https://rest.boxhero-app.com"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")

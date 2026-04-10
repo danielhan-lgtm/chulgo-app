@@ -44,6 +44,8 @@ if debug_p == "not_in_channel":
     </div>""", unsafe_allow_html=True)
     if st.button("🔗 채널 참여 시도", key="try_join_channel", type="primary"):
         try:
+            from slack_sdk import WebClient
+            from slack_sdk.errors import SlackApiError
             _jclient = WebClient(token=slack_token_p)
             _jclient.conversations_join(channel=channel_id_p)
             st.session_state.pop("sb_slack_orders", None)
@@ -224,6 +226,8 @@ with detail_col:
     def _toggle_reaction(emoji_name: str):
         """이미 달린 reaction이면 제거, 없으면 추가"""
         try:
+            from slack_sdk import WebClient
+            from slack_sdk.errors import SlackApiError
             _rc = WebClient(token=_sl_tk_p)
             existing = [r["name"] for r in order_p.get("reactions", [])]
             if emoji_name in existing:

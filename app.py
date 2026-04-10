@@ -1,7 +1,7 @@
 import streamlit as st
 from utils import (
     load_config, save_config, fetch_locations, fetch_all_items, add_log,
-    post_transaction, WebClient, SlackApiError, GMAIL_SENDERS,
+    post_transaction, _get_slack, GMAIL_SENDERS,
     gmail_auth_url, gmail_exchange_code, APP_CSS, DEFAULT_MASTER,
 )
 from urllib.parse import urlparse, parse_qs
@@ -38,6 +38,7 @@ if "config_loaded" not in st.session_state:
     _sl_token = _cfg.get("slack_token", "")
     if _sl_token and "slack_token" not in st.session_state:
         try:
+            WebClient, SlackApiError = _get_slack()
             _sl_client = WebClient(token=_sl_token)
             _sl_chs = {}
             _sl_cur = None
@@ -189,6 +190,7 @@ with st.sidebar:
         slack_connect_btn = st.button("🔗 연결", use_container_width=True, key="slack_connect")
         if slack_connect_btn and slack_token:
             try:
+                WebClient, SlackApiError = _get_slack()
                 client = WebClient(token=slack_token)
                 channels = {}
                 cursor = None
@@ -214,6 +216,7 @@ with st.sidebar:
         if st.session_state.get("slack_token"):
             if not st.session_state.get("slack_channels"):
                 try:
+                    WebClient, SlackApiError = _get_slack()
                     _client = WebClient(token=st.session_state["slack_token"])
                     _chs = {}
                     _cur = None

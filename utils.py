@@ -12,13 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 from rapidfuzz import fuzz
 
-# 무거운 패키지는 지연 로딩 (시작 메모리 절약)
+# 무거운 패키지는 실제 사용 시점에만 로딩
 def _get_slack():
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
     return WebClient, SlackApiError
-
-WebClient, SlackApiError = _get_slack()
 
 def _get_google():
     from google.oauth2.credentials import Credentials
@@ -26,8 +24,6 @@ def _get_google():
     from google_auth_oauthlib.flow import Flow
     from googleapiclient.discovery import build
     return Credentials, GoogleAuthRequest, Flow, build
-
-Credentials, GoogleAuthRequest, Flow, build = _get_google()
 
 BASE_URL = "https://rest.boxhero-app.com"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -232,6 +228,7 @@ def parse_order_message(text: str) -> dict:
 
 def fetch_slack_orders(token: str, channel_id: str) -> tuple[list[dict], str]:
     """채널에서 출고 요청 메시지 목록 반환. (orders, debug_msg) 반환"""
+    WebClient, SlackApiError = _get_slack()
     client = WebClient(token=token)
     orders = []
     debug = ""
@@ -364,7 +361,8 @@ def render_slack_loader(file_key: str) -> bytes | None:
 
 # ── Gmail ────────────────────────────────────────────────────
 
-def gmail_build_flow(client_id: str, client_secret: str) -> "Flow":
+def gmail_build_flow(client_id: str, client_secret: str):
+    _, _, Flow, _ = _get_google()
     client_config = {
         "installed": {
             "client_id": client_id,
@@ -405,6 +403,7 @@ def gmail_exchange_code(code: str) -> dict:
 
 
 def gmail_get_service(token_info: dict):
+    Credentials, GoogleAuthRequest, _, build = _get_google()
     expiry = None
     if token_info.get("expiry"):
         try:

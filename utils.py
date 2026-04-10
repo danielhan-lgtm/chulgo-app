@@ -672,7 +672,7 @@ def render_api_send_section(output_df: pd.DataFrame, memo_key: str):
                 return
 
             payload = {
-                "type": "out",
+                "type": "sale",
                 "to_location_id": int(from_loc_id),
                 "items": items_payload,
                 "memo": memo or "",

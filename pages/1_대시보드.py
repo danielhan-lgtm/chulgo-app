@@ -1,6 +1,7 @@
 import streamlit as st
 import datetime
 from utils import *
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 bh_ok     = bool(st.session_state.get("api_token"))
 slack_ok  = bool(st.session_state.get("slack_token"))

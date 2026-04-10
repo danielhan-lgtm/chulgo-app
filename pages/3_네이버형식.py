@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from utils import *
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 # 플로우 바
 has_naver = bool(st.session_state.get("naver_results") or st.session_state.get("naver_unmatched"))

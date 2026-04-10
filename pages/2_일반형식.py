@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from utils import *
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 has_g = bool(st.session_state.get("results") or st.session_state.get("unmatched"))
 has_staged_g = bool(st.session_state.get("general_staged_df") is not None)

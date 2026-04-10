@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from utils import *
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 slack_token_p = st.session_state.get("slack_token")
 channel_id_p  = st.session_state.get("slack_channel_id")

@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 from utils import *
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 gmail_token_p = st.session_state.get("gmail_token")
 

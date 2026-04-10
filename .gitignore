@@ -13,3 +13,4 @@ public/
 Dockerfile
 entrypoint.sh
 배포방법.md
+*.bat

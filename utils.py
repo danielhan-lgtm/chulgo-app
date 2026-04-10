@@ -49,6 +49,7 @@ def load_config() -> dict:
                     "selected_location_name", "gmail_client_id", "gmail_client_secret"]:
             if key not in cfg and key in st.secrets:
                 cfg[key] = st.secrets[key]
+        # Streamlit Cloud: [gmail_token] TOML 섹션
         if "gmail_token" not in cfg and "gmail_token" in st.secrets:
             gt = st.secrets["gmail_token"]
             cfg["gmail_token"] = {
@@ -58,6 +59,22 @@ def load_config() -> dict:
                 "client_id":     gt.get("client_id", ""),
                 "client_secret": gt.get("client_secret", ""),
                 "scopes":        list(gt.get("scopes", ["https://www.googleapis.com/auth/gmail.readonly"])),
+            }
+        # Hugging Face Spaces: gmail_token__key 개별 환경변수
+        if "gmail_token" not in cfg and "gmail_token__refresh_token" in st.secrets:
+            import json as _json
+            scopes_raw = st.secrets.get("gmail_token__scopes", '["https://www.googleapis.com/auth/gmail.readonly"]')
+            try:
+                scopes = _json.loads(scopes_raw)
+            except Exception:
+                scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+            cfg["gmail_token"] = {
+                "token":         st.secrets.get("gmail_token__token", ""),
+                "refresh_token": st.secrets.get("gmail_token__refresh_token", ""),
+                "token_uri":     st.secrets.get("gmail_token__token_uri", "https://oauth2.googleapis.com/token"),
+                "client_id":     st.secrets.get("gmail_token__client_id", ""),
+                "client_secret": st.secrets.get("gmail_token__client_secret", ""),
+                "scopes":        scopes,
             }
     except Exception:
         pass

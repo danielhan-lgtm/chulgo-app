@@ -438,10 +438,21 @@ def gmail_get_service(token_info: dict):
         expiry=expiry,
     )
     if (creds.expired or not creds.valid) and creds.refresh_token:
-        creds.refresh(GoogleAuthRequest())
+        try:
+            import requests as _req
+            _session = _req.Session()
+            _session.request = lambda method, url, **kwargs: _req.Session.request(
+                _session, method, url, timeout=kwargs.pop("timeout", 15), **kwargs
+            )
+            creds.refresh(GoogleAuthRequest(_session))
+        except Exception:
+            creds.refresh(GoogleAuthRequest())
         token_info["token"] = creds.token
         token_info["expiry"] = creds.expiry.isoformat() if creds.expiry else None
-        save_config({"gmail_token": token_info})
+        try:
+            save_config({"gmail_token": token_info})
+        except Exception:
+            pass
         st.session_state["gmail_token"] = token_info
     return build("gmail", "v1", credentials=creds)
 
@@ -465,7 +476,7 @@ def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
     try:
         service = gmail_get_service(token_info)
         result = service.users().messages().list(
-            userId="me", q=query, maxResults=30
+            userId="me", q=query, maxResults=20
         ).execute()
         messages = result.get("messages", [])
         debug = f"총 {len(messages)}개 메일 조회됨"
@@ -503,11 +514,11 @@ def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
                 "files":   excel_files,
             }
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(_fetch_one, m): m for m in messages}
-            for fut in as_completed(futures):
+            for fut in as_completed(futures, timeout=30):
                 try:
-                    orders.append(fut.result())
+                    orders.append(fut.result(timeout=10))
                 except Exception:
                     pass
 

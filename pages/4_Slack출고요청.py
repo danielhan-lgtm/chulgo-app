@@ -457,13 +457,27 @@ with detail_col:
                             use_container_width=True, hide_index=True,
                             height=min(60 + len(_map_df_s) * 38, 400),
                             column_config={
-                                "원본 상품명": st.column_config.TextColumn("원본 상품명", disabled=True, width="medium"),
-                                "수량":        st.column_config.NumberColumn("수량", disabled=True, width="small"),
+                                "원본 상품명": st.column_config.TextColumn("원본 상품명 (수정 가능)", width="medium"),
+                                "수량":        st.column_config.NumberColumn("수량", width="small"),
                                 "마스터 매핑": st.column_config.SelectboxColumn("마스터 매핑 (클릭해서 변경)", options=_all_mnames, width="large"),
                                 "유사도":      st.column_config.TextColumn("유사도", disabled=True, width="small"),
                             },
                             key=f"slack_map_editor_{sel_idx_p}_{fi}",
                         )
+                        if st.button("🔍 수정된 상품명으로 재매핑", key=f"remap_s_{sel_idx_p}_{fi}"):
+                            _nnames2 = list(_mlookup.keys())
+                            _new_map = []
+                            for _, _rr2 in _edited_map_s.iterrows():
+                                _best2, _score2 = best_match(str(_rr2["원본 상품명"]), _nnames2)
+                                _ok2 = _score2 >= _thresh_s
+                                _new_map.append({
+                                    "원본 상품명": _rr2["원본 상품명"],
+                                    "수량": _rr2["수량"],
+                                    "마스터 매핑": _mlookup[_best2][2] if _ok2 else "(건너뜀)",
+                                    "유사도": f"{_score2}%" if _ok2 else f"{_score2}% ❌",
+                                })
+                            st.session_state[_map_key] = _new_map
+                            st.rerun()
                         _results_s = []
                         for _ri, _rrow in _edited_map_s.iterrows():
                             _ch = _rrow["마스터 매핑"]; _qty_s = _raw_map_s[_ri]["수량"]

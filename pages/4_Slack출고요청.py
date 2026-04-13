@@ -399,7 +399,11 @@ with detail_col:
                                 st.error(f"네이버 파일 오류: {_ex}")
                         else:
                             try:
-                                _odf = pd.read_excel(io.BytesIO(_preview_bytes))
+                                # 시트 목록 조회
+                                _xf = pd.ExcelFile(io.BytesIO(_preview_bytes))
+                                _sheets = _xf.sheet_names
+                                _sheet_sel = st.selectbox("📋 시트 선택", _sheets, key=f"sheet_{sel_idx_p}_{fi}")
+                                _odf = pd.read_excel(io.BytesIO(_preview_bytes), sheet_name=_sheet_sel)
                                 _ocols = list(_odf.columns)
                                 # 컬럼 자동 감지
                                 _nc_auto = next((c for c in _ocols if str(c).strip() == "상품명"), None) or \

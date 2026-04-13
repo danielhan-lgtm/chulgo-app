@@ -403,6 +403,7 @@ with detail_col:
                                 _ocols = list(_odf.columns)
                                 _nc = next((c for c in _ocols if "상품명" in c or "name" in c.lower()), _ocols[0])
                                 _qc = next((c for c in _ocols if "수량" in c or "qty" in c.lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
+                                _odf[_qc] = pd.to_numeric(_odf[_qc], errors='coerce').fillna(1)
                                 _grp = _odf.groupby(_nc)[_qc].sum().reset_index().rename(columns={_nc:"상품명",_qc:"수량"})
                                 _nnames = list(_mlookup.keys())
                                 _prog_s = st.progress(0, text="매칭 중...")
@@ -410,9 +411,13 @@ with detail_col:
                                     _best, _score = best_match(_rr["상품명"], _nnames)
                                     _ok = _score >= _thresh_s
                                     _matched_name = _mlookup[_best][2] if _ok else "(건너뜀)"
-                                    _raw_map_s.append({"원본 상품명": _rr["상품명"], "수량": int(_rr["수량"]),
-                                                        "마스터 매핑": _matched_name,
-                                                        "유사도": f"{_score}%" if _ok else f"{_score}% ❌"})
+                                    try:
+                                        _qty_val = int(float(str(_rr["수량"]).replace(',',''))) if pd.notna(_rr["수량"]) else 1
+                                    except (ValueError, TypeError):
+                                        _qty_val = 1
+                                    _raw_map_s.append({"원본 상품명": _rr["상품명"], "수량": _qty_val,
+                                                       "마스터 매핑": _matched_name,
+                                                       "유사도": f"{_score}%" if _ok else f"{_score}% ❌"})
                                     _prog_s.progress((_ii+1)/len(_grp))
                                 _prog_s.empty()
                             except Exception as _ex:

@@ -375,12 +375,10 @@ with detail_col:
                     _map_key = f"slack_map_{sel_idx_p}_{fi}"
 
                     if _fmt == "🛒 네이버":
-                        # 네이버: 변환 시작 버튼 하나로 즉시 매핑
                         _run_s = st.button("🔄 변환 시작", type="primary",
                                            use_container_width=True, key=f"run_s_{sel_idx_p}_{fi}")
-                        _need_rerun_n = False
                         if _run_s:
-                            _raw_map_s = []
+                            _raw_map_s_new = []
                             try:
                                 _ndf, _n2s = load_naver(io.BytesIO(_preview_bytes))
                                 _prog_s = st.progress(0, text="변환 중...")
@@ -391,24 +389,20 @@ with detail_col:
                                     except: _qty_s = 0
                                     _matched_name = next((v[2] for v in _mlookup.values() if v[0] == _sku_s), "(건너뜀)")
                                     _ok = not _sku_s.startswith("UNKNOWN")
-                                    _raw_map_s.append({"원본 상품명": _rr["상품명"], "수량": _qty_s,
+                                    _raw_map_s_new.append({"원본 상품명": _rr["상품명"], "수량": _qty_s,
                                                         "마스터 매핑": _matched_name if _ok else "(건너뜀)",
                                                         "유사도": "✅" if _ok else "❌"})
                                     _prog_s.progress((_ii+1)/len(_rows_s))
                                 _prog_s.empty()
                             except Exception as _ex:
                                 st.error(f"네이버 파일 오류: {_ex}")
-                            if _raw_map_s:
-                                st.session_state[_map_key] = _raw_map_s
+                            if _raw_map_s_new:
+                                st.session_state[_map_key] = _raw_map_s_new
                                 st.session_state.pop(_staged_key, None)
-                                _need_rerun_n = True
                             else:
                                 st.warning("매칭된 항목이 없습니다.")
-                        if _need_rerun_n:
-                            st.rerun()
                     else:
-                        # 일반: 시트·컬럼 선택 UI는 항상 표시 (rerun해도 유지)
-                        _need_rerun_g = False
+                        # 일반: 시트·컬럼 선택 UI는 항상 표시
                         try:
                             _xf = pd.ExcelFile(io.BytesIO(_preview_bytes))
                             _sheets = _xf.sheet_names
@@ -419,7 +413,6 @@ with detail_col:
                                        next((c for c in _ocols if "상품명" in str(c) or "품명" in str(c) or "제품명" in str(c)), _ocols[0])
                             _qc_auto = next((c for c in _ocols if str(c).strip() == "수량"), None) or \
                                        next((c for c in _ocols if "수량" in str(c) or "qty" in str(c).lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
-                            # 시트명을 키에 포함 → 시트 바뀌면 새 selectbox로 초기화
                             _safe_sheet = str(_sheet_sel).replace(" ", "_")[:30]
                             _nc_key = f"nc_{sel_idx_p}_{fi}_{_safe_sheet}"
                             _qc_key = f"qc_{sel_idx_p}_{fi}_{_safe_sheet}"
@@ -435,7 +428,7 @@ with detail_col:
                                 st.write("")
                                 _do_map = st.button("▶ 매핑 시작", key=f"domap_{sel_idx_p}_{fi}", type="primary", use_container_width=True)
                             if _do_map:
-                                _raw_map_s = []
+                                _raw_map_s_new = []
                                 _odf[_qc] = pd.to_numeric(_odf[_qc], errors='coerce').fillna(1)
                                 _grp = _odf.groupby(_nc)[_qc].sum().reset_index().rename(columns={_nc:"상품명",_qc:"수량"})
                                 _nnames = list(_mlookup.keys())
@@ -448,24 +441,20 @@ with detail_col:
                                         _qty_val = int(float(str(_rr["수량"]).replace(',',''))) if pd.notna(_rr["수량"]) else 1
                                     except (ValueError, TypeError):
                                         _qty_val = 1
-                                    _raw_map_s.append({"원본 상품명": _rr["상품명"], "수량": _qty_val,
+                                    _raw_map_s_new.append({"원본 상품명": _rr["상품명"], "수량": _qty_val,
                                                        "마스터 매핑": _matched_name,
                                                        "유사도": f"{_score}%" if _ok else f"{_score}% ❌"})
                                     _prog_s.progress((_ii+1)/len(_grp))
                                 _prog_s.empty()
-                                if _raw_map_s:
-                                    st.session_state[_map_key] = _raw_map_s
+                                if _raw_map_s_new:
+                                    st.session_state[_map_key] = _raw_map_s_new
                                     st.session_state.pop(_staged_key, None)
-                                    _need_rerun_g = True
                                 else:
                                     st.warning("매칭된 항목이 없습니다. 임계값을 낮추거나 양식을 확인해주세요.")
                         except Exception as _ex:
                             st.error(f"파일 오류: {_ex}")
-                        # st.rerun()은 try/except 밖에서 호출 (안에서 호출 시 예외가 catch됨)
-                        if _need_rerun_g:
-                            st.rerun()
 
-                    # ── 매핑 확인 테이블
+                    # ── 매핑 확인 테이블 (rerun 없이 같은 패스에서 바로 렌더링)
                     _raw_map_s = st.session_state.get(_map_key)
                     if _raw_map_s:
                         _all_mnames = ["(건너뜀)"] + [v[2] for v in _mlookup.values()]

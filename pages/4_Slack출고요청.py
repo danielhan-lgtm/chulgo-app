@@ -401,17 +401,25 @@ with detail_col:
                             try:
                                 _odf = pd.read_excel(io.BytesIO(_preview_bytes))
                                 _ocols = list(_odf.columns)
-                                # 상품명 컬럼: 정확히 "상품명" 우선, 그 다음 포함 검색
+                                # 컬럼 자동 감지
                                 _nc_auto = next((c for c in _ocols if str(c).strip() == "상품명"), None) or \
                                            next((c for c in _ocols if "상품명" in str(c) or "품명" in str(c) or "제품명" in str(c)), _ocols[0])
-                                # 수량 컬럼: 정확히 "수량" 우선
                                 _qc_auto = next((c for c in _ocols if str(c).strip() == "수량"), None) or \
                                            next((c for c in _ocols if "수량" in str(c) or "qty" in str(c).lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
-                                _col1, _col2 = st.columns(2)
+                                # 파일 미리보기
+                                st.dataframe(_odf.head(3), use_container_width=True, hide_index=True)
+                                st.caption("📌 아래에서 올바른 컬럼을 선택한 후 매핑 시작 버튼을 누르세요.")
+                                _col1, _col2, _col3 = st.columns([2, 2, 1])
                                 with _col1:
-                                    _nc = st.selectbox("상품명 컬럼 선택", _ocols, index=_ocols.index(_nc_auto), key=f"nc_{sel_idx_p}_{fi}")
+                                    _nc = st.selectbox("📦 상품명 컬럼", _ocols, index=_ocols.index(_nc_auto), key=f"nc_{sel_idx_p}_{fi}")
                                 with _col2:
-                                    _qc = st.selectbox("수량 컬럼 선택", _ocols, index=_ocols.index(_qc_auto), key=f"qc_{sel_idx_p}_{fi}")
+                                    _qc = st.selectbox("🔢 수량 컬럼", _ocols, index=_ocols.index(_qc_auto), key=f"qc_{sel_idx_p}_{fi}")
+                                with _col3:
+                                    st.write("")
+                                    st.write("")
+                                    _do_map = st.button("▶ 매핑 시작", key=f"domap_{sel_idx_p}_{fi}", type="primary", use_container_width=True)
+                                if not _do_map:
+                                    st.stop()
                                 _odf[_qc] = pd.to_numeric(_odf[_qc], errors='coerce').fillna(1)
                                 _grp = _odf.groupby(_nc)[_qc].sum().reset_index().rename(columns={_nc:"상품명",_qc:"수량"})
                                 _nnames = list(_mlookup.keys())

@@ -399,6 +399,7 @@ with detail_col:
                             if _raw_map_s_new:
                                 st.session_state[_map_key] = _raw_map_s_new
                                 st.session_state.pop(_staged_key, None)
+                                st.session_state.pop(f"slack_map_editor_{sel_idx_p}_{fi}", None)
                             else:
                                 st.warning("매칭된 항목이 없습니다.")
                     else:
@@ -449,6 +450,8 @@ with detail_col:
                                 if _raw_map_s_new:
                                     st.session_state[_map_key] = _raw_map_s_new
                                     st.session_state.pop(_staged_key, None)
+                                    # data_editor 이전 상태 제거 (stale 인덱스 충돌 방지)
+                                    st.session_state.pop(f"slack_map_editor_{sel_idx_p}_{fi}", None)
                                 else:
                                     st.warning("매칭된 항목이 없습니다. 임계값을 낮추거나 양식을 확인해주세요.")
                         except Exception as _ex:
@@ -495,7 +498,7 @@ with detail_col:
                             st.rerun()
                         _results_s = []
                         for _ri, _rrow in _edited_map_s.iterrows():
-                            _ch = _rrow["마스터 매핑"]; _qty_s = _raw_map_s[_ri]["수량"]
+                            _ch = _rrow["마스터 매핑"]; _qty_s = int(_rrow.get("수량", 1))
                             if _ch and _ch != "(건너뜀)":
                                 for _sv, _pv, _ov in _mlookup.values():
                                     if _ov == _ch:

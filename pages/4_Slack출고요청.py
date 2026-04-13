@@ -401,8 +401,17 @@ with detail_col:
                             try:
                                 _odf = pd.read_excel(io.BytesIO(_preview_bytes))
                                 _ocols = list(_odf.columns)
-                                _nc = next((c for c in _ocols if "상품명" in c or "name" in c.lower()), _ocols[0])
-                                _qc = next((c for c in _ocols if "수량" in c or "qty" in c.lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
+                                # 상품명 컬럼: 정확히 "상품명" 우선, 그 다음 포함 검색
+                                _nc_auto = next((c for c in _ocols if str(c).strip() == "상품명"), None) or \
+                                           next((c for c in _ocols if "상품명" in str(c) or "품명" in str(c) or "제품명" in str(c)), _ocols[0])
+                                # 수량 컬럼: 정확히 "수량" 우선
+                                _qc_auto = next((c for c in _ocols if str(c).strip() == "수량"), None) or \
+                                           next((c for c in _ocols if "수량" in str(c) or "qty" in str(c).lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
+                                _col1, _col2 = st.columns(2)
+                                with _col1:
+                                    _nc = st.selectbox("상품명 컬럼 선택", _ocols, index=_ocols.index(_nc_auto), key=f"nc_{sel_idx_p}_{fi}")
+                                with _col2:
+                                    _qc = st.selectbox("수량 컬럼 선택", _ocols, index=_ocols.index(_qc_auto), key=f"qc_{sel_idx_p}_{fi}")
                                 _odf[_qc] = pd.to_numeric(_odf[_qc], errors='coerce').fillna(1)
                                 _grp = _odf.groupby(_nc)[_qc].sum().reset_index().rename(columns={_nc:"상품명",_qc:"수량"})
                                 _nnames = list(_mlookup.keys())

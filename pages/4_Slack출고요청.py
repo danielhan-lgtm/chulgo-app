@@ -378,6 +378,7 @@ with detail_col:
                         # 네이버: 변환 시작 버튼 하나로 즉시 매핑
                         _run_s = st.button("🔄 변환 시작", type="primary",
                                            use_container_width=True, key=f"run_s_{sel_idx_p}_{fi}")
+                        _need_rerun_n = False
                         if _run_s:
                             _raw_map_s = []
                             try:
@@ -400,11 +401,14 @@ with detail_col:
                             if _raw_map_s:
                                 st.session_state[_map_key] = _raw_map_s
                                 st.session_state.pop(_staged_key, None)
-                                st.rerun()
+                                _need_rerun_n = True
                             else:
                                 st.warning("매칭된 항목이 없습니다.")
+                        if _need_rerun_n:
+                            st.rerun()
                     else:
                         # 일반: 시트·컬럼 선택 UI는 항상 표시 (rerun해도 유지)
+                        _need_rerun_g = False
                         try:
                             _xf = pd.ExcelFile(io.BytesIO(_preview_bytes))
                             _sheets = _xf.sheet_names
@@ -452,11 +456,14 @@ with detail_col:
                                 if _raw_map_s:
                                     st.session_state[_map_key] = _raw_map_s
                                     st.session_state.pop(_staged_key, None)
-                                    st.rerun()
+                                    _need_rerun_g = True
                                 else:
                                     st.warning("매칭된 항목이 없습니다. 임계값을 낮추거나 양식을 확인해주세요.")
                         except Exception as _ex:
                             st.error(f"파일 오류: {_ex}")
+                        # st.rerun()은 try/except 밖에서 호출 (안에서 호출 시 예외가 catch됨)
+                        if _need_rerun_g:
+                            st.rerun()
 
                     # ── 매핑 확인 테이블
                     _raw_map_s = st.session_state.get(_map_key)

@@ -379,7 +379,7 @@ with st.sidebar:
                     st.error("전송할 항목이 없습니다.")
                 else:
                     _payload = {
-                        "type": "sale",
+                        "type": "out",
                         "to_location_id": int(_from_loc_sb),
                         "items": items_payload,
                         "memo": _sb_memo or "",

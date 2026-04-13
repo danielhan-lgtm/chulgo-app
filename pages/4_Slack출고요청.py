@@ -371,14 +371,15 @@ with detail_col:
                     _detail_key = f"slack_detail_{sel_idx_p}_{fi}"
 
                     st.caption(f"마스터 파일: {len(_mlookup)}개 항목 로드됨 · 파일: {len(_preview_bytes)//1024}KB")
-                    _run_s = st.button("🔄 변환 시작", type="primary",
-                                       use_container_width=True, key=f"run_s_{sel_idx_p}_{fi}")
 
                     _map_key = f"slack_map_{sel_idx_p}_{fi}"
 
-                    if _run_s:
-                        _raw_map_s = []
-                        if _fmt == "🛒 네이버":
+                    if _fmt == "🛒 네이버":
+                        # 네이버: 변환 시작 버튼 하나로 즉시 매핑
+                        _run_s = st.button("🔄 변환 시작", type="primary",
+                                           use_container_width=True, key=f"run_s_{sel_idx_p}_{fi}")
+                        if _run_s:
+                            _raw_map_s = []
                             try:
                                 _ndf, _n2s = load_naver(io.BytesIO(_preview_bytes))
                                 _prog_s = st.progress(0, text="변환 중...")
@@ -388,7 +389,6 @@ with detail_col:
                                     try: _qty_s = int(float(_rr["수량"])) if pd.notna(_rr["수량"]) else 0
                                     except: _qty_s = 0
                                     _matched_name = next((v[2] for v in _mlookup.values() if v[0] == _sku_s), "(건너뜀)")
-                                    _price_s = next((v[1] for v in _mlookup.values() if v[0] == _sku_s), "")
                                     _ok = not _sku_s.startswith("UNKNOWN")
                                     _raw_map_s.append({"원본 상품명": _rr["상품명"], "수량": _qty_s,
                                                         "마스터 매핑": _matched_name if _ok else "(건너뜀)",
@@ -397,33 +397,41 @@ with detail_col:
                                 _prog_s.empty()
                             except Exception as _ex:
                                 st.error(f"네이버 파일 오류: {_ex}")
-                        else:
-                            try:
-                                # 시트 목록 조회
-                                _xf = pd.ExcelFile(io.BytesIO(_preview_bytes))
-                                _sheets = _xf.sheet_names
-                                _sheet_sel = st.selectbox("📋 시트 선택", _sheets, key=f"sheet_{sel_idx_p}_{fi}")
-                                _odf = pd.read_excel(io.BytesIO(_preview_bytes), sheet_name=_sheet_sel)
-                                _ocols = list(_odf.columns)
-                                # 컬럼 자동 감지
-                                _nc_auto = next((c for c in _ocols if str(c).strip() == "상품명"), None) or \
-                                           next((c for c in _ocols if "상품명" in str(c) or "품명" in str(c) or "제품명" in str(c)), _ocols[0])
-                                _qc_auto = next((c for c in _ocols if str(c).strip() == "수량"), None) or \
-                                           next((c for c in _ocols if "수량" in str(c) or "qty" in str(c).lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
-                                # 파일 미리보기
-                                st.dataframe(_odf.head(3), use_container_width=True, hide_index=True)
-                                st.caption("📌 아래에서 올바른 컬럼을 선택한 후 매핑 시작 버튼을 누르세요.")
-                                _col1, _col2, _col3 = st.columns([2, 2, 1])
-                                with _col1:
-                                    _nc = st.selectbox("📦 상품명 컬럼", _ocols, index=_ocols.index(_nc_auto), key=f"nc_{sel_idx_p}_{fi}")
-                                with _col2:
-                                    _qc = st.selectbox("🔢 수량 컬럼", _ocols, index=_ocols.index(_qc_auto), key=f"qc_{sel_idx_p}_{fi}")
-                                with _col3:
-                                    st.write("")
-                                    st.write("")
-                                    _do_map = st.button("▶ 매핑 시작", key=f"domap_{sel_idx_p}_{fi}", type="primary", use_container_width=True)
-                                if not _do_map:
-                                    st.stop()
+                            if _raw_map_s:
+                                st.session_state[_map_key] = _raw_map_s
+                                st.session_state.pop(_staged_key, None)
+                                st.rerun()
+                            else:
+                                st.warning("매칭된 항목이 없습니다.")
+                    else:
+                        # 일반: 시트·컬럼 선택 UI는 항상 표시 (rerun해도 유지)
+                        try:
+                            _xf = pd.ExcelFile(io.BytesIO(_preview_bytes))
+                            _sheets = _xf.sheet_names
+                            _sheet_sel = st.selectbox("📋 시트 선택", _sheets, key=f"sheet_{sel_idx_p}_{fi}")
+                            _odf = pd.read_excel(io.BytesIO(_preview_bytes), sheet_name=_sheet_sel)
+                            _ocols = list(_odf.columns)
+                            _nc_auto = next((c for c in _ocols if str(c).strip() == "상품명"), None) or \
+                                       next((c for c in _ocols if "상품명" in str(c) or "품명" in str(c) or "제품명" in str(c)), _ocols[0])
+                            _qc_auto = next((c for c in _ocols if str(c).strip() == "수량"), None) or \
+                                       next((c for c in _ocols if "수량" in str(c) or "qty" in str(c).lower()), _ocols[1] if len(_ocols)>1 else _ocols[0])
+                            # 시트명을 키에 포함 → 시트 바뀌면 새 selectbox로 초기화
+                            _safe_sheet = str(_sheet_sel).replace(" ", "_")[:30]
+                            _nc_key = f"nc_{sel_idx_p}_{fi}_{_safe_sheet}"
+                            _qc_key = f"qc_{sel_idx_p}_{fi}_{_safe_sheet}"
+                            st.dataframe(_odf.head(3), use_container_width=True, hide_index=True)
+                            st.caption("📌 올바른 컬럼을 선택한 후 매핑 시작 버튼을 누르세요.")
+                            _col1, _col2, _col3 = st.columns([2, 2, 1])
+                            with _col1:
+                                _nc = st.selectbox("📦 상품명 컬럼", _ocols, index=_ocols.index(_nc_auto), key=_nc_key)
+                            with _col2:
+                                _qc = st.selectbox("🔢 수량 컬럼", _ocols, index=_ocols.index(_qc_auto), key=_qc_key)
+                            with _col3:
+                                st.write("")
+                                st.write("")
+                                _do_map = st.button("▶ 매핑 시작", key=f"domap_{sel_idx_p}_{fi}", type="primary", use_container_width=True)
+                            if _do_map:
+                                _raw_map_s = []
                                 _odf[_qc] = pd.to_numeric(_odf[_qc], errors='coerce').fillna(1)
                                 _grp = _odf.groupby(_nc)[_qc].sum().reset_index().rename(columns={_nc:"상품명",_qc:"수량"})
                                 _nnames = list(_mlookup.keys())
@@ -441,15 +449,14 @@ with detail_col:
                                                        "유사도": f"{_score}%" if _ok else f"{_score}% ❌"})
                                     _prog_s.progress((_ii+1)/len(_grp))
                                 _prog_s.empty()
-                            except Exception as _ex:
-                                st.error(f"파일 오류: {_ex}")
-
-                        if _raw_map_s:
-                            st.session_state[_map_key] = _raw_map_s
-                            st.session_state.pop(_staged_key, None)
-                            st.rerun()
-                        else:
-                            st.warning("매칭된 항목이 없습니다. 임계값을 낮추거나 양식을 확인해주세요.")
+                                if _raw_map_s:
+                                    st.session_state[_map_key] = _raw_map_s
+                                    st.session_state.pop(_staged_key, None)
+                                    st.rerun()
+                                else:
+                                    st.warning("매칭된 항목이 없습니다. 임계값을 낮추거나 양식을 확인해주세요.")
+                        except Exception as _ex:
+                            st.error(f"파일 오류: {_ex}")
 
                     # ── 매핑 확인 테이블
                     _raw_map_s = st.session_state.get(_map_key)

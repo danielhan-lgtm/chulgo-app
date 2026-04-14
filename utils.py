@@ -470,6 +470,7 @@ def _extract_gmail_parts(payload: dict) -> list:
     return parts
 
 
+@st.cache_data(ttl=180, show_spinner=False, hash_funcs={dict: lambda d: json.dumps(d, sort_keys=True)})
 def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
     """3개 발신자에서 온 메일 목록 반환. 메시지 상세를 병렬로 조회해 속도 개선."""
     query = " OR ".join(f"from:{s}" for s in GMAIL_SENDERS)
@@ -478,7 +479,7 @@ def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
     try:
         service = gmail_get_service(token_info)
         result = service.users().messages().list(
-            userId="me", q=query, maxResults=20
+            userId="me", q=query, maxResults=10
         ).execute()
         messages = result.get("messages", [])
         debug = f"총 {len(messages)}개 메일 조회됨"
@@ -546,6 +547,7 @@ def render_gmail_loader(file_key: str) -> bytes | None:
 
     with st.expander("📧 Gmail 출고 요청에서 불러오기", expanded=False):
         if st.button("🔄 목록 새로고침", key=f"gmail_refresh_{file_key}"):
+            fetch_gmail_orders.clear()
             st.session_state.pop(f"gmail_orders_{file_key}", None)
 
         if f"gmail_orders_{file_key}" not in st.session_state:

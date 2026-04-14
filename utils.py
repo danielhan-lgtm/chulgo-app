@@ -29,7 +29,7 @@ BASE_URL = "https://rest.boxhero-app.com"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-GMAIL_SENDERS = ["inn1246919@nate.com", "gy.lee12@cj.net", "lgl10910@lglpartner.com"]
+GMAIL_SENDERS = ["inn1246919@nate.com", "gy.lee12@cj.net", "lgl10910@lglpartner.com", "wonkyoung.hwang@cj.net"]
 
 DEFAULT_MASTER = r"C:\Users\User\OneDrive\Desktop\업무\AI 실험\박스 히어로 마스터 파일.xlsx"
 if not os.path.exists(DEFAULT_MASTER):

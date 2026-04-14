@@ -9,7 +9,6 @@ import requests
 import base64
 import email.utils
 import functools
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 from rapidfuzz import fuzz
 
@@ -472,7 +471,7 @@ def _extract_gmail_parts(payload: dict) -> list:
 
 @st.cache_data(ttl=180, show_spinner=False, hash_funcs={dict: lambda d: json.dumps(d, sort_keys=True)})
 def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
-    """3개 발신자에서 온 메일 목록 반환. 메시지 상세를 병렬로 조회해 속도 개선."""
+    """3개 발신자에서 온 메일 목록 반환. Batch API로 한 번에 조회."""
     query = " OR ".join(f"from:{s}" for s in GMAIL_SENDERS)
     orders = []
     debug = ""
@@ -484,11 +483,28 @@ def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
         messages = result.get("messages", [])
         debug = f"총 {len(messages)}개 메일 조회됨"
 
-        def _fetch_one(msg_ref):
-            msg = service.users().messages().get(
-                userId="me", id=msg_ref["id"], format="full",
-                fields="id,payload"
-            ).execute()
+        if not messages:
+            return orders, debug
+
+        # Batch API: 여러 get 요청을 1번 HTTP 요청으로 묶어 처리
+        raw_msgs = {}
+
+        def _batch_callback(request_id, response, exception=None):
+            if response:
+                raw_msgs[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_batch_callback)
+        for m in messages:
+            batch.add(
+                service.users().messages().get(
+                    userId="me", id=m["id"], format="full",
+                    fields="id,payload"
+                ),
+                request_id=m["id"]
+            )
+        batch.execute()
+
+        def _parse_msg(msg_id, msg):
             headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
             subject  = headers.get("Subject", "(제목 없음)")
             sender   = headers.get("From", "")
@@ -507,23 +523,21 @@ def fetch_gmail_orders(token_info: dict) -> tuple[list[dict], str]:
                         excel_files.append({
                             "name": filename,
                             "attachment_id": att_id,
-                            "message_id": msg_ref["id"],
+                            "message_id": msg_id,
                         })
             return {
-                "id":      msg_ref["id"],
+                "id":      msg_id,
                 "dt":      dt,
                 "subject": subject,
                 "sender":  sender,
                 "files":   excel_files,
             }
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(_fetch_one, m): m for m in messages}
-            for fut in as_completed(futures, timeout=30):
-                try:
-                    orders.append(fut.result(timeout=10))
-                except Exception:
-                    pass
+        for msg_id, msg in raw_msgs.items():
+            try:
+                orders.append(_parse_msg(msg_id, msg))
+            except Exception:
+                pass
 
         orders.sort(key=lambda x: x["dt"], reverse=True)
     except Exception as e:

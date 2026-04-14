@@ -260,8 +260,7 @@ def fetch_slack_orders(token: str, channel_id: str) -> tuple[list[dict], str]:
                 f.get("name", "").endswith((".xlsx", ".xls"))
                 for f in msg.get("files", [])
             )
-            _keywords = ("출고", "픽업", "픽업요청", "출고요청", "발주")
-            if not any(kw in text for kw in _keywords) and not has_excel:
+            if not text.strip() and not has_excel and not msg.get("files"):
                 continue
             excel_files = [
                 {

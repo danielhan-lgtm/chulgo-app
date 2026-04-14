@@ -8,6 +8,7 @@ import datetime
 import requests
 import base64
 import email.utils
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 from rapidfuzz import fuzz
@@ -243,6 +244,7 @@ def parse_order_message(text: str) -> dict:
     return info
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_slack_orders(token: str, channel_id: str) -> tuple[list[dict], str]:
     """채널에서 출고 요청 메시지 목록 반환. (orders, debug_msg) 반환"""
     WebClient, SlackApiError = _get_slack()
@@ -906,6 +908,7 @@ def analyze_reseller(raw_bytes: bytes) -> tuple[pd.DataFrame, dict]:
     return df, stats
 
 
+@functools.lru_cache(maxsize=4096)
 def normalize(text: str) -> str:
     text = str(text)
     text = re.sub(r"\[.*?\]", "", text)

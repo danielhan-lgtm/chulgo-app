@@ -14,6 +14,7 @@ if not gmail_token_p:
 hdr_c1, hdr_c2 = st.columns([5, 1])
 with hdr_c2:
     if st.button("🔄 새로고침", key="gmail_page_refresh", use_container_width=True):
+        fetch_gmail_orders.clear()
         st.session_state.pop("gm_orders", None)
 
 st.caption(f"조회 대상: {' · '.join(GMAIL_SENDERS)}")

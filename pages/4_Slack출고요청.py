@@ -19,6 +19,7 @@ if not channel_id_p:
 hdr_c1, hdr_c2 = st.columns([5, 1])
 with hdr_c2:
     if st.button("🔄 새로고침", key="slack_page_refresh", use_container_width=True):
+        fetch_slack_orders.clear()
         st.session_state.pop("sb_slack_orders", None)
 
 # 현재 선택된 채널 표시

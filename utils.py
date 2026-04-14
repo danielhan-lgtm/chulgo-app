@@ -312,7 +312,8 @@ def render_slack_loader(file_key: str) -> bytes | None:
 
     with st.expander("📨 Slack 출고 요청에서 불러오기", expanded=False):
         if st.button("🔄 목록 새로고침", key=f"slack_refresh_{file_key}"):
-            st.session_state[f"slack_orders_{file_key}"], st.session_state[f"slack_debug_{file_key}"] = fetch_slack_orders(slack_token, channel_id)
+            fetch_slack_orders.clear()
+            st.session_state.pop(f"slack_orders_{file_key}", None)
 
         if f"slack_orders_{file_key}" not in st.session_state:
             with st.spinner("Slack 메시지 불러오는 중..."):

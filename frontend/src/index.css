@@ -1,0 +1,158 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Inter', 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif;
+  background: #f8f9fb;
+  color: #111827;
+  font-size: 14px;
+}
+
+#root {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+/* Ant Design overrides */
+.ant-layout { background: #f8f9fb !important; }
+.ant-layout-sider { background: #0f1117 !important; }
+.ant-menu { background: transparent !important; border: none !important; }
+.ant-menu-item { color: #9ca3af !important; border-radius: 8px !important; margin: 2px 8px !important; }
+.ant-menu-item:hover { background: #1a1d27 !important; color: #f3f4f6 !important; }
+.ant-menu-item-selected { background: #1a1d27 !important; color: #10b981 !important; }
+.ant-card { border-radius: 14px !important; border: 1px solid #e5e7eb !important; box-shadow: 0 1px 3px rgba(0,0,0,0.04) !important; }
+.ant-table-thead > tr > th { background: #f9fafb !important; font-weight: 600 !important; font-size: 0.78rem !important; }
+
+/* Page content area */
+.page-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  background: #f8f9fb;
+}
+
+.page-header { margin-bottom: 20px; }
+.page-title { font-size: 1.5rem; font-weight: 800; color: #111827; letter-spacing: -0.5px; margin: 0; }
+.page-desc { font-size: 0.82rem; color: #6b7280; margin: 4px 0 0 0; }
+
+/* Pipeline nodes */
+.pipe-wrap {
+  display: flex;
+  align-items: center;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 14px 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.pipe-node { flex: 1; text-align: center; }
+.pipe-arrow { color: #d1d5db; font-size: 1.3rem; margin: 0 6px; flex-shrink: 0; }
+.pipe-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+.pipe-dot.on { background: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,0.2); }
+.pipe-dot.off { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,0.2); }
+
+/* Flow bar */
+.flow-bar {
+  display: flex;
+  align-items: center;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 10px 18px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.flow-step { display: flex; align-items: center; gap: 7px; flex: 1; }
+.flow-num {
+  background: #10b981; color: #fff; border-radius: 50%;
+  width: 22px; height: 22px; font-size: 0.72rem; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.flow-num.pending { background: #e5e7eb; color: #9ca3af; }
+.flow-label { font-size: 0.82rem; font-weight: 600; color: #374151; white-space: nowrap; }
+.flow-arrow-sm { color: #d1d5db; font-size: 1.1rem; margin: 0 8px; flex-shrink: 0; }
+
+/* Stat boxes */
+.stat-box { border-radius: 10px; padding: 12px; text-align: center; border: 1px solid transparent; }
+.stat-box .stat-value { font-size: 1.8rem; font-weight: 800; line-height: 1; }
+.stat-box .stat-label { font-size: 0.72rem; font-weight: 600; margin-top: 4px; opacity: 0.8; }
+
+/* Log items */
+.log-item { border-radius: 10px; padding: 9px 13px; margin-bottom: 5px; border: 1px solid; }
+.log-success { background: #ecfdf5; border-color: #a7f3d0; }
+.log-error { background: #fef2f2; border-color: #fecaca; }
+.log-warning { background: #fffbeb; border-color: #fde68a; }
+.log-info { background: #eff6ff; border-color: #bfdbfe; }
+
+/* 거래명세서 품목 편집 테이블 — 입력 필드 글씨 흰색 강제 */
+.invoice-item-table .ant-input,
+.invoice-item-table .ant-input-number-input {
+  color: #f3f4f6 !important;
+  background: #2a2d3e !important;
+}
+.invoice-item-table .ant-input::placeholder,
+.invoice-item-table .ant-input-number-input::placeholder {
+  color: #6b7280 !important;
+}
+.invoice-item-table .ant-input-number {
+  background: #2a2d3e !important;
+  border-color: #4b5563 !important;
+}
+.invoice-item-table .ant-input-number:hover,
+.invoice-item-table .ant-input-number:focus-within {
+  border-color: #10b981 !important;
+}
+.invoice-item-table .ant-input:hover,
+.invoice-item-table .ant-input:focus {
+  border-color: #10b981 !important;
+}
+.invoice-item-table .ant-table-tbody > tr > td {
+  background: #1a1d27 !important;
+  border-color: #2e2f45 !important;
+}
+.invoice-item-table .ant-table-thead > tr > th {
+  background: #0f1117 !important;
+  color: #9ca3af !important;
+  border-color: #2e2f45 !important;
+}
+.invoice-item-table .ant-table {
+  background: transparent !important;
+}
+
+/* Settings 섹션 스타일 */
+.settings-section {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.settings-section-title {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #374151;
+  margin-bottom: 14px;
+}
+
+/* Metric card */
+.metric-card {
+  background: #fff; border-radius: 14px; border: 1px solid #e5e7eb;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  padding: 18px; position: relative; overflow: hidden;
+}
+.metric-icon {
+  position: absolute; top: 16px; right: 16px;
+  width: 38px; height: 38px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; font-size: 1.1rem;
+}

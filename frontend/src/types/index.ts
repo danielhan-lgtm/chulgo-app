@@ -8,6 +8,11 @@ export interface AppConfig {
   gmail_token?: GmailToken
   ourbox_id?: string
   ourbox_pw?: string
+  ourbox_access_key?: string
+  ourbox_secret_key?: string
+  claude_api_key?: string
+  gemini_api_key?: string
+  groq_api_key?: string
 }
 
 export interface GmailToken {
@@ -104,7 +109,54 @@ export interface LogEntry {
   source?: string
 }
 
-export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'receiving' | 'docreview' | 'invoice' | 'settings'
+export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'receiving' | 'docreview' | 'invoice' | 'reconcile' | 'channel' | 'mapping' | 'settings'
+
+export interface ReconcileRow {
+  period: string
+  tx_type: 'in' | 'out' | 'adjustment'
+  sku: string
+  channel?: string
+  name: string
+  bh_qty: number | null
+  ob_qty: number | null
+  status: 'ok' | 'mismatch' | 'bh_only' | 'ob_only'
+  matched_confirmed?: boolean  // 입고매칭 확정으로 수량 보정된 행
+}
+
+export interface ReconcileSummary {
+  total: number
+  ok: number
+  mismatch: number
+  bh_only: number
+  ob_only: number
+}
+
+export interface ReconcileResult {
+  summary: {
+    in: ReconcileSummary
+    out: ReconcileSummary
+    adjustment: ReconcileSummary
+    total: ReconcileSummary
+  }
+  rows: ReconcileRow[]
+  has_ourbox: boolean
+  errors: string[]
+  period: string
+  from_date: string
+  to_date: string
+  mapping_applied?: number
+  filtered_locations?: number[]
+  mode?: 'period' | 'cumulative' | 'total'
+  by_channel?: boolean
+  data_counts?: {
+    bh: { in: number; out: number; adj: number }
+    ob: { in: number; out: number; adj: number }
+  }
+  unmapped_products?: {
+    bh_only: string[]
+    ob_only: string[]
+  }
+}
 
 // ─── 거래명세서 ───────────────────────────────────────────────────────────────
 

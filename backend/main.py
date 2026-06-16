@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice
+from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping
 
 app = FastAPI(title="출고 라몬 API", version="2.0.0")
 
@@ -25,6 +25,9 @@ app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(receiving.router, prefix="/api/receiving", tags=["receiving"])
 app.include_router(doc_review.router, prefix="/api/doc-review", tags=["doc-review"])
 app.include_router(invoice.router, prefix="/api/invoice", tags=["invoice"])
+app.include_router(reconcile.router, prefix="/api/reconcile", tags=["reconcile"])
+app.include_router(channel.router, prefix="/api/channel", tags=["channel"])
+app.include_router(mapping.router, prefix="/api/mapping", tags=["mapping"])
 
 
 @app.get("/")

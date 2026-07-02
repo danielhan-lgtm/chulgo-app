@@ -25,3 +25,6 @@ resp_tmp.json
 test_*.json
 fm_debug.json
 uvicorn*.log
+
+# 거래처 데이터 (개인정보 — 커밋 금지)
+backend/customers.json

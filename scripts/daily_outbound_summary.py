@@ -26,10 +26,22 @@ MARKER = "박스히어로 출고 정리"
 
 
 def _bh_get(token: str, path: str, params: dict = None) -> dict:
-    r = requests.get(f"{BH}{path}", headers={"Authorization": f"Bearer {token}"},
-                     params=params or {}, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    """BoxHero GET — 429/5xx는 지수 백오프로 재시도 (Retry-After 존중)."""
+    import time
+    last = None
+    for attempt in range(6):
+        r = requests.get(f"{BH}{path}", headers={"Authorization": f"Bearer {token}"},
+                         params=params or {}, timeout=20)
+        if r.status_code == 429 or r.status_code >= 500:
+            wait = float(r.headers.get("Retry-After") or 2.0 * (2 ** attempt))
+            print(f"WARN: BH {r.status_code} — retry in {wait:.0f}s (attempt {attempt + 1}/6)")
+            time.sleep(min(wait, 120))
+            last = r
+            continue
+        r.raise_for_status()
+        time.sleep(0.3)  # 페이지/거래 조회 사이 완충 — 429 예방
+        return r.json()
+    last.raise_for_status()
 
 
 def _fetch_tx_items(token: str, tx_id) -> list:
@@ -177,6 +189,14 @@ def main():
         print("--- dry run preview ---")
         print(msg)
         return
+
+    # 데이터 수집에 시간이 걸리므로 포스팅 직전 한 번 더 중복 확인 (동시 실행 대비)
+    try:
+        if already_posted_today(slack_token, channel_id, today):
+            print("posted by another run while gathering — skip")
+            return
+    except Exception:
+        pass
 
     res = _slack(slack_token, "chat.postMessage", http="post", channel=channel_id, text=msg)
     print(f"posted ts={res.get('ts')}")

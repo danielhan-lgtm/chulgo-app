@@ -25,6 +25,18 @@ KST = timezone(timedelta(hours=9))
 MARKER = "박스히어로 출고 정리"
 
 
+def _kst_date(ts: str) -> str:
+    """BoxHero 타임스탬프는 UTC('...Z') — KST 날짜로 변환해 비교해야
+    KST 새벽 0~9시 처리분(UTC로는 전날)이 누락되지 않는다."""
+    try:
+        dt = datetime.fromisoformat((ts or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST).strftime("%Y-%m-%d")
+    except Exception:
+        return (ts or "")[:10]
+
+
 def _bh_get(token: str, path: str, params: dict = None) -> dict:
     """BoxHero GET — 429/5xx는 지수 백오프로 재시도 (Retry-After 존중)."""
     import time
@@ -68,13 +80,13 @@ def gather_today_out(token: str, today: str):
         data = _bh_get(token, "/v1/location-txs", params)
         got = 0
         for tx in data.get("items", []):
-            created = (tx.get("created_at", "") or "")[:10]
+            created = _kst_date(tx.get("created_at", ""))
             if created != today:
                 continue
             got += 1
             txcount += 1
             partner = (tx.get("partner") or {}).get("name", "") or "(거래처 미지정)"
-            out_date = (tx.get("transaction_time", "") or "")[:10]
+            out_date = _kst_date(tx.get("transaction_time", ""))
             for it in _fetch_tx_items(token, tx.get("id")):
                 key = (partner, it["sku"] or it["name"], out_date)
                 a = agg.setdefault(key, {"partner": partner, "name": it["name"],

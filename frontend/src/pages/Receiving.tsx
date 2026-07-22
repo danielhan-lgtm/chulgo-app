@@ -5,7 +5,7 @@ import type { ReceivingRecord, ReceivingItem, ProductMapping, BoxheroItem, AppCo
 import {
   getReceivings, approveReceiving, cancelReceiving, ignoreReceiving,
   syncReceiving, getSyncStatus, getMappings, saveMapping, autoMap,
-  deleteMapping, getBoxheroItemsForReceiving,
+  deleteMapping, getBoxheroItemsForReceiving, getOurboxProductsForReceiving,
 } from '../services/api'
 
 interface Props { config: AppConfig }
@@ -95,8 +95,25 @@ export default function Receiving({ config }: Props) {
     setSyncing(true)
     try {
       const res = await syncReceiving()
-      message.info(res.message)
-      setTimeout(loadRecords, 2000)
+      if (res.already) {
+        message.info(res.message)
+      }
+      // 완료까지 2초 간격 폴링 (아워박스 로그인 포함 15초~1분 소요, 최대 3분 대기)
+      for (let i = 0; i < 90; i++) {
+        await new Promise(r => setTimeout(r, 2000))
+        const s = await getSyncStatus()
+        setSyncStatus(s)
+        if (s.status !== 'syncing') {
+          if (s.status === 'error') {
+            message.error('동기화 실패: ' + (s.lastSyncError || '알 수 없는 오류'), 8)
+          } else {
+            const n = (s as any).lastNewCount
+            message.success(n != null ? `✅ 동기화 완료 — 신규 입고 ${n}건` : '✅ 동기화 완료')
+            await loadRecords()
+          }
+          break
+        }
+      }
     } catch (e: any) {
       message.error('동기화 실패: ' + (e.response?.data?.detail || e.message))
     } finally {
@@ -186,11 +203,17 @@ export default function Receiving({ config }: Props) {
     } finally {
       setMappingLoading(false)
     }
+    // 아워박스 상품은 스크래핑 기반이라 느릴 수 있어 별도 로드 (실패해도 매핑/박스히어로는 표시)
+    try {
+      setOurboxProds(await getOurboxProductsForReceiving())
+    } catch (e: any) {
+      message.warning('아워박스 상품 로드 실패: ' + (e.response?.data?.detail || e.message))
+    }
   }
 
   function switchTab(key: TabKey) {
     setTab(key)
-    if (key === 'mapping' && bhItems.length === 0) loadMappingPage()
+    if (key === 'mapping' && (bhItems.length === 0 || ourboxProds.length === 0)) loadMappingPage()
   }
 
   async function handleSaveMapping() {
@@ -243,6 +266,10 @@ export default function Receiving({ config }: Props) {
   const filteredBh = bhItems.filter(i =>
     !searchBh || (i.name || '').toLowerCase().includes(searchBh.toLowerCase()) || (i.sku || '').includes(searchBh)
   ).slice(0, 100)
+
+  // 이미 매핑된 상품 집합 (양쪽 목록에 "연결됨" 표시용)
+  const mappedOurboxCds = new Set(mappings.map(m => m.ourbox_prod_cd))
+  const mappedBhIds = new Set(mappings.map(m => m.boxhero_item_id))
 
   // ─── UI ────────────────────────────────────────────────────────────────────
   return (
@@ -446,16 +473,19 @@ export default function Receiving({ config }: Props) {
                     <div style={itemListStyle}>
                       {filteredOurbox.length === 0
                         ? <div style={{ padding: 12, textAlign: 'center', color: '#7f8c8d' }}>검색 결과 없음</div>
-                        : filteredOurbox.map(p => (
+                        : filteredOurbox.map(p => {
+                          const linked = mappedOurboxCds.has(p.prod_cd)
+                          return (
                           <div
                             key={p.prod_cd}
-                            onClick={() => setSelOurbox(prev => prev?.prod_cd === p.prod_cd ? null : p)}
-                            style={{ ...itemRowStyle, background: selOurbox?.prod_cd === p.prod_cd ? '#d6eaf8' : undefined }}
+                            onClick={() => setSelOurbox((prev: typeof p | null) => prev?.prod_cd === p.prod_cd ? null : p)}
+                            style={{ ...itemRowStyle, background: selOurbox?.prod_cd === p.prod_cd ? '#d6eaf8' : linked ? '#f6fff8' : undefined }}
                           >
-                            <span>{p.sale_prod_nm || ''}</span>
+                            <span>{linked && <span style={linkedBadgeStyle}>✅ 연결됨</span>}{p.sale_prod_nm || ''}</span>
                             <span style={{ color: '#7f8c8d', fontSize: 11, marginLeft: 8 }}>{p.prod_cd}</span>
                           </div>
-                        ))
+                          )
+                        })
                       }
                     </div>
                   </div>
@@ -471,16 +501,19 @@ export default function Receiving({ config }: Props) {
                     <div style={itemListStyle}>
                       {filteredBh.length === 0
                         ? <div style={{ padding: 12, textAlign: 'center', color: '#7f8c8d' }}>검색 결과 없음</div>
-                        : filteredBh.map(i => (
+                        : filteredBh.map(i => {
+                          const linked = mappedBhIds.has(i.id)
+                          return (
                           <div
                             key={i.id}
                             onClick={() => setSelBh(prev => prev?.id === i.id ? null : i)}
-                            style={{ ...itemRowStyle, background: selBh?.id === i.id ? '#d6eaf8' : undefined }}
+                            style={{ ...itemRowStyle, background: selBh?.id === i.id ? '#d6eaf8' : linked ? '#f6fff8' : undefined }}
                           >
-                            <span>{i.name}</span>
+                            <span>{linked && <span style={linkedBadgeStyle}>✅ 연결됨</span>}{i.name}</span>
                             <span style={{ color: '#7f8c8d', fontSize: 11, marginLeft: 8 }}>{i.sku || ''}</span>
                           </div>
-                        ))
+                          )
+                        })
                       }
                     </div>
                   </div>
@@ -662,3 +695,4 @@ const panelTitleStyle: React.CSSProperties = { fontSize: 15, margin: 0, color: '
 const itemListStyle: React.CSSProperties = { maxHeight: 400, overflowY: 'auto', border: '1px solid #e9ecef', borderRadius: 6 }
 const itemRowStyle: React.CSSProperties = { padding: '9px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #f0f0f0', cursor: 'pointer', fontSize: 13, transition: 'background 0.1s' }
 const miniInputStyle: React.CSSProperties = { width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 6, fontSize: 13 }
+const linkedBadgeStyle: React.CSSProperties = { fontSize: 10, color: '#27ae60', background: '#d4edda', borderRadius: 4, padding: '1px 5px', marginRight: 6, fontWeight: 600 }

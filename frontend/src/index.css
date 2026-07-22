@@ -156,3 +156,7 @@ html, body {
   width: 38px; height: 38px; border-radius: 10px;
   display: flex; align-items: center; justify-content: center; font-size: 1.1rem;
 }
+
+/* 크로스 타입 매칭 행 (BH 유형 ≠ OB 유형) 강조 */
+.row-cross-type td { background: #fffbeb !important; }
+.row-cross-type:hover td { background: #fef3c7 !important; }

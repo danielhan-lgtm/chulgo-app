@@ -13,6 +13,9 @@ export interface AppConfig {
   claude_api_key?: string
   gemini_api_key?: string
   groq_api_key?: string
+  slack_outbound_notify?: boolean
+  slack_outbound_channel?: string
+  bh_notify_time?: string
 }
 
 export interface GmailToken {
@@ -109,7 +112,7 @@ export interface LogEntry {
   source?: string
 }
 
-export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'receiving' | 'docreview' | 'invoice' | 'reconcile' | 'channel' | 'mapping' | 'settings'
+export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'oborders' | 'receiving' | 'docreview' | 'invoice' | 'reconcile' | 'channel' | 'mapping' | 'orderplan' | 'disposal' | 'expiry' | 'coupangload' | 'coupanggrowthload' | 'kurlylabel' | 'outbound' | 'settings'
 
 export interface ReconcileRow {
   period: string
@@ -121,7 +124,34 @@ export interface ReconcileRow {
   ob_qty: number | null
   status: 'ok' | 'mismatch' | 'bh_only' | 'ob_only'
   matched_confirmed?: boolean  // 입고매칭 확정으로 수량 보정된 행
+  // 원인 자동 분류 (백엔드 _classify_root_causes)
+  root_cause?: RootCause
+  fix_target?: 'BH' | 'OB' | 'MAPPING' | 'REVIEW' | 'NONE' | ''
+  fix_hint?: string
+  // 반자동 수정안 (백엔드 _build_correction)
+  correction?: {
+    system: 'BH' | 'OB' | 'MAPPING' | 'REVIEW' | 'NONE'
+    op: 'in' | 'out' | 'adjust' | 'map' | 'review'
+    qty: number
+    action: string
+    copy_text: string
+  }
+  // 행 단위 정리(전산정리) 상태 (백엔드 reconcile_status 조인)
+  cleanup_status?: 'reviewing' | 'resolved' | 'hold' | 'ignore'
+  cleanup_memo?: string
+  cleanup_assignee?: string
+  cleanup_updated_at?: string
 }
+
+export type RootCause =
+  | 'ok'
+  | 'adj_initial'
+  | 'set_bom'
+  | 'timing'
+  | 'product_unmapped'
+  | 'channel_unmapped'
+  | 'qty_mismatch'
+  | 'true_missing'
 
 export interface ReconcileSummary {
   total: number
@@ -156,6 +186,8 @@ export interface ReconcileResult {
     bh_only: string[]
     ob_only: string[]
   }
+  root_cause_summary?: Record<string, { count: number; label: string }>
+  cleanup_counts?: Record<string, number>
 }
 
 // ─── 거래명세서 ───────────────────────────────────────────────────────────────

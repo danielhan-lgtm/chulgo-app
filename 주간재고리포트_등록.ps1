@@ -10,8 +10,8 @@ $ErrorActionPreference = "Stop"
 $BackendUrl  = "http://localhost:8081"
 $LocationIds = "228640"          # 아워박스 호법
 $TaskName    = "BH_OB_주간재고리포트"
-$RunTime     = "09:00"           # 월요일 실행 시각
-$TokenFile   = Join-Path $PSScriptRoot "backend\data\config.json"
+$RunTime     = "11:00"           # 월요일 실행 시각
+$TokenFile   = Join-Path $PSScriptRoot "config.json"   # 토큰은 루트 config.json에 있음
 
 # ── 호출 스크립트 본문 (스케줄러가 실행할 명령) ──────────
 # config.json에서 토큰을 읽어 weekly-report 호출

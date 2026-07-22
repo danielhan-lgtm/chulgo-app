@@ -36,7 +36,15 @@ export default function Settings({
   const [selectedLocation, setSelectedLocation] = useState<number | undefined>(config.selected_location_id)
   const [ourboxId, setOurboxId] = useState(config.ourbox_id || '')
   const [ourboxPw, setOurboxPw] = useState('')
+  const [ourboxAccessKey, setOurboxAccessKey] = useState(config.ourbox_access_key || '')
+  const [ourboxSecretKey, setOurboxSecretKey] = useState(config.ourbox_secret_key || '')
   const [ourboxSaving, setOurboxSaving] = useState(false)
+  const [probeLoading, setProbeLoading] = useState(false)
+  const [probeResult, setProbeResult] = useState<Record<string, unknown> | null>(null)
+  const [claudeApiKey, setClaudeApiKey] = useState(config.claude_api_key || '')
+  const [geminiApiKey, setGeminiApiKey] = useState(config.gemini_api_key || '')
+  const [groqApiKey, setGroqApiKey] = useState(config.groq_api_key || '')
+  const [claudeSaving, setClaudeSaving] = useState(false)
 
   useEffect(() => {
     checkGmailStatus()
@@ -125,13 +133,32 @@ export default function Settings({
     message.info('Gmail 연결 해제')
   }
 
+  async function handleOurboxProbe() {
+    setProbeLoading(true)
+    setProbeResult(null)
+    try {
+      const r = await api.get('/reconcile/probe')
+      setProbeResult(r.data)
+      if (r.data.login) {
+        message.success(`✅ OurBox REST API 로그인 성공! (${r.data.login})`)
+      } else {
+        message.warning('로그인 실패 - errors 확인')
+      }
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } }
+      message.error('API 탐색 실패: ' + (err.response?.data?.detail ?? String(e)))
+    } finally {
+      setProbeLoading(false)
+    }
+  }
+
   async function handleOurboxSave() {
     if (!ourboxId.trim()) return message.warning('아워박스 아이디를 입력하세요')
     if (!ourboxPw.trim()) return message.warning('아워박스 비밀번호를 입력하세요')
     setOurboxSaving(true)
     try {
-      await updateConfig({ ourbox_id: ourboxId.trim(), ourbox_pw: ourboxPw.trim() })
-      onConfigChange({ ourbox_id: ourboxId.trim(), ourbox_pw: ourboxPw.trim() })
+      await updateConfig({ ourbox_id: ourboxId.trim(), ourbox_pw: ourboxPw.trim(), ourbox_access_key: ourboxAccessKey.trim(), ourbox_secret_key: ourboxSecretKey.trim() })
+      onConfigChange({ ourbox_id: ourboxId.trim(), ourbox_pw: ourboxPw.trim(), ourbox_access_key: ourboxAccessKey.trim(), ourbox_secret_key: ourboxSecretKey.trim() })
       message.success('아워박스 정보 저장됨')
       setOurboxPw('')
     } catch (e: any) {
@@ -337,7 +364,7 @@ export default function Settings({
               )}
               <div style={{ fontSize: '0.75rem', color: '#9ca3af' }}>
                 Google Cloud Console에서 OAuth 2.0 클라이언트 ID를 생성하고<br />
-                리다이렉트 URI에 <code>http://localhost:8080/api/gmail/callback</code>을 추가하세요
+                리다이렉트 URI에 <code>http://localhost:8081/api/gmail/callback</code>을 추가하세요
               </div>
             </>
           )}
@@ -369,14 +396,132 @@ export default function Settings({
               onChange={e => setOurboxPw(e.target.value)}
               style={{ flex: 1 }}
             />
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+            <Input.Password
+              placeholder="API ACCESS KEY"
+              value={ourboxAccessKey}
+              onChange={e => setOurboxAccessKey(e.target.value)}
+              style={{ flex: 1 }}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+            <Input.Password
+              placeholder="API SECRET KEY"
+              value={ourboxSecretKey}
+              onChange={e => setOurboxSecretKey(e.target.value)}
+              style={{ flex: 1 }}
+            />
             <Button type="primary" icon={<LinkOutlined />} onClick={handleOurboxSave} loading={ourboxSaving}>저장</Button>
+          </div>
+          <div style={{ fontSize: '0.73rem', color: '#9ca3af', marginBottom: 4 }}>
+            REST API 키: <a href="https://api.ourbox.co.kr/redoc.html" target="_blank" rel="noopener noreferrer">api.ourbox.co.kr</a> 참고.
+            없으면 웹 ID/PW로 로그인 시도.
           </div>
           {config.ourbox_id && (
             <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>저장된 아이디: <strong>{config.ourbox_id}</strong> (비밀번호 변경 시 재입력)</div>
           )}
-          <div style={{ fontSize: '0.75rem', color: '#9ca3af', marginTop: 6 }}>
-            아워박스 로그인 정보 — 입고 정산기 동기화 시 사용됩니다
+          <div style={{ fontSize: '0.75rem', color: '#9ca3af', marginTop: 6, marginBottom: 10 }}>
+            아워박스 로그인 정보 — 입고 정산기 및 재고 대사 동기화 시 사용됩니다
           </div>
+          {config.ourbox_id && (
+            <div>
+              <Button
+                size="small"
+                icon={<LinkOutlined />}
+                onClick={handleOurboxProbe}
+                loading={probeLoading}
+                style={{ marginBottom: 8 }}
+              >
+                REST API 탐색 (로그인 테스트)
+              </Button>
+              {probeResult && (
+                <pre style={{ background: '#f9fafb', borderRadius: 8, padding: 10, fontSize: '0.72rem', overflow: 'auto', maxHeight: 200, marginTop: 4 }}>
+                  {JSON.stringify(probeResult, null, 2)}
+                </pre>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* AI 분석 API Key */}
+        <div className="settings-section">
+          <div className="settings-section-title">
+            🤖 AI 분석 API Key (재고 대사)
+          </div>
+          <div style={{ fontSize: '0.73rem', color: '#6b7280', marginBottom: 10 }}>
+            하나만 입력하면 됩니다. 우선순위: <strong>Gemini (무료)</strong> → Groq (무료) → Claude (유료)
+          </div>
+
+          {/* Gemini */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#374151', marginBottom: 4 }}>
+              🟢 Google Gemini Flash — <span style={{ color: '#10b981', fontWeight: 700 }}>완전 무료</span>
+              &nbsp;<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.72rem' }}>발급하기 →</a>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Input.Password
+                placeholder="AIza... (Google AI Studio에서 발급)"
+                value={geminiApiKey}
+                onChange={e => setGeminiApiKey(e.target.value)}
+                style={{ flex: 1 }}
+              />
+            </div>
+          </div>
+
+          {/* Groq */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#374151', marginBottom: 4 }}>
+              🟡 Groq (LLaMA 3) — <span style={{ color: '#10b981', fontWeight: 700 }}>무료 티어</span>
+              &nbsp;<a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.72rem' }}>발급하기 →</a>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Input.Password
+                placeholder="gsk_... (Groq Console에서 발급)"
+                value={groqApiKey}
+                onChange={e => setGroqApiKey(e.target.value)}
+                style={{ flex: 1 }}
+              />
+            </div>
+          </div>
+
+          {/* Claude */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#374151', marginBottom: 4 }}>
+              🔵 Claude (Anthropic) — 유료
+              &nbsp;<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.72rem' }}>발급하기 →</a>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Input.Password
+                placeholder="sk-ant-api03-..."
+                value={claudeApiKey}
+                onChange={e => setClaudeApiKey(e.target.value)}
+                style={{ flex: 1 }}
+              />
+            </div>
+          </div>
+
+          <Button
+            type="primary"
+            loading={claudeSaving}
+            style={{ marginTop: 4 }}
+            onClick={async () => {
+              setClaudeSaving(true)
+              await updateConfig({
+                gemini_api_key: geminiApiKey.trim(),
+                groq_api_key: groqApiKey.trim(),
+                claude_api_key: claudeApiKey.trim(),
+              })
+              onConfigChange({
+                gemini_api_key: geminiApiKey.trim(),
+                groq_api_key: groqApiKey.trim(),
+                claude_api_key: claudeApiKey.trim(),
+              })
+              setClaudeSaving(false)
+            }}
+          >
+            저장
+          </Button>
         </div>
 
         {/* 거래명세서 양식 경로 */}

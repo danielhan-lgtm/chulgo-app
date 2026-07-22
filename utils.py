@@ -147,6 +147,46 @@ def post_transaction(token: str, payload: dict) -> dict:
     return r.json()
 
 
+def create_in_transaction(token: str, location_id: int, items: list, memo: str = "", tx_time: str = None) -> dict:
+    """박스히어로 입고(IN) 트랜잭션 생성."""
+    import datetime as _dt
+    payload = {
+        "type": "in",
+        "to_location_id": location_id,
+        "items": items,
+        "memo": memo,
+        "tx_time": tx_time or _dt.datetime.now().isoformat(),
+    }
+    r = requests.post(f"{BASE_URL}/v1/location-txs", headers=api_headers(token), json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def delete_transaction(token: str, tx_id: int) -> dict:
+    """박스히어로 트랜잭션 삭제 (입고 취소)."""
+    r = requests.delete(f"{BASE_URL}/v1/location-txs/{tx_id}", headers=api_headers(token))
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+@st.cache_data(ttl=300)
+def fetch_all_items_list(token: str) -> list:
+    """BoxHero 전체 상품 목록 반환 (id, name, sku 포함)."""
+    items, cursor = [], None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        r = requests.get(f"{BASE_URL}/v1/items", headers=api_headers(token), params=params)
+        r.raise_for_status()
+        data = r.json()
+        items.extend(data.get("items", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("cursor")
+    return items
+
+
 def reaction_to_status(reactions: list[dict]) -> dict | None:
     """Slack reactions → 업무 상태 변환. 가장 의미있는 상태 1개 반환."""
     STATUS_MAP = {

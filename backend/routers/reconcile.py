@@ -1,5 +1,7 @@
 """재고 대사(Reconciliation): 박스히어로 ↔ 아워박스 Mate 입출고·조정 비교 + AI 분석"""
 import sys, os, json, html, re
+import threading as _threading
+import time as _time_mod
 import concurrent.futures
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -40,16 +42,34 @@ def _load_tx_file_cache():
         _tx_file_cache = {}
     _tx_file_cache_loaded = True
 
+_tx_cache_dirty = 0
+_tx_cache_last_flush = 0.0
+_tx_cache_flush_lock = _threading.Lock()
+
+def _flush_tx_file_cache():
+    """메모리 캐시를 파일로 기록. 대량 보강 후엔 명시적으로 호출."""
+    global _tx_cache_dirty, _tx_cache_last_flush
+    with _tx_cache_flush_lock:
+        if not _tx_cache_dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(_TX_CACHE_PATH), exist_ok=True)
+            with open(_TX_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(_tx_file_cache, f, ensure_ascii=False)
+            _tx_cache_dirty = 0
+            _tx_cache_last_flush = _time_mod.time()
+        except Exception:
+            pass
+
 def _save_tx_file_cache_entry(tx_id: int, items: list):
-    """단일 TX 항목을 파일 캐시에 저장 (비동기 없이 즉시 append-flush)."""
-    global _tx_file_cache
+    """단일 TX 항목을 파일 캐시에 저장.
+    항목마다 전체 파일을 재작성하면 수천 건 보강 시 O(n²) 디스크 쓰기가 되므로
+    40건 또는 3초 단위로 모아서 기록 (대량 루프 끝에는 _flush_tx_file_cache 호출)."""
+    global _tx_file_cache, _tx_cache_dirty
     _tx_file_cache[str(tx_id)] = items
-    try:
-        os.makedirs(os.path.dirname(_TX_CACHE_PATH), exist_ok=True)
-        with open(_TX_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(_tx_file_cache, f, ensure_ascii=False)
-    except Exception:
-        pass
+    _tx_cache_dirty += 1
+    if _tx_cache_dirty >= 40 or _time_mod.time() - _tx_cache_last_flush >= 3:
+        _flush_tx_file_cache()
 
 
 # ── 영구 파일 캐시 (OB 수집 데이터) ─────────────────────────────────────────
@@ -112,6 +132,23 @@ def _get_ob_cache(cache_key: str) -> Optional[dict]:
     return None
 
 
+def _ob_month_chunks(from_date: str, to_date: str) -> list:
+    """[from,to]를 (chunk_from, chunk_to) 월 단위로 분해.
+    완결된 달은 청크 키가 날마다 바뀌지 않아 영구 캐시가 재사용된다."""
+    chunks = []
+    cur = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(to_date, "%Y-%m-%d").date()
+    while cur <= end:
+        if cur.month == 12:
+            nxt = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            nxt = cur.replace(month=cur.month + 1, day=1)
+        c_to = min(nxt - timedelta(days=1), end)
+        chunks.append((cur.isoformat(), c_to.isoformat()))
+        cur = nxt
+    return chunks
+
+
 def _fetch_bh_tx_items(token: str, tx_id: int, tx_type: str = "location") -> list:
     """BoxHero 거래 상세 → items 리스트. 목록 API는 헤더만 주므로 상세 조회 필요.
     tx_type='adjust': /v1/txs/{id} (조정 TX), 기타: /v1/location-txs/{id}
@@ -140,10 +177,14 @@ def _fetch_bh_tx_items(token: str, tx_id: int, tx_type: str = "location") -> lis
                 # adjust TX의 items는 quantity가 음수/양수로 방향을 나타냄 — 보존
                 state.bh_tx_items_cache[cache_key] = {"items": items, "ts": _dt_c.datetime.now()}
                 _save_tx_file_cache_entry(cache_key, items)
-                # 위치 정보도 별도 키로 캐시 (in: to_location, out/move: from_location)
-                _loc_obj = _detail.get("to_location") or _detail.get("from_location") or {}
-                if isinstance(_loc_obj, dict) and _loc_obj.get("id"):
-                    _save_tx_file_cache_entry(f"{cache_key}:loc", _loc_obj.get("id"))
+                # 위치 정보도 별도 키로 캐시 — move는 from/to 둘 다 있어 방향 보존 필요
+                _from_obj = _detail.get("from_location") or {}
+                _to_obj = _detail.get("to_location") or {}
+                _from_id = _from_obj.get("id") if isinstance(_from_obj, dict) else None
+                _to_id = _to_obj.get("id") if isinstance(_to_obj, dict) else None
+                if _from_id or _to_id:
+                    _save_tx_file_cache_entry(f"{cache_key}:locft", [_from_id, _to_id])
+                    _save_tx_file_cache_entry(f"{cache_key}:loc", _to_id or _from_id)
                 return items
             if r.status_code == 429:
                 _time2.sleep(2.0 * (attempt + 1))
@@ -154,13 +195,20 @@ def _fetch_bh_tx_items(token: str, tx_id: int, tx_type: str = "location") -> lis
     return []
 
 
-def _get_bh_tx_loc_id(token: str, tx_id: int, tx_type: str = "location"):
-    """BH TX의 위치 id 반환 (in: to_location, out/move: from_location).
+def _get_bh_tx_loc_id(token: str, tx_id: int, tx_type: str = "location", prefer_from: bool = False):
+    """BH TX의 위치 id 반환. in은 to_location, out은 from_location만 있어 자동.
+    move는 from/to 둘 다 있으므로 방향이 중요: prefer_from=True면 출발지(from) 반환
+    (move를 '해당 위치에서 나간 출고'로 필터링할 때 사용).
     캐시에 없으면 상세 1회 조회 (이후 영구 캐시). 실패 시 None."""
     import time as _time3
     _load_tx_file_cache()
+    ft_key = f"{tx_id}:{tx_type}:locft"
+    if ft_key in _tx_file_cache:
+        _ft = _tx_file_cache.get(ft_key) or [None, None]
+        return (_ft[0] or _ft[1]) if prefer_from else (_ft[1] or _ft[0])
     loc_key = f"{tx_id}:{tx_type}:loc"
-    if loc_key in _tx_file_cache:
+    if not prefer_from and loc_key in _tx_file_cache:
+        # 구버전 캐시(to 우선 단일값) — in/out엔 그대로 유효, move 방향 구분엔 사용 불가
         return _tx_file_cache.get(loc_key)
     if tx_type == "adjust":
         endpoint = f"{BH_BASE}/v1/txs/{tx_id}"
@@ -171,10 +219,12 @@ def _get_bh_tx_loc_id(token: str, tx_id: int, tx_type: str = "location"):
             r = _req.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
             if r.ok:
                 _detail = r.json().get("item", {})
-                _loc_obj = _detail.get("to_location") or _detail.get("from_location") or {}
-                _lid = _loc_obj.get("id") if isinstance(_loc_obj, dict) else None
-                _save_tx_file_cache_entry(loc_key, _lid)
-                return _lid
+                _from_obj = _detail.get("from_location") or {}
+                _to_obj = _detail.get("to_location") or {}
+                _from_id = _from_obj.get("id") if isinstance(_from_obj, dict) else None
+                _to_id = _to_obj.get("id") if isinstance(_to_obj, dict) else None
+                _save_tx_file_cache_entry(ft_key, [_from_id, _to_id])
+                return (_from_id or _to_id) if prefer_from else (_to_id or _from_id)
             if r.status_code == 429:
                 _time3.sleep(2.0 * (attempt + 1))
                 continue
@@ -203,6 +253,7 @@ def _enrich_bh_items(token: str, txs: list, tx_type: str = "location") -> None:
                 tx["items"] = result
             elif tx.get("items") is None:
                 tx["items"] = []
+    _flush_tx_file_cache()
 
 
 # ── 드릴다운: 개별 라인아이템 추출 (집계 행 → 원시 거래) ──────────
@@ -342,6 +393,12 @@ ASSEMBLY_CHANNELS: frozenset = frozenset({"전산처리용"})
 # 사장된 OB 상품코드 — 비교 대상에서 완전 제외
 DEPRECATED_OB_CODES: frozenset = frozenset({"P000000000011556"})
 
+# OB 기초재고 일괄입고 전표번호(input_code) — OurBox 도입 시점 재고 초기등록.
+# 매입 입고가 아니라 시스템 전환용 일괄 등록(2026-05-16, 55품목 44만개, status=0 다수)으로
+# BoxHero에는 대응 입고가 없어 입고 비교를 통째로 왜곡함 → 입고 raw에서 제외.
+# (BH는 bh_adj_max_qty로 기초재고 adj를 거르는데, OB 입고엔 대칭 필터가 없어 추가)
+OB_INITIAL_STOCK_INPUT_CODES: frozenset = frozenset({"6496"})
+
 
 def _ob_rec_channel(rec: dict) -> str:
     """OB 원시 레코드에서 채널명 추출 (header/flat 양쪽 대응)."""
@@ -369,9 +426,24 @@ def _ob_rec_prod_cd(rec: dict) -> str:
     return ""
 
 
+def _ob_rec_input_code(rec: dict) -> str:
+    """OB 입고 레코드에서 입고전표번호(input_code) 추출."""
+    if not isinstance(rec, dict):
+        return ""
+    h = rec.get("header", rec)
+    return str(h.get("input_code") or "").strip()
+
+
 def _filter_deprecated(raw: list) -> list:
     """사장된 OB 상품코드 레코드를 제거."""
     return [r for r in raw if _ob_rec_prod_cd(r) not in DEPRECATED_OB_CODES]
+
+
+def _filter_initial_stock(raw: list) -> list:
+    """기초재고 일괄입고(OurBox 도입 초기 재고등록) 전표 레코드를 제거. 입고에만 적용."""
+    if not OB_INITIAL_STOCK_INPUT_CODES:
+        return raw
+    return [r for r in raw if _ob_rec_input_code(r) not in OB_INITIAL_STOCK_INPUT_CODES]
 
 
 def _route_ob_assembly(in_raw: list, out_raw: list, adj_raw: list) -> tuple:
@@ -860,20 +932,24 @@ def _norm_ob_auto(raw: list, period: str, source: str, tx_type: str, ch_resolver
         grouped: dict = defaultdict(lambda: {"name": "", "qty": 0})
 
         def _process_item(item: dict, dt: datetime, channel_raw: str = ""):
-            # stock_status=0 → 입고예정/미처리/취소 → 집계 제외
-            # stock_status=1 또는 필드 없음 → 입고완료 → 포함
-            _ss = str(item.get("stock_status", "1")).strip()
-            if _ss == "0":
-                return
+            # ⚠ stock_status=0 컷 제거 — 실데이터 검증 결과 stock_status=0도 정상 입고(78건/101건, 77%)
+            # 6/17 팝타임 입고 20,184처럼 명백한 정상 거래가 status=0로 와 누락되던 버그
+            # OurBox stock_status 의미가 데이터마다 일관되지 않아 컷이 오히려 위험
 
             code_k = _find_key(item, code_candidates)
             name_k = _find_key(item, name_candidates)
             qty_k  = _find_key(item, qty_candidates)
             if not code_k and not qty_k:
                 return
-            prod_cd = str(item.get(code_k, "UNKNOWN")).strip() if code_k else "UNKNOWN"
+            # 키 존재해도 값이 None일 수 있음 → "None" 문자열로 묶이는 버그 방지
+            # (예: 6/17 팝타임 입고 20,184처럼 OB가 product_code를 누락한 데이터)
+            _raw_cd = item.get(code_k) if code_k else None
+            prod_cd = str(_raw_cd).strip() if _raw_cd not in (None, "", "None") else ""
             prod_nm = html.unescape(str(item.get(name_k, "")).strip()) if name_k else ""
             qty = abs(int(float(item.get(qty_k, 0) or 0))) if qty_k else 0
+            # 코드 없으면 이름 기반 폴백 (안 그러면 코드 없는 모든 OB 거래가 한 그룹으로 묶여 사라짐)
+            if not prod_cd:
+                prod_cd = ("NM:" + prod_nm) if prod_nm else "UNKNOWN"
             if ch_resolver is not None:
                 channel = ch_resolver(channel_raw)
                 item_key = f"{prod_cd}{CH_SEP}{channel}"
@@ -1195,25 +1271,78 @@ def _build_channel_resolvers():
         members[root]["ob"].add(p["ob_channel"])
         members[root]["bh"].add(p["bh_keyword"])
 
+    # ── 정규화: 날짜·공백·특수문자 제거(소문자), '&'는 변별용으로 보존 ──
+    def _norm_ch(s: str) -> str:
+        s = html.unescape(str(s or ""))
+        s = re.sub(r'\d+\s*월\s*\d+\s*일?', ' ', s)
+        s = re.sub(r'\d{2,4}[-./]\d{1,2}([-./]\d{1,2})?', ' ', s)
+        return re.sub(r'[\s\-_·•\[\]()（）#,]', '', s).lower()
+
+    # 채널 변별력 없는 흔한 토큰 (이것만으로는 채널 구분 불가)
+    _STOP_CH = {"스마트스토어", "스마트", "스토어", "홈쇼핑", "도착보장", "네이버",
+                "미리주문", "본방", "택배", "대리점", "무상", "주문", "출고", "처리"}
+
+    def _tokens(s: str) -> list:
+        s = html.unescape(str(s or ""))
+        s = re.sub(r'\d+\s*월\s*\d+\s*일?', ' ', s)
+        s = re.sub(r'\d{2,4}[-./]\d{1,2}([-./]\d{1,2})?', ' ', s)
+        # 흔한 접두/접미어를 분리해 '지에스홈쇼핑'→'지에스', '마켓컬리'→'컬리', '스마트스토어'→'스마트' 등 변별어 노출
+        s = re.sub(r'(홈쇼핑|쇼핑|스토아|스토어|택배|대리점|미리주문|본방|세트)', r' \1 ', s)
+        s = re.sub(r'^(마켓|네이버|카카오|기내|홈)', r'\1 ', s.strip())   # 접두어 분리
+        out = []
+        for t in re.split(r'[\s\-_·•\[\]()（）#,/]+', s):
+            tn = re.sub(r'[\s]', '', t).lower().strip()
+            if len(tn) >= 2 and tn not in _STOP_CH:
+                out.append(tn)
+        return out
+
     ob_to_label: dict = {}
-    bh_kw_label: list = []  # (keyword, label)
+    bh_kw_label: list = []   # (norm_keyword, label) — 전체 부분매칭용
+    from collections import defaultdict as _dd2
+    tok_labels: dict = _dd2(set)   # 토큰 → {라벨...} (변별 토큰 식별용)
     for root, m in members.items():
         label = sorted(m["ob"])[0] if m["ob"] else sorted(m["bh"])[0]
         for ob in m["ob"]:
             ob_to_label[ob] = label
         for kw in m["bh"]:
-            bh_kw_label.append((kw, label))
-    # 긴 키워드 우선 매칭 (부분문자열 충돌 방지)
+            nkw = _norm_ch(kw)
+            if nkw:
+                bh_kw_label.append((nkw, label))
+            for tok in _tokens(kw):
+                tok_labels[tok].add(label)
+        for ob in m["ob"]:        # OB 채널명의 변별 토큰도 BH 메모 매칭에 활용
+            for tok in _tokens(ob):
+                tok_labels[tok].add(label)
+    # 변별 토큰 = 정확히 한 라벨에만 속한 토큰 (긴 토큰 우선)
+    disc_tok = sorted(
+        ((tok, next(iter(labs))) for tok, labs in tok_labels.items() if len(labs) == 1),
+        key=lambda x: -len(x[0]))
     bh_kw_label.sort(key=lambda x: -len(x[0]))
 
     def ob_resolver(channel: str) -> str:
         channel = (channel or "").strip()
-        return ob_to_label.get(channel, channel or "채널미상")
+        if channel in ob_to_label:
+            return ob_to_label[channel]
+        nm = _norm_ch(channel)
+        for kw, label in bh_kw_label:
+            if kw and kw in nm:
+                return label
+        for tok, label in disc_tok:
+            if tok in nm:
+                return label
+        return channel or "채널미상"
 
     def bh_resolver(memo: str) -> str:
-        memo = memo or ""
+        nm = _norm_ch(memo)
+        if not nm:
+            return "채널미상"
+        # 1) 정규화 키워드 전체 부분매칭 (긴 것 우선)
         for kw, label in bh_kw_label:
-            if kw and kw in memo:
+            if kw and kw in nm:
+                return label
+        # 2) 변별 토큰 매칭 (예: 'dj&a','이알하나','지에스','쿠팡','올리브영')
+        for tok, label in disc_tok:
+            if tok in nm:
                 return label
         return "채널미상"
 
@@ -1328,6 +1457,225 @@ def _build_unmapped(all_rows: list, groups: dict) -> dict:
     }
 
 
+# ── 원인 자동 분류기 ──────────────────────────────────────────────
+# 비교 결과 각 불일치 행에 재현 가능한 규칙 기반 원인(root_cause)과
+# 정리 방향(fix_target/fix_hint)을 라벨링한다. AI 분석과 달리 결정론적이라
+# "전산 정리" 작업의 1차 분류 토대로 사용한다.
+ROOT_CAUSE_LABELS = {
+    "ok":               "정상",
+    "adj_initial":      "기초재고 조정",
+    "set_bom":          "세트 분해",
+    "timing":           "시점 차이",
+    "product_unmapped": "상품 미매핑",
+    "channel_unmapped": "채널 미매핑",
+    "qty_mismatch":     "수량 불일치",
+    "true_missing":     "한쪽 누락",
+}
+
+
+def _build_correction(r: dict, cause: str, fix_target: str) -> dict:
+    """행 하나에 대한 반자동 수정안 생성.
+
+    실제 시스템에 쓰지 않고, 담당자가 해당 시스템에 직접 입력할 수 있도록
+    조치 설명(action)과 복붙용 한 줄(copy_text)을 만든다.
+
+    반환: {system, op, qty, action, copy_text}
+      system: BH(박스히어로 입력) / OB(아워박스 입력) / MAPPING(매핑·세트) / REVIEW(대조 필요) / NONE
+      op:     in/out/adjust/map/review
+      qty:    입력·조정 수량 (부호 포함, 없으면 0)
+      copy_text: 스프레드시트 붙여넣기용 탭 구분 한 줄
+    """
+    tx = r.get("tx_type", "")
+    op_label = {"in": "입고", "out": "출고", "adjustment": "조정"}.get(tx, tx)
+    sku = r.get("sku", "")
+    name = r.get("name", "")
+    channel = r.get("channel", "") or ""
+    period = r.get("period", "")
+    bh_q = r.get("bh_qty")
+    ob_q = r.get("ob_qty")
+
+    def _row(system, op, qty, action):
+        # 탭 구분: 날짜 / SKU / 상품명 / 시스템 / 작업 / 수량 / 채널
+        copy_text = "\t".join([
+            str(period), str(sku), str(name),
+            system, f"{op_label}", str(qty), channel,
+        ])
+        return {"system": system, "op": op, "qty": qty,
+                "action": action, "copy_text": copy_text}
+
+    if cause == "true_missing":
+        if bh_q is None:
+            q = int(ob_q or 0)
+            return _row("BH", tx, q,
+                        f"박스히어로에 {op_label} {q}개 입력 (아워박스에만 기록됨)")
+        else:
+            q = int(bh_q or 0)
+            return _row("OB", tx, q,
+                        f"아워박스에 {op_label} {q}개 입력/확인 (박스히어로에만 기록됨)")
+
+    if cause == "qty_mismatch":
+        bv = int(bh_q or 0); ov = int(ob_q or 0)
+        diff = bv - ov
+        # 어느 쪽이 정답인지 모르므로 양방향 후보 제시 (조정 수량 = 차이)
+        action = (f"수량 대조 필요: BH {bv} ↔ OB {ov} (차이 {diff:+d}). "
+                  f"정답 확인 후 → BH를 OB에 맞추려면 조정 {(-diff):+d}, "
+                  f"OB를 BH에 맞추려면 조정 {diff:+d}")
+        return {"system": "REVIEW", "op": "review", "qty": abs(diff),
+                "action": action,
+                "copy_text": "\t".join([str(period), str(sku), str(name),
+                                        "REVIEW", op_label, f"{diff:+d}", channel])}
+
+    if cause == "set_bom":
+        return _row("MAPPING", "map", 0,
+                    "세트 BOM 등록/확인 후 재대사 (세트↔단품 수량 비율 연결)")
+    if cause == "product_unmapped":
+        return _row("MAPPING", "map", 0,
+                    "상품 매핑 추가 (박스히어로 SKU ↔ 아워박스 코드 연결)")
+    if cause == "channel_unmapped":
+        return _row("MAPPING", "map", 0, "채널 매핑 규칙 추가")
+    if cause == "adj_initial":
+        return _row("REVIEW", "review", 0,
+                    "기초재고/조정 노이즈 — 조정 제외 토글 또는 아워박스 조정으로 정리")
+    if cause == "timing":
+        return _row("NONE", "review", 0,
+                    "시점 차이 — 누적 모드로 재확인, 대개 조치 불필요")
+    return _row("REVIEW", "review", 0, "원인 확인 필요")
+
+
+def _classify_root_causes(all_rows: list, groups: dict, period: str,
+                          by_channel: bool = False) -> dict:
+    """all_rows의 각 행에 root_cause / fix_target / fix_hint를 부여 (in-place).
+
+    우선순위(강한 구조적 신호 → 약한 신호):
+      1) adj_initial   : in/out 동일, adj만 차이 (BH 기초재고 설정 노이즈)
+      2) set_bom       : 세트 비율 패턴 or set_bom 등록 품목
+      3) timing        : 반대 시스템이 인접/다른 기간에 동일 SKU 보유 → 시점 차이
+      4) product_unmapped : *_only인데 매핑 그룹에 없음 → 매핑 추가하면 해소
+      5) channel_unmapped : by_channel 모드에서 채널 미해소
+      6) qty_mismatch  : 양쪽 모두 존재하나 수량 다름 (실제 오입력 의심)
+      7) true_missing  : 한쪽에만 존재 + 위 모두 아님 (전표 확인 필요)
+
+    반환: {root_cause: {count, label, fix_target}} 요약.
+    """
+    from collections import defaultdict as _dd
+
+    # set_bom 등록 SKU/이름 집합
+    set_bom_keys: set = set()
+    try:
+        import receiving_db as _rdb
+        for _b in (_rdb.get_set_boms() or []):
+            for _k in (_b.get("set_sku"), _b.get("set_name"),
+                       _b.get("component_sku"), _b.get("component_name")):
+                if _k:
+                    set_bom_keys.add(str(_k).strip())
+    except Exception:
+        pass
+
+    # 매핑 그룹 인덱스 (안전 접근)
+    bh_to_group      = groups.get("bh_to_group", {}) or {}
+    bh_name_to_group = groups.get("bh_name_to_group", {}) or {}
+    ob_code_to_group = groups.get("ob_code_to_group", {}) or {}
+    ob_to_group      = groups.get("ob_to_group", {}) or {}
+
+    def _is_mapped(r: dict) -> bool:
+        sku = r.get("sku", "")
+        name = r.get("name", "")
+        if r.get("status") == "bh_only":
+            return sku in bh_to_group or name in bh_name_to_group
+        if r.get("status") == "ob_only":
+            return sku in ob_code_to_group or name in ob_to_group
+        return True  # 양쪽 존재 행은 이미 매칭됨
+
+    # 시점 차이 색인: (tx_type, sku|name) → 반대 시스템이 보유한 기간 집합
+    bh_periods: dict = _dd(set)
+    ob_periods: dict = _dd(set)
+    for r in all_rows:
+        key = (r.get("tx_type", ""), r.get("sku") or r.get("name"))
+        if r.get("bh_qty"):
+            bh_periods[key].add(r.get("period"))
+        if r.get("ob_qty"):
+            ob_periods[key].add(r.get("period"))
+
+    summary: dict = _dd(int)
+    for r in all_rows:
+        status = r.get("status")
+        if status == "ok":
+            r["root_cause"] = "ok"
+            r["fix_target"] = ""
+            r["fix_hint"] = ""
+            summary["ok"] += 1
+            continue
+
+        cause = None
+        mc = r.get("mismatch_cause", "")
+        key = (r.get("tx_type", ""), r.get("sku") or r.get("name"))
+        _bq = r.get("bh_qty") or 0
+        _oq = r.get("ob_qty") or 0
+
+        # 세트 비율 폴백: mismatch_cause 미설정(period/cumulative 모드)에서도 감지
+        _ratio_hit = False
+        if status == "mismatch" and _bq > 0 and _oq > 0:
+            _rt = max(_bq, _oq) / min(_bq, _oq)
+            if 2 <= _rt <= 20 and abs(_rt - round(_rt)) < 0.1:
+                _ratio_hit = True
+
+        if mc == "adj_only":
+            cause = "adj_initial"
+        elif mc == "set_ratio" or _ratio_hit \
+                or r.get("sku") in set_bom_keys or r.get("name") in set_bom_keys:
+            cause = "set_bom"
+        elif status in ("bh_only", "ob_only"):
+            # *_only: 매핑 누락 → 시점 차이 → 실제 누락 순으로 판정
+            if not _is_mapped(r):
+                cause = "product_unmapped"
+            elif (status == "bh_only" and ob_periods.get(key)) or \
+                 (status == "ob_only" and bh_periods.get(key)):
+                cause = "timing"
+            elif by_channel and not r.get("channel"):
+                cause = "channel_unmapped"
+            else:
+                cause = "true_missing"
+        elif status == "mismatch":
+            cause = "qty_mismatch"
+        else:
+            cause = "true_missing"
+
+        # 정리 방향 결정 (어느 시스템을 손봐야 하는가)
+        if cause in ("product_unmapped", "channel_unmapped", "set_bom"):
+            fix_target = "MAPPING"
+        elif cause == "adj_initial":
+            fix_target = "REVIEW"   # 비교 제외 또는 OB 조정 입력 검토
+        elif cause == "timing":
+            fix_target = "NONE"     # 대개 실제 오차 아님
+        elif cause == "true_missing":
+            # 기록이 없는 쪽에 추가하는 것이 정답 (None인 시스템이 보정 대상)
+            fix_target = "BH" if r.get("bh_qty") is None else "OB"
+        elif cause == "qty_mismatch":
+            fix_target = "REVIEW"   # 양쪽 존재·수량 상이 — 어느 쪽이 정답인지 대조 필요
+        else:
+            fix_target = "REVIEW"
+
+        _HINTS = {
+            "adj_initial": "BH 기초재고/조정 노이즈 — 비교에서 제외하거나 OB 조정으로 맞춤",
+            "set_bom": "세트 분해 의심 — 세트 BOM 등록/확인 후 재대사",
+            "timing": "시점 차이 — 누적(cumulative) 모드로 재확인, 실제 누락 아닐 가능성 높음",
+            "product_unmapped": "상품 매핑 누락 — BH SKU ↔ OB 코드 매핑 추가하면 해소",
+            "channel_unmapped": "채널 매핑 누락 — 채널 매핑 규칙 추가",
+            "qty_mismatch": "수량 불일치 — 한쪽 전산 오입력 의심, 전표 대조 필요",
+            "true_missing": "한쪽에만 기록 — 실제 누락/오입력 의심, 전표 확인 필요",
+        }
+        r["root_cause"] = cause
+        r["fix_target"] = fix_target
+        r["fix_hint"] = _HINTS.get(cause, "")
+        r["correction"] = _build_correction(r, cause, fix_target)
+        summary[cause] += 1
+
+    return {
+        k: {"count": v, "label": ROOT_CAUSE_LABELS.get(k, k)}
+        for k, v in sorted(summary.items(), key=lambda x: -x[1])
+    }
+
+
 @router.get("/compare")
 def compare(
     token: str = Query(...),
@@ -1344,6 +1692,7 @@ def compare(
     merge_types: bool = Query(False),  # True: in/out/adj 유형 무관 품목별 순수량 합산 비교
     exclude_adj: bool = Query(False),  # True: 조정(adjustment) 항목 제외 — BH 기초재고 설정 등 노이즈 제거
     bh_adj_max_qty: int = Query(0),    # BH adj 임계값: qty >= 이값 SKU를 양측 adj에서 제외 (기초재고 자동 필터, 0=비활성)
+    hide_resolved: bool = Query(False), # True: 정리완료(resolved)·무시(ignore)로 마킹된 행을 비교 결과에서 제외
 ):
     if period not in ("day", "week", "month", "year"):
         raise HTTPException(400, "period must be day, week, month, or year")
@@ -1417,10 +1766,10 @@ def compare(
             _loc_set_cmp = {int(x) for x in loc_id_list if str(x).strip().isdigit()}
             if _loc_set_cmp:
                 import concurrent.futures as _cf_cmp
-                def _filter_by_loc(_txs: list) -> list:
+                def _filter_by_loc(_txs: list, _prefer_from: bool = False) -> list:
                     _locs: dict = {}
                     with _cf_cmp.ThreadPoolExecutor(max_workers=3) as _ex:
-                        _fs = {_ex.submit(_get_bh_tx_loc_id, token, t["id"]): t["id"]
+                        _fs = {_ex.submit(_get_bh_tx_loc_id, token, t["id"], "location", _prefer_from): t["id"]
                                for t in _txs if t.get("id")}
                         for _f in _cf_cmp.as_completed(_fs):
                             try: _locs[_fs[_f]] = _f.result()
@@ -1430,7 +1779,8 @@ def compare(
                             if _locs.get(t.get("id")) is None or _locs.get(t.get("id")) in _loc_set_cmp]
                 bh_in_raw = _filter_by_loc(bh_in_raw)
                 bh_out_raw = _filter_by_loc(bh_out_raw)
-                bh_move_raw = _filter_by_loc(bh_move_raw)
+                # move는 출발지(from) 기준 — 이 위치에서 나간 이동(폐기·타창고 이송)을 출고로 포함
+                bh_move_raw = _filter_by_loc(bh_move_raw, _prefer_from=True)
         except Exception as _e_loc:
             errors.append(f"[정보] BH 위치 필터 실패(전체 위치로 진행): {str(_e_loc)[:60]}")
 
@@ -1440,12 +1790,19 @@ def compare(
     if by_channel:
         ob_ch_res, bh_ch_res, channel_mapped = _build_channel_resolvers()
 
-    bh_in  = _normalize_bh_txs(bh_in_raw,  "in",     period, bh_ch_res)
-    # move는 출고로 합산 (full-match와 동일 — OB 출고가 BH '이동'으로 기록되는 케이스)
-    bh_out = _normalize_bh_txs(bh_out_raw + bh_move_raw, "out", period, bh_ch_res)
+    # 정규화 기간 키: 총량/유형합산 모드는 day 단위로 만들어 날짜 범위 필터가 작동하게 함.
+    #   (period="month"면 키가 "2026-05"라 _build_sku_qty_map·_compare_total의 날짜필터가
+    #    무력화돼 bh_lookback로 당겨온 범위 밖 거래까지 합산되는 버그 → exact 기간 합과 불일치)
+    _norm_period = "day" if (mode == "total" or merge_types) else period
+    bh_in  = _normalize_bh_txs(bh_in_raw,  "in",     _norm_period, bh_ch_res)
+    # move는 출고와 분리 — 이동은 재고 총량 불변이므로 순수 출고와 별도 집계
+    bh_out = _normalize_bh_txs(bh_out_raw, "out", _norm_period, bh_ch_res)
+    bh_move = _normalize_bh_txs(bh_move_raw, "out", _norm_period, bh_ch_res)
+    # full-match 비교에서는 out+move 합산본도 필요 (OB 출고와 크로스 매칭)
+    bh_out_plus_move = _normalize_bh_txs(bh_out_raw + bh_move_raw, "out", _norm_period, bh_ch_res)
     # BH adj: 음수 항목(단품 소진)만 포함. 양수(세트 추가)는 매칭 불필요 → 제외
     bh_adj_raw_neg = _filter_bh_adj_negative(bh_adj_raw)
-    bh_adj = _normalize_bh_txs(bh_adj_raw_neg, "adjust", period, bh_ch_res)
+    bh_adj = _normalize_bh_txs(bh_adj_raw_neg, "adjust", _norm_period, bh_ch_res)
 
     # ── OurBox Mate 데이터 수집 (REST API 우선, Playwright fallback) ──
     ob_in_raw, ob_out_raw, ob_adj_raw = [], [], []
@@ -1484,6 +1841,14 @@ def compare(
         n_dep = n_dep_before - n_dep_after
         if n_dep:
             errors.append(f"[정보] 사장 OB 코드 {n_dep}건 제외: {', '.join(DEPRECATED_OB_CODES)}")
+
+    # 기초재고 일괄입고 제거 (OurBox 도입 초기 재고등록 — BH 미대응, 입고 비교 왜곡 방지)
+    if OB_INITIAL_STOCK_INPUT_CODES:
+        _n_init_before = len(ob_in_raw)
+        ob_in_raw = _filter_initial_stock(ob_in_raw)
+        _n_init = _n_init_before - len(ob_in_raw)
+        if _n_init:
+            errors.append(f"[정보] 기초재고 일괄입고 {_n_init}건 제외: input_code {', '.join(sorted(OB_INITIAL_STOCK_INPUT_CODES))}")
 
     # 원본 raw 건수 보존 (data_counts용)
     _ob_in_raw_cnt  = len(ob_in_raw)
@@ -1525,9 +1890,9 @@ def compare(
         except Exception:
             pass
 
-    ob_in  = _norm_ob_auto(ob_in_raw,  period, ob_source, "in",  ob_ch_res)
-    ob_out = _norm_ob_auto(ob_out_raw, period, ob_source, "out", ob_ch_res)
-    ob_adj = _norm_ob_auto(ob_adj_raw, period, ob_source, "adjustment", ob_ch_res)
+    ob_in  = _norm_ob_auto(ob_in_raw,  _norm_period, ob_source, "in",  ob_ch_res)
+    ob_out = _norm_ob_auto(ob_out_raw, _norm_period, ob_source, "out", ob_ch_res)
+    ob_adj = _norm_ob_auto(ob_adj_raw, _norm_period, ob_source, "adjustment", ob_ch_res)
 
     if by_channel and not channel_mapped:
         errors.append("[정보] 채널 매핑이 없어 채널이 매칭되지 않습니다 (상품 매핑 → 채널 매핑에서 연결)")
@@ -1598,12 +1963,13 @@ def compare(
             result[real_sku] = result.get(real_sku, 0) + v.get("qty", 0)
         return result
 
-    bh_in_map  = _build_sku_qty_map(bh_in,  from_date, to_date)
-    bh_out_map = _build_sku_qty_map(bh_out, from_date, to_date)
-    bh_adj_map = _build_sku_qty_map(bh_adj, from_date, to_date)
-    ob_in_map  = _build_sku_qty_map(ob_in,  from_date, to_date)
-    ob_out_map = _build_sku_qty_map(ob_out, from_date, to_date)
-    ob_adj_map = _build_sku_qty_map(ob_adj, from_date, to_date)
+    bh_in_map   = _build_sku_qty_map(bh_in,   from_date, to_date)
+    bh_out_map  = _build_sku_qty_map(bh_out,  from_date, to_date)
+    bh_move_map = _build_sku_qty_map(bh_move, from_date, to_date)
+    bh_adj_map  = _build_sku_qty_map(bh_adj,  from_date, to_date)
+    ob_in_map   = _build_sku_qty_map(ob_in,   from_date, to_date)
+    ob_out_map  = _build_sku_qty_map(ob_out,  from_date, to_date)
+    ob_adj_map  = _build_sku_qty_map(ob_adj,  from_date, to_date)
 
     # ── 비교 ─────────────────────────────────────────────────
     if merge_types:
@@ -1629,7 +1995,7 @@ def compare(
                 net[k2]["qty"] += v.get("qty", 0)
             return dict(net)
 
-        bh_all = _merge_all_types(bh_in, bh_out, bh_adj)
+        bh_all = _merge_all_types(bh_in, bh_out_plus_move, bh_adj)
         ob_all = _merge_all_types(ob_in, ob_out, ob_adj)
         merged_rows = _compare_total(bh_all, ob_all, from_date, to_date, qty_tolerance=qty_tolerance)
         # 유형합산 행은 tx_type="all"로 표시
@@ -1637,7 +2003,7 @@ def compare(
         in_rows, out_rows, adj_rows = [], [], merged_rows
     elif mode == "cumulative":
         in_rows  = _compare_cumulative(bh_in,  ob_in)
-        out_rows = _compare_cumulative(bh_out, ob_out)
+        out_rows = _compare_cumulative(bh_out_plus_move, ob_out)
         adj_rows = _compare_cumulative(bh_adj, ob_adj)
         all_rows = (
             [{"tx_type": "in", **r} for r in in_rows]
@@ -1646,8 +2012,9 @@ def compare(
         )
     elif mode == "total":
         # 재고 역산 모드: 날짜 무시, 품목별 기간 합산 비교
+        # 출고 비교는 out+move 합산으로 OB 매칭, 별도 bh_move_qty 필드로 분리 보고
         in_rows  = _compare_total(bh_in,  ob_in,  from_date, to_date, qty_tolerance=qty_tolerance)
-        out_rows = _compare_total(bh_out, ob_out, from_date, to_date, qty_tolerance=qty_tolerance)
+        out_rows = _compare_total(bh_out_plus_move, ob_out, from_date, to_date, qty_tolerance=qty_tolerance)
         adj_rows = _compare_total(bh_adj, ob_adj, from_date, to_date, qty_tolerance=qty_tolerance)
         all_rows = (
             [{"tx_type": "in", **r} for r in in_rows]
@@ -1657,7 +2024,7 @@ def compare(
     else:
         _lb = bh_lookback if period == "day" else 0  # 주/월 단위는 날짜 오프셋 무시
         in_rows  = _compare(bh_in,  ob_in,  day_lookback=_lb, display_from=from_date, display_to=to_date, qty_tolerance=qty_tolerance)
-        out_rows = _compare(bh_out, ob_out, day_lookback=_lb, display_from=from_date, display_to=to_date, qty_tolerance=qty_tolerance)
+        out_rows = _compare(bh_out_plus_move, ob_out, day_lookback=_lb, display_from=from_date, display_to=to_date, qty_tolerance=qty_tolerance)
         adj_rows = _compare(bh_adj, ob_adj, day_lookback=_lb, display_from=from_date, display_to=to_date, qty_tolerance=qty_tolerance)
         all_rows = (
             [{"tx_type": "in", **r} for r in in_rows]
@@ -1670,12 +2037,13 @@ def compare(
     if mode in ("total",) or merge_types:
         for r in all_rows:
             sku = r.get("sku", "")
-            r["bh_in_qty"]  = bh_in_map.get(sku, 0)
-            r["bh_out_qty"] = bh_out_map.get(sku, 0)
-            r["bh_adj_qty"] = bh_adj_map.get(sku, 0)
-            r["ob_in_qty"]  = ob_in_map.get(sku, 0)
-            r["ob_out_qty"] = ob_out_map.get(sku, 0)
-            r["ob_adj_qty"] = ob_adj_map.get(sku, 0)
+            r["bh_in_qty"]   = bh_in_map.get(sku, 0)
+            r["bh_out_qty"]  = bh_out_map.get(sku, 0)
+            r["bh_move_qty"] = bh_move_map.get(sku, 0)
+            r["bh_adj_qty"]  = bh_adj_map.get(sku, 0)
+            r["ob_in_qty"]   = ob_in_map.get(sku, 0)
+            r["ob_out_qty"]  = ob_out_map.get(sku, 0)
+            r["ob_adj_qty"]  = ob_adj_map.get(sku, 0)
             # mismatch 원인 힌트: adj만 다르고 in/out은 같으면 "adj_diff"
             bh_in_v  = r["bh_in_qty"];  bh_out_v = r["bh_out_qty"]; bh_adj_v = r["bh_adj_qty"]
             ob_in_v  = r["ob_in_qty"];  ob_out_v = r["ob_out_qty"]; ob_adj_v = r["ob_adj_qty"]
@@ -1950,6 +2318,47 @@ def compare(
         out_rows = [r for r in out_rows if not _is_material_row(r)]
         adj_rows = [r for r in adj_rows if not _is_material_row(r)]
 
+    # ── 원인 자동 분류 (각 행에 root_cause/fix_target/fix_hint 부여) ──
+    try:
+        root_cause_summary = _classify_root_causes(all_rows, groups, period, by_channel)
+    except Exception as e:
+        root_cause_summary = {}
+        errors.append(f"[정보] 원인 분류 실패: {str(e)[:60]}")
+
+    # ── 저장된 정리(전산정리) 상태 조인 ──────────────────────────────
+    # 각 행에 cleanup_status/cleanup_memo/cleanup_assignee/cleanup_updated_at 부착.
+    # hide_resolved=True면 resolved/ignore 행은 결과에서 제외.
+    cleanup_counts: dict = {}
+    try:
+        import receiving_db as _rdb_cs
+        # 전체 상태 로드 후 정확 키 매칭 (week/month/total 등 period 키 형식 차이 무관)
+        _cs_list = _rdb_cs.get_reconcile_statuses()
+        _cs_by_key = {c["row_key"]: c for c in _cs_list}
+        from collections import Counter as _Counter
+        _joined_statuses: list = []
+        if _cs_by_key:
+            for r in all_rows:
+                _k = _recon_row_key(r.get("tx_type", ""), r.get("sku", ""),
+                                    r.get("channel", ""), r.get("period", ""))
+                _c = _cs_by_key.get(_k)
+                if _c:
+                    r["cleanup_status"] = _c.get("status", "")
+                    r["cleanup_memo"] = _c.get("memo", "")
+                    r["cleanup_assignee"] = _c.get("assignee", "")
+                    r["cleanup_updated_at"] = _c.get("updated_at", "")
+                    _joined_statuses.append(_c.get("status", ""))
+        # 현재 비교 결과에 실제로 매칭된 행만 집계 (이 화면의 정리 진행도)
+        cleanup_counts = dict(_Counter(_joined_statuses))
+        if hide_resolved and _cs_by_key:
+            # cleanup_status는 all_rows에만 부착됨 → all_rows 필터 후 tx_type별 재구성
+            _hidden = {"resolved", "ignore"}
+            all_rows = [r for r in all_rows if r.get("cleanup_status") not in _hidden]
+            in_rows  = [r for r in all_rows if r.get("tx_type") == "in"]
+            out_rows = [r for r in all_rows if r.get("tx_type") == "out"]
+            adj_rows = [r for r in all_rows if r.get("tx_type") == "adjustment"]
+    except Exception as e:
+        errors.append(f"[정보] 정리 상태 조인 실패: {str(e)[:60]}")
+
     def _summarize(rows):
         s = {"total": len(rows), "ok": 0, "mismatch": 0, "bh_only": 0, "ob_only": 0}
         for r in rows:
@@ -1984,6 +2393,7 @@ def compare(
         "bh": {
             "in":  len(bh_in_raw),
             "out": len(bh_out_raw),
+            "move": len(bh_move_raw),
             "adj": len(bh_adj_raw),
         },
         "ob": {
@@ -2013,6 +2423,10 @@ def compare(
         "qty_tolerance": qty_tolerance,
         "data_counts": data_counts,
         "ob_adj_unknown": ob_adj_unknown,
+        # 원인 자동 분류 요약 {root_cause: {count, label}} — 행별 root_cause/fix_target/fix_hint도 rows에 포함
+        "root_cause_summary": root_cause_summary,
+        # 정리(전산정리) 상태 집계 {status: count} — 행별 cleanup_status/cleanup_memo도 rows에 포함
+        "cleanup_counts": cleanup_counts,
         # 부자재/포장재 — OB 미관리 품목으로 비교에서 제외된 행 (별도 표시용)
         "excluded_material": excluded_material,
         # 미매핑 상품 목록: 매핑에 없는 bh_only/ob_only SKU + 상품명 (항목 1)
@@ -2119,6 +2533,8 @@ def smart_compare(
     if DEPRECATED_OB_CODES:
         ob_in_raw  = _filter_deprecated(ob_in_raw)
         ob_out_raw = _filter_deprecated(ob_out_raw)
+    # 기초재고 일괄입고 제거 (OurBox 도입 초기 재고등록 — BH 미대응)
+    ob_in_raw = _filter_initial_stock(ob_in_raw)
     if ob_source == "rest":
         ob_in_raw, ob_out_raw, ob_adj_raw, n_asm = _route_ob_assembly(ob_in_raw, ob_out_raw, ob_adj_raw)
         if n_asm:
@@ -2627,6 +3043,7 @@ def product_match(
             if not isinstance(rec, dict): continue
             prod_cd_v = str(rec.get("product_code") or rec.get("prod_cd") or "").strip()
             if prod_cd_v in DEPRECATED_OB_CODES: continue  # 사장된 코드 제외
+            if str(rec.get("input_code") or "").strip() in OB_INITIAL_STOCK_INPUT_CODES: continue  # 기초재고 일괄입고 제외
             nm = html.unescape(str(rec.get("product_name","")).strip())
             qty = abs(int(float(str(rec.get("input_qty") or 0))))
             dt = str(rec.get("input_dt") or rec.get("input_complete_dt",""))[:10]
@@ -3196,7 +3613,7 @@ def get_stock(
     merged: dict = _ddg(lambda: {
         "name": "", "sku": "", "ob_code": "", "ob_codes": set(),
         "bh_stock": None, "ob_total": None, "ob_avail": None, "ob_unav": None,
-        "bh_skus": set(),
+        "bh_skus": set(), "bh_names": set(), "ob_names": set(),
     })
     # 병합 키: 그룹이든 미매핑이든 '대표이름의 정규화값'으로 통일
     # → OB는 매핑 그룹, BH는 미매핑(NM)이어도 같은 제품이면 동일 키로 합쳐짐
@@ -3208,6 +3625,7 @@ def get_stock(
         m["bh_stock"] = (m["bh_stock"] or 0) + bh.get("quantity", 0)
         if not m["name"]: m["name"] = label
         if bh.get("sku"): m["bh_skus"].add(bh["sku"]); m["sku"] = m["sku"] or bh["sku"]
+        if bh.get("name"): m["bh_names"].add(bh["name"])
     for norm, ob in ob_stock.items():
         g, label = _grp_key_ob(ob.get("name", ""), norm, ob.get("codes", []))
         gk = _snorm(label) if g else norm
@@ -3218,6 +3636,7 @@ def get_stock(
         if not m["name"]: m["name"] = label
         for c in ob.get("codes", []): m["ob_codes"].add(c)
         m["ob_code"] = m["ob_code"] or ob.get("code", "")
+        if ob.get("name"): m["ob_names"].add(ob["name"])
 
     # ── 행 구성 + 차이 원인 자동 분해 ────────────────────────────────
     rows = []
@@ -3227,27 +3646,24 @@ def get_stock(
         ob_avail = m["ob_avail"]
         # OurBox unavailable_stock 직접 사용 (가용외 = 출고할당·작업중·불용 등). total-available 계산 아님
         unusable = m["ob_unav"] if m["ob_unav"] is not None else ((ob_total - ob_avail) if (ob_total is not None and ob_avail is not None) else 0)
-        # 차이 = BH재고 - OB가용 (엑셀 기준)
-        diff = (bh_q or 0) - (ob_avail or 0) if (bh_q is not None and ob_avail is not None) else None
+        # 차이 = BH재고 - OB총재고 (가용외 포함). 가용외는 OB 내부 상태(할당/보류)라 비교 기준에서 제외 →
+        # 가용 기준 비교의 ±수천 출렁임(할당 타이밍 노이즈) 제거, 진짜 정합오차만 남김.
+        diff = (bh_q or 0) - (ob_total or 0) if (bh_q is not None and ob_total is not None) else None
+        # 참고용: BH - OB가용 (기존 엑셀 기준). 가용/가용외 표기와 함께 보조 지표로 노출
+        diff_vs_available = (bh_q or 0) - (ob_avail or 0) if (bh_q is not None and ob_avail is not None) else None
 
-        # 원인 분해
+        # 원인 분해 (총재고 기준이므로 가용외는 차이를 '설명'하지 않음 — 참고 표기만)
         causes = []
-        residual = diff
+        residual = diff  # 총재고 비교라 잔여 = 차이. 매핑다중은 정량화 불가라 차감하지 않음
         if diff is not None:
-            # 1) 가용외(unavailable): OurBox가 가용에서 뺀 수량(출고 할당·작업중·불용 등). BH재고엔 포함
-            if unusable and unusable > 0:
-                explained = min(unusable, diff) if diff > 0 else 0
-                if diff > 0 and explained > 0:
-                    causes.append({"type": "가용외", "qty": explained,
-                                   "desc": f"OB 가용외 {unusable:,}개 (출고 할당·작업중·불용 등)"})
-                    residual = diff - explained
-                elif unusable > 0:
-                    causes.append({"type": "가용외", "qty": 0,
-                                   "desc": f"OB 가용외 {unusable:,}개 (참고)"})
-            # 2) 매핑 1:N (BH 1 SKU ↔ OB 여러 코드)
+            # 1) 매핑 1:N (BH 1 SKU ↔ OB 여러 코드)
             if len(m["ob_codes"]) > 1 or len(m["bh_skus"]) > 1:
                 causes.append({"type": "매핑다중", "qty": None,
                                "desc": f"BH SKU {len(m['bh_skus'])}개 ↔ OB 코드 {len(m['ob_codes'])}개 그룹 합산"})
+            # 2) 가용외 정보(참고): 총재고엔 이미 포함돼 차이에 영향 없음. 가용/가용외 분리 표기용
+            if unusable and unusable > 0:
+                causes.append({"type": "가용외", "qty": None,
+                               "desc": f"OB 가용외 {unusable:,}개 (출고 할당·작업중·불용 등). 총재고 비교라 차이엔 영향 없음(참고)"})
 
         rows.append({
             "name": m["name"] or gk,
@@ -3255,13 +3671,16 @@ def get_stock(
             "ob_code": m["ob_code"],
             "ob_codes": sorted(m["ob_codes"]),
             "bh_skus": sorted(m["bh_skus"]),
+            "bh_names": sorted(m["bh_names"]),
+            "ob_names": sorted(m["ob_names"]),
             "bh_stock": bh_q,
             "ob_stock_total": ob_total,
             "ob_stock_available": ob_avail,
             "ob_unusable": unusable,
-            "diff": diff,                       # BH - OB가용
-            "diff_vs_total": (bh_q or 0) - (ob_total or 0) if (bh_q is not None and ob_total is not None) else None,
-            "residual": residual,               # 불용으로 설명 후 남은 차이
+            "diff": diff,                       # BH - OB총재고 (주지표)
+            "diff_vs_total": diff,              # 하위호환(= diff)
+            "diff_vs_available": diff_vs_available,  # BH - OB가용 (참고 보조지표)
+            "residual": residual,               # 매핑 외 설명 안 된 진짜 차이 (= diff)
             "causes": causes,
         })
 
@@ -3284,6 +3703,9 @@ def get_stock(
 
 # ── 주간 재고 비교 리포트 (자동 스냅샷 저장 + 조회) ─────────────────────────
 
+_WR_ENRICHING: set = set()  # (report_date, location_ids) — 사전계산 중복 실행 방지
+
+
 @router.post("/weekly-report")
 def create_weekly_report(
     token: str = Query(...),
@@ -3303,84 +3725,1107 @@ def create_weekly_report(
     if result.get("rows") is None:
         return {"saved": False, "error": "재고 조회 실패"}
 
-    # ── 차이 품목(잔여≠0)의 거래 분해 사전 계산 (월요일 백그라운드라 시간 여유) ──
-    # 최근 trace_months개월 compare(total)를 1회 호출 → 품목별 입고/출고/조정 BH/OB를 행에 첨부
-    # → 앱에서 행 클릭 시 API 호출 없이 즉시 표시
-    flow_filled = 0
-    try:
-        _to = _dtw.strptime(rd, "%Y-%m-%d")
-        _from = (_to - _tdw(days=trace_months * 30)).strftime("%Y-%m-%d")
-        # compare는 FastAPI 엔드포인트 — 직접 호출 시 모든 Query 파라미터를 명시해야
-        # (누락 시 Query 객체가 그대로 들어가 timedelta 등에서 터짐)
-        cmp = compare(token=token, from_date=_from, to_date=rd, period="month",
-                      location_id=None, location_ids=location_ids or None,
-                      use_mapping=True, mode="total", by_channel=False,
-                      bh_lookback=7, qty_tolerance=0.0, merge_types=False,
-                      exclude_adj=False, bh_adj_max_qty=0)
-        def _nrm(s): return _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", str(s or "")).lower()
-        flow_map: dict = {}
-        for cr in (cmp.get("rows") or []):
-            k = _nrm(cr.get("name") or cr.get("sku") or "")
-            f = flow_map.setdefault(k, {"bh": {"in":0,"out":0,"adjustment":0}, "ob": {"in":0,"out":0,"adjustment":0}})
-            f["bh"]["in"] += cr.get("bh_in_qty",0) or 0; f["bh"]["out"] += cr.get("bh_out_qty",0) or 0; f["bh"]["adjustment"] += cr.get("bh_adj_qty",0) or 0
-            f["ob"]["in"] += cr.get("ob_in_qty",0) or 0; f["ob"]["out"] += cr.get("ob_out_qty",0) or 0; f["ob"]["adjustment"] += cr.get("ob_adj_qty",0) or 0
-        for r in result["rows"]:
-            if r.get("residual") in (None, 0):
-                continue  # 잔여 없는 건(불용/매핑으로 설명됨) 생략
-            fl = flow_map.get(_nrm(r.get("name") or ""))
-            if fl:
-                r["flow"] = {**fl, "from": _from, "to": rd}
-                flow_filled += 1
-    except Exception as _e_fl:
-        result.setdefault("errors", []).append(f"[정보] 거래분해 사전계산 실패: {str(_e_fl)[:60]}")
-
-    # ── 개별 거래 매칭(full-match) 사전계산 — 짝 안 맞는 거래를 차이 품목에 첨부 ──
-    # 평일에 행 클릭 시 즉시 "전산오류 거래 위치" 표시 (OB 캐시는 위 compare가 채워둠)
-    fm_filled = 0
-    try:
-        # 유통기한 날짜 suffix 제거 후 정규화 (full-match는 원본명+날짜, stock은 대표명 → 통일)
-        def _nrm_d(s):
-            s2 = _re_wr.sub(r'[\s\-_]+\d{2,4}[-.]\d{1,2}[-.]\d{1,2}\s*$', '', str(s or ''))
-            return _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", s2).lower()
-        fm = full_match(token=token, from_date=_from, to_date=rd,
-                        min_score=60, bh_lookback=5, location_ids=location_ids,
-                        bh_internal_keywords="일원화,품목통합,기초재고,재고이관,창고이동")
-        from collections import defaultdict as _dd_fm
-        _fm_bo = _dd_fm(list); _fm_oo = _dd_fm(list); _fm_qd = _dd_fm(list)
-        for x in fm.get("bh_only", []):
-            _fm_bo[_nrm_d(x.get("name") or "")].append({"date": x.get("date"), "qty": x.get("qty"), "bh_type": x.get("bh_type")})
-        for x in fm.get("ob_only", []):
-            _fm_oo[_nrm_d(x.get("name") or "")].append({"date": x.get("date"), "qty": x.get("qty"), "ob_type": x.get("ob_type")})
-        for x in fm.get("matched", []):
-            if x.get("qty_diff"):
-                for nm in (x.get("bh_name"), x.get("ob_name")):
-                    _fm_qd[_nrm_d(nm or "")].append({"bh_date": x.get("bh_date"), "ob_date": x.get("ob_date"),
-                        "bh_qty": x.get("bh_qty"), "ob_qty": x.get("ob_qty"), "qty_diff": x.get("qty_diff"), "day_gap": x.get("day_gap")})
-        for r in result["rows"]:
-            if r.get("residual") in (None, 0):
-                continue
-            k = _nrm_d(r.get("name") or "")
-            bo, oo, qd = _fm_bo.get(k, []), _fm_oo.get(k, []), _fm_qd.get(k, [])
-            if bo or oo or qd:
-                # 수량차 중복 제거 (bh_name/ob_name 둘 다 등록되어 2배 가능)
-                _seen = set(); _qd2 = []
-                for q in qd:
-                    key = (q["bh_date"], q["ob_date"], q["bh_qty"], q["ob_qty"])
-                    if key not in _seen:
-                        _seen.add(key); _qd2.append(q)
-                r["fm"] = {"bh_only": bo, "ob_only": oo, "qty_diff": _qd2, "from": _from, "to": rd}
-                fm_filled += 1
-    except Exception as _e_fm:
-        result.setdefault("errors", []).append(f"[정보] 개별매칭 사전계산 실패: {str(_e_fm)[:60]}")
-
+    # ── 리포트 먼저 저장 (재고 조회는 수 초) ──
+    # 아래 사전계산(3개월 거래 대조)은 수 분~수십 분 걸릴 수 있어 동기로 하면
+    # 프론트(타임아웃)와 월요일 스케줄러가 전부 실패한다 (6/24 이후 저장 안 되던 원인).
+    # 먼저 저장하고, 사전계산은 백그라운드 스레드가 끝나는 대로 같은 리포트를 덮어쓴다.
     _db.save_stock_report(rd, location_ids, result)
+
+    def _enrich_report():
+        # ── 차이 품목(잔여≠0)의 거래 분해 사전 계산 ──
+        # 최근 trace_months개월 compare(total)를 1회 호출 → 품목별 입고/출고/조정 BH/OB를 행에 첨부
+        # → 앱에서 행 클릭 시 API 호출 없이 즉시 표시
+        flow_filled = 0
+        try:
+            _to = _dtw.strptime(rd, "%Y-%m-%d")
+            _from = (_to - _tdw(days=trace_months * 30)).strftime("%Y-%m-%d")
+            # compare는 FastAPI 엔드포인트 — 직접 호출 시 모든 Query 파라미터를 명시해야
+            # (누락 시 Query 객체가 그대로 들어가 timedelta 등에서 터짐)
+            cmp = compare(token=token, from_date=_from, to_date=rd, period="month",
+                          location_id=None, location_ids=location_ids or None,
+                          use_mapping=True, mode="total", by_channel=False,
+                          bh_lookback=7, qty_tolerance=0.0, merge_types=False,
+                          exclude_adj=False, bh_adj_max_qty=0)
+            def _nrm(s): return _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", str(s or "")).lower()
+            flow_map: dict = {}
+            # ⚠ compare total은 한 품목을 in/out/adj 3행으로 주고 각 행에 동일한 분해값(sku 전체)을
+            #   복제함 → sku 중복 제거 후 합산 (안 하면 3배 부풀림)
+            _flow_seen: set = set()
+            for cr in (cmp.get("rows") or []):
+                _sku = str(cr.get("sku") or cr.get("name") or "")
+                if _sku in _flow_seen:
+                    continue
+                _flow_seen.add(_sku)
+                k = _nrm(cr.get("name") or cr.get("sku") or "")
+                f = flow_map.setdefault(k, {"bh": {"in":0,"out":0,"move":0,"adjustment":0}, "ob": {"in":0,"out":0,"adjustment":0}})
+                f["bh"]["in"] += cr.get("bh_in_qty",0) or 0; f["bh"]["out"] += cr.get("bh_out_qty",0) or 0; f["bh"]["move"] += cr.get("bh_move_qty",0) or 0; f["bh"]["adjustment"] += cr.get("bh_adj_qty",0) or 0
+                f["ob"]["in"] += cr.get("ob_in_qty",0) or 0; f["ob"]["out"] += cr.get("ob_out_qty",0) or 0; f["ob"]["adjustment"] += cr.get("ob_adj_qty",0) or 0
+            for r in result["rows"]:
+                if r.get("residual") in (None, 0):
+                    continue  # 잔여 없는 건(불용/매핑으로 설명됨) 생략
+                fl = flow_map.get(_nrm(r.get("name") or ""))
+                if fl:
+                    r["flow"] = {**fl, "from": _from, "to": rd}
+                    flow_filled += 1
+        except Exception as _e_fl:
+            result.setdefault("errors", []).append(f"[정보] 거래분해 사전계산 실패: {str(_e_fl)[:60]}")
+
+        # ── 개별 거래 매칭(full-match) 사전계산 — 짝 안 맞는 거래를 차이 품목에 첨부 ──
+        # 평일에 행 클릭 시 즉시 "전산오류 거래 위치" 표시 (OB 캐시는 위 compare가 채워둠)
+        fm_filled = 0
+        try:
+            _to2 = _dtw.strptime(rd, "%Y-%m-%d")
+            _from = (_to2 - _tdw(days=trace_months * 30)).strftime("%Y-%m-%d")
+            # 유통기한 날짜 suffix 제거 후 정규화 (full-match는 원본명+날짜, stock은 대표명 → 통일)
+            def _nrm_d(s):
+                s2 = _re_wr.sub(r'[\s\-_]+\d{2,4}[-.]\d{1,2}[-.]\d{1,2}\s*$', '', str(s or ''))
+                return _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", s2).lower()
+            fm = full_match(token=token, from_date=_from, to_date=rd,
+                            min_score=60, bh_lookback=5, location_ids=location_ids,
+                            bh_internal_keywords="일원화,품목통합,기초재고,재고이관,창고이동")
+            from collections import defaultdict as _dd_fm
+            _fm_bo = _dd_fm(list); _fm_oo = _dd_fm(list); _fm_qd = _dd_fm(list)
+            for x in fm.get("bh_only", []):
+                _fm_bo[_nrm_d(x.get("name") or "")].append({"date": x.get("date"), "qty": x.get("qty"), "bh_type": x.get("bh_type")})
+            for x in fm.get("ob_only", []):
+                _fm_oo[_nrm_d(x.get("name") or "")].append({"date": x.get("date"), "qty": x.get("qty"), "ob_type": x.get("ob_type")})
+            for x in fm.get("matched", []):
+                if x.get("qty_diff"):
+                    for nm in (x.get("bh_name"), x.get("ob_name")):
+                        _fm_qd[_nrm_d(nm or "")].append({"bh_date": x.get("bh_date"), "ob_date": x.get("ob_date"),
+                            "bh_qty": x.get("bh_qty"), "ob_qty": x.get("ob_qty"), "qty_diff": x.get("qty_diff"), "day_gap": x.get("day_gap")})
+            for r in result["rows"]:
+                if r.get("residual") in (None, 0):
+                    continue
+                k = _nrm_d(r.get("name") or "")
+                bo, oo, qd = _fm_bo.get(k, []), _fm_oo.get(k, []), _fm_qd.get(k, [])
+                if bo or oo or qd:
+                    # 수량차 중복 제거 (bh_name/ob_name 둘 다 등록되어 2배 가능)
+                    _seen = set(); _qd2 = []
+                    for q in qd:
+                        key = (q["bh_date"], q["ob_date"], q["bh_qty"], q["ob_qty"])
+                        if key not in _seen:
+                            _seen.add(key); _qd2.append(q)
+                    r["fm"] = {"bh_only": bo, "ob_only": oo, "qty_diff": _qd2, "from": _from, "to": rd}
+                    fm_filled += 1
+        except Exception as _e_fm:
+            result.setdefault("errors", []).append(f"[정보] 개별매칭 사전계산 실패: {str(_e_fm)[:60]}")
+
+        try:
+            _db.save_stock_report(rd, location_ids, result)  # 사전계산 반영해 덮어쓰기
+        finally:
+            _WR_ENRICHING.discard((rd, location_ids))
+
+    import threading as _th_wr
+    if (rd, location_ids) not in _WR_ENRICHING:
+        _WR_ENRICHING.add((rd, location_ids))
+        _th_wr.Thread(target=_enrich_report, daemon=True, name="weekly-report-enrich").start()
+
     return {
         "saved": True, "report_date": rd, "location_ids": location_ids,
         "total": result.get("total"), "diff_count": result.get("diff_count"),
         "need_trace_count": result.get("need_trace_count"),
-        "flow_precomputed": flow_filled,
-        "fm_precomputed": fm_filled,
+        "enrich": "background",
     }
+
+
+@router.get("/stock-diff-change")
+def stock_diff_change(
+    token: str = Query(...),
+    name: str = Query(...),                    # 품목명 (재고현황 행 name)
+    report_t1_id: int = Query(...),            # 이전(기준) 리포트 id
+    report_t2_id: int = Query(0),              # 비교(나중) 리포트 id (0=최신 저장 리포트)
+    location_ids: str = Query("228640"),
+    include_fm: bool = Query(True),            # 개별 거래 매칭(한쪽에만 있는 거래) 포함
+):
+    """두 재고 스냅샷(t1→t2) 사이에 품목의 BH재고−OB가용 차이가 왜 벌어졌는지 분해.
+
+    - 스냅샷 변화(ΔBH재고·ΔOB가용·Δ가용외·ΔD)는 저장된 리포트 값에서 정확히 계산.
+    - 그 기간 거래 흐름(입고/출고/조정 BH vs OB)은 compare(total)로 근사 분해.
+    - ΔD = (입고차) − (출고차) + (조정차) + (가용외변동) + 잔차(기간경계·미기록).
+    - include_fm: 그 기간 한쪽에만 기록된 개별 거래(full-match)도 첨부.
+    """
+    import receiving_db as _db
+    import re as _re_dc
+
+    def _nrm(s: str) -> str:
+        return _re_dc.sub(r"[\s\-_·•\[\]()（）]", "", str(s or "")).lower()
+    def _nrm_d(s: str) -> str:
+        s2 = _re_dc.sub(r'[\s\-_]+\d{2,4}[-.]\d{1,2}[-.]\d{1,2}\s*$', '', str(s or ''))
+        return _re_dc.sub(r"[\s\-_·•\[\]()（）]", "", s2).lower()
+
+    # 1) 리포트 로드 (t2 미지정 시 최신)
+    r1 = _db.get_stock_report(report_t1_id)
+    if report_t2_id:
+        r2 = _db.get_stock_report(report_t2_id)
+    else:
+        _reps = _db.list_stock_reports(1)
+        r2 = _db.get_stock_report(_reps[0]["id"]) if _reps else {}
+    if not r1 or not r2:
+        raise HTTPException(404, "비교할 재고 리포트를 찾을 수 없습니다")
+
+    # 2) 두 리포트에서 해당 품목 행 찾기 (이름 정규화 매칭)
+    nkey = _nrm(name)
+    def _find(rows):
+        for row in rows or []:
+            if _nrm(row.get("name")) == nkey:
+                return row
+        return None
+    row1 = _find(r1.get("rows", []))
+    row2 = _find(r2.get("rows", []))
+    if not row1 and not row2:
+        raise HTTPException(404, f"'{name}' 품목을 두 리포트에서 찾을 수 없습니다")
+
+    def _g(row, k, default=None):
+        return (row or {}).get(k, default)
+
+    t1d, t2d = r1.get("report_date", ""), r2.get("report_date", "")
+    bh1, bh2 = _g(row1, "bh_stock"), _g(row2, "bh_stock")
+    oba1, oba2 = _g(row1, "ob_stock_available"), _g(row2, "ob_stock_available")
+    obt1, obt2 = _g(row1, "ob_stock_total"), _g(row2, "ob_stock_total")
+    obu1, obu2 = _g(row1, "ob_unusable") or 0, _g(row2, "ob_unusable") or 0
+    # 주지표(총재고 기준)로 통일. 저장된 'diff'는 리포트 시점에 따라 가용/총 기준이 섞일 수 있어
+    # bh_stock·ob_total에서 직접 재계산(구 리포트도 일관). 가용 기준은 보조로 별도 계산.
+    d1 = (bh1 - obt1) if (bh1 is not None and obt1 is not None) else _g(row1, "diff")
+    d2 = (bh2 - obt2) if (bh2 is not None and obt2 is not None) else _g(row2, "diff")
+    d1_av = (bh1 - oba1) if (bh1 is not None and oba1 is not None) else None
+    d2_av = (bh2 - oba2) if (bh2 is not None and oba2 is not None) else None
+    delta_d = (d2 or 0) - (d1 or 0)
+    delta_d_av = (d2_av or 0) - (d1_av or 0)
+    delta_bh = (bh2 or 0) - (bh1 or 0)
+    delta_ob_total = (obt2 or 0) - (obt1 or 0)
+    delta_unavail = obu2 - obu1
+
+    # 3) 기간 거래 흐름 분해 (compare total) — 품목의 BH SKU 그룹으로 합산
+    bh_skus = set(_g(row2, "bh_skus") or _g(row1, "bh_skus") or [])
+    flow = {"bh_in": 0, "bh_out": 0, "bh_move": 0, "bh_adj": 0, "ob_in": 0, "ob_out": 0, "ob_adj": 0}
+    cmp_err = None
+    try:
+        cmp = compare(token=token, from_date=t1d, to_date=t2d, period="month",
+                      location_id=None, location_ids=location_ids or None,
+                      use_mapping=True, mode="total", by_channel=False,
+                      bh_lookback=0, qty_tolerance=0.0, merge_types=False,
+                      exclude_adj=False, bh_adj_max_qty=0)
+        _seen = set()
+        for cr in cmp.get("rows", []):
+            sk = str(cr.get("sku") or "")
+            matched = (any(s and s in sk for s in bh_skus) if bh_skus
+                       else _nrm(cr.get("name")) == nkey)
+            if not matched or sk in _seen:
+                continue
+            _seen.add(sk)
+            for k in flow:
+                flow[k] += cr.get(k + "_qty", 0) or 0
+    except Exception as e:
+        cmp_err = str(e)[:80]
+
+    # 4) 차이 변화 분해 (총재고 기준, 스냅샷 기반):
+    #    ΔD(총) = ΔBH재고 − ΔOB총재고 = net_stock_flow (입출고·조정 순차이) — 가용외는 총재고에 포함돼 빠짐.
+    #    참고로 가용 기준 변화 ΔD(가용) = net_stock_flow + ΔOB가용외 인데, 가용외 변동은
+    #    OB 할당/보류 상태 변화(거래 아님)이므로 총재고 기준에선 노이즈로 제거된다.
+    net_stock_flow = delta_bh - delta_ob_total       # BH·OB 순재고증감 차이 (입출고/조정 합) = ΔD(총)
+    contrib = {
+        "net_stock_flow":     net_stock_flow,        # 입·출고·조정의 BH−OB 순차이 (= 총재고 차이 변화)
+        "ob_unavail_change":  delta_unavail,         # OB 가용외(할당/보류) 변동 — 가용 기준에만 영향(노이즈)
+    }
+    explained = net_stock_flow                       # 총재고 기준 차이변화는 순재고흐름이 전부
+    residual = delta_d - explained                   # 스냅샷 정합성 체크(보통 ~0)
+    # net_stock_flow의 입고/출고 세부는 flow(거래흐름, 근사)로 참고 제공
+
+    # 4-b) 가용외 '환원'량 — 가용외 감소분 중 출고가 아니라 가용으로 되돌아온 양.
+    #   ΔOB가용 − ΔOB전체 > 0 이면 전체는 그대로인데 가용만 늘어남 = 가용외→가용 환원(할당/보류 해제).
+    delta_ob_avail = (oba2 or 0) - (oba1 or 0)
+    unavail_returned = delta_ob_avail - delta_ob_total   # >0: 가용외에서 가용으로 환원된 수량
+
+    # 4-c) BH 선등록(발송예정) — 같은 기간 채널분해로 계산(캐시 재사용). 절대 차이 수준에 기여.
+    prebook_bh = 0
+    prebook_list: list = []
+    try:
+        _ob_codes_s = ",".join(str(c) for c in (_g(row2, "ob_codes") or _g(row1, "ob_codes") or []))
+        _dec = item_out_decompose(
+            token=token, name=name,
+            bh_skus=",".join(sorted(str(s) for s in bh_skus)),
+            ob_codes=_ob_codes_s, from_date=t1d, to_date=t2d,
+            location_ids=location_ids or "228640")
+        prebook_bh = _dec.get("prebook_bh", 0) or 0
+        prebook_list = _dec.get("prebook", []) or []
+    except Exception:
+        pass
+
+    # 4-d) 매핑 그룹 구성 변화 — 두 스냅샷의 OB코드/BH SKU 집합이 다르면 같은 '품목명' 행이라도
+    #   속을 구성하는 코드가 달라 ob_total/가용/가용외 비교가 왜곡됨(사과↔오렌지). 거래 없이 가용이
+    #   변한 '흔적'의 상당수가 실은 이 그룹 재구성에서 옴 → 명시적으로 감지·노출.
+    c1 = set(str(x) for x in (_g(row1, "ob_codes") or []))
+    c2 = set(str(x) for x in (_g(row2, "ob_codes") or []))
+    s1 = set(str(x) for x in (_g(row1, "bh_skus") or []))
+    s2 = set(str(x) for x in (_g(row2, "bh_skus") or []))
+    group_change = {
+        "changed": (c1 != c2) or (s1 != s2),
+        "t1_only_codes": sorted(c1 - c2),   # t1에만 있던 OB코드 (t2에서 빠짐 → 그 코드 재고가 비교에서 사라짐)
+        "t2_only_codes": sorted(c2 - c1),   # t2에만 있는 OB코드 (새로 합쳐짐)
+        "t1_only_skus":  sorted(s1 - s2),
+        "t2_only_skus":  sorted(s2 - s1),
+    }
+
+    # 5) 개별 거래 (한쪽에만 기록) — full-match
+    bh_only, ob_only, qty_diff = [], [], []
+    if include_fm:
+        try:
+            fm = full_match(token=token, from_date=t1d, to_date=t2d,
+                            min_score=60, bh_lookback=3, location_ids=location_ids,
+                            bh_internal_keywords="일원화,품목통합,기초재고,재고이관,창고이동")
+            dkey = _nrm_d(name)
+            for x in fm.get("bh_only", []):
+                if _nrm_d(x.get("name")) == dkey:
+                    # BH 메모·채널을 직배송/누락 판별 단서로 노출 (full_match는 memo 키 사용)
+                    bh_only.append({"date": x.get("date"), "qty": x.get("qty"), "bh_type": x.get("bh_type"),
+                                    "memo": (x.get("memo") or x.get("ref") or "")[:80],
+                                    "channel": x.get("channel") or ""})
+            for x in fm.get("ob_only", []):
+                if _nrm_d(x.get("name")) == dkey:
+                    ob_only.append({"date": x.get("date"), "qty": x.get("qty"), "ob_type": x.get("ob_type"),
+                                    "channel": x.get("channel") or x.get("extra") or ""})
+            _seen_qd = set()
+            for x in fm.get("matched", []):
+                if not x.get("qty_diff"):
+                    continue
+                if _nrm_d(x.get("bh_name")) != dkey and _nrm_d(x.get("ob_name")) != dkey:
+                    continue
+                key = (x.get("bh_date"), x.get("ob_date"), x.get("bh_qty"), x.get("ob_qty"))
+                if key in _seen_qd:
+                    continue
+                _seen_qd.add(key)
+                qty_diff.append({"bh_date": x.get("bh_date"), "ob_date": x.get("ob_date"),
+                                 "bh_qty": x.get("bh_qty"), "ob_qty": x.get("ob_qty"),
+                                 "qty_diff": x.get("qty_diff"), "day_gap": x.get("day_gap"),
+                                 "bh_memo": (x.get("bh_memo") or "")[:80]})
+        except Exception:
+            pass
+
+    return {
+        "name": name,
+        "t1": {"date": t1d, "bh_stock": bh1, "ob_available": oba1, "ob_total": obt1, "ob_unusable": obu1, "diff": d1, "diff_vs_available": d1_av},
+        "t2": {"date": t2d, "bh_stock": bh2, "ob_available": oba2, "ob_total": obt2, "ob_unusable": obu2, "diff": d2, "diff_vs_available": d2_av},
+        "delta_diff": delta_d,
+        "delta_diff_available": delta_d_av,     # 참고: 가용 기준 차이 변화 (가용외 노이즈 포함)
+        "delta_bh_stock": delta_bh,
+        "delta_ob_total": delta_ob_total,
+        "delta_ob_available": delta_ob_avail,
+        "delta_ob_unusable": delta_unavail,
+        "unavail_returned": unavail_returned,   # 가용외→가용 환원 추정량 (거래 아님)
+        "prebook_bh": prebook_bh,               # BH 선등록(발송예정) — OB 미반영, 시점차
+        "prebook": prebook_list,
+        "group_change": group_change,           # 두 스냅샷 매핑 그룹 구성 변화 (비교 왜곡 원인)
+        "flow": flow,
+        "contrib": contrib,
+        "explained": explained,
+        "residual": residual,
+        "bh_only": bh_only, "ob_only": ob_only, "qty_diff": qty_diff,
+        "errors": ([f"기간 거래 분해 실패: {cmp_err}"] if cmp_err else []),
+    }
+
+
+def _ob_rec_prod_nm(rec: dict) -> str:
+    """OB 원시 레코드에서 상품명 추출."""
+    if not isinstance(rec, dict):
+        return ""
+    h = rec.get("header", rec)
+    for k in ("product_name", "sale_prod_nm", "prod_nm", "item_name"):
+        v = str(h.get(k) or "").strip()
+        if v and v != "None":
+            return html.unescape(v)
+    return ""
+
+
+def _collect_bh_ob_raw(token, from_date, to_date, loc_set, errors, cfg):
+    """BH·OB 원시 거래를 수집하고 위치 필터·코드 필터까지 적용해 반환하는 공통 헬퍼."""
+    bh_in_raw, bh_out_raw, bh_move_raw, bh_adj_raw = [], [], [], []
+    try:
+        bh_in_raw   = U.fetch_transactions(token, "in",     from_date, to_date, None)
+        bh_out_raw  = U.fetch_transactions(token, "out",    from_date, to_date, None)
+        bh_move_raw = U.fetch_transactions(token, "move",   from_date, to_date, None)
+        bh_adj_raw  = U.fetch_transactions(token, "adjust", from_date, to_date, None)
+        _enrich_bh_items(token, bh_in_raw)
+        _enrich_bh_items(token, bh_out_raw)
+        _enrich_bh_items(token, bh_move_raw)
+        _enrich_bh_items(token, bh_adj_raw, tx_type="adjust")
+    except Exception as e:
+        errors.append(f"BoxHero 거래 조회 실패: {str(e)[:80]}")
+
+    if loc_set:
+        def _filt(txs, prefer_from: bool = False):
+            _locs: dict = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as _ex:
+                _fs = {_ex.submit(_get_bh_tx_loc_id, token, t["id"], "location", prefer_from): t["id"]
+                       for t in txs if t.get("id")}
+                for _f in concurrent.futures.as_completed(_fs):
+                    try: _locs[_fs[_f]] = _f.result()
+                    except Exception: _locs[_fs[_f]] = None
+            _flush_tx_file_cache()
+            return [t for t in txs if _locs.get(t.get("id")) is None or _locs.get(t.get("id")) in loc_set]
+        try:
+            bh_in_raw = _filt(bh_in_raw); bh_out_raw = _filt(bh_out_raw)
+            # move는 출발지(from) 기준 필터 — 이 위치에서 나간 이동을 출고로 포함
+            bh_move_raw = _filt(bh_move_raw, prefer_from=True)
+        except Exception as e:
+            errors.append(f"[정보] BH 위치 필터 실패(전체 위치로 진행): {str(e)[:50]}")
+
+    ourbox_id, ourbox_pw = cfg.get("ourbox_id"), cfg.get("ourbox_pw")
+    ob_in_raw, ob_out_raw, ob_adj_raw = [], [], []
+    ob_source = "none"
+    if ourbox_id and ourbox_pw:
+        ob_ext_from = (datetime.strptime(from_date, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+        ob_ext_to   = (datetime.strptime(to_date,   "%Y-%m-%d") + timedelta(days=2)).strftime("%Y-%m-%d")
+        ck = f"{ob_ext_from}|{ob_ext_to}"
+        _load_ob_file_cache()
+        cached = _get_ob_cache(ck)
+        if cached:
+            ob_in_raw, ob_out_raw, ob_adj_raw = list(cached["in"]), list(cached["out"]), list(cached["adj"])
+            ob_source = cached.get("source", "rest")
+        else:
+            # 월 단위 청크로 수집 — 완결된 달은 키가 고정돼 영구 캐시 재사용.
+            # 긴 기간(6개월·1년)도 미캐시 달(보통 이번 달)만 새로 수집한다.
+            chunk_entries: list = []
+            failed = False
+            fallback_whole = False
+            for c_from, c_to in _ob_month_chunks(ob_ext_from, ob_ext_to):
+                cck = f"{c_from}|{c_to}"
+                centry = _get_ob_cache(cck)
+                if centry is None:
+                    ci, co, ca = [], [], []
+                    _errs: list = []
+                    src = _collect_ourbox(ourbox_id, ourbox_pw, c_from, c_to, ci, co, ca, _errs)
+                    for m in _errs:
+                        # 월별 호출이라 빈 달은 정상 — '데이터 0건' 안내는 청크에선 무시
+                        if "데이터 0건" not in m and m not in errors:
+                            errors.append(m)
+                    if src == "failed":
+                        failed = True
+                        break
+                    if src != "rest":
+                        # 스크래핑 fallback은 달마다 브라우저 세션이 떠서 월별 반복이 더 느림 → 전체 범위 일괄 수집
+                        fallback_whole = True
+                        break
+                    centry = {"in": ci, "out": co, "adj": ca, "source": src}
+                    try: _save_ob_file_cache_entry(cck, ci, co, ca, src)
+                    except Exception: pass
+                chunk_entries.append(centry)
+            if failed:
+                ob_source = "failed"
+            elif fallback_whole:
+                ob_in_raw, ob_out_raw, ob_adj_raw = [], [], []
+                ob_source = _collect_ourbox(ourbox_id, ourbox_pw, ob_ext_from, ob_ext_to, ob_in_raw, ob_out_raw, ob_adj_raw, errors)
+                if ob_source != "failed":
+                    try: _save_ob_file_cache_entry(ck, ob_in_raw, ob_out_raw, ob_adj_raw, ob_source)
+                    except Exception: pass
+            else:
+                for ce in chunk_entries:
+                    ob_in_raw.extend(ce.get("in") or [])
+                    ob_out_raw.extend(ce.get("out") or [])
+                    ob_adj_raw.extend(ce.get("adj") or [])
+                srcs = {ce.get("source", "rest") for ce in chunk_entries}
+                ob_source = "rest" if (not srcs or srcs == {"rest"}) else next(iter(srcs - {"rest"}))
+    else:
+        errors.append("[정보] OurBox 미설정 — BH만 표시")
+
+    ob_in_raw  = [r for r in ob_in_raw  if _ob_rec_prod_cd(r) not in DEPRECATED_OB_CODES]
+    ob_in_raw  = _filter_initial_stock(ob_in_raw)
+    ob_out_raw = [r for r in ob_out_raw if _ob_rec_prod_cd(r) not in DEPRECATED_OB_CODES]
+
+    return (bh_in_raw, bh_out_raw, bh_move_raw, bh_adj_raw,
+            ob_in_raw, ob_out_raw, ob_adj_raw, ob_source)
+
+
+@router.get("/channel-flow")
+def channel_flow(
+    token: str = Query(...),
+    from_date: str = Query(...),
+    to_date: str = Query(...),
+    location_ids: str = Query("228640"),
+    group_by: str = Query("channel"),
+    product_filter: str = Query(""),
+):
+    """거래처(채널)별 또는 제품별 입·출고·조정 총량을 BH vs OB로 비교.
+
+    group_by='channel' (기본): 채널 단위 집계.
+    group_by='product': 제품(상품명) 단위 집계. product_filter로 검색 가능.
+    """
+    errors: list = []
+    loc_set = {int(x) for x in location_ids.split(",") if str(x).strip().isdigit()}
+    ob_ch_res, bh_ch_res, ch_mapped = _build_channel_resolvers()
+    if group_by == "channel" and not ch_mapped:
+        errors.append("[정보] 채널 매핑이 없어 채널이 정확히 묶이지 않습니다 (상품 매핑 → 채널 매핑)")
+    cfg = U.load_config()
+
+    (bh_in_raw, bh_out_raw, bh_move_raw, bh_adj_raw,
+     ob_in_raw, ob_out_raw, ob_adj_raw, ob_source) = _collect_bh_ob_raw(
+        token, from_date, to_date, loc_set, errors, cfg)
+
+    mat: dict = defaultdict(lambda: {"bh_in": 0, "bh_out": 0, "bh_adj": 0, "ob_in": 0, "ob_out": 0, "ob_adj": 0})
+    prod_mat: dict = {}  # 채널별 모드에서만 채움 — {channel: {product: {bh_in,...}}}
+
+    # ── OB 헬퍼 (범위·수량) ──
+    def _in_range(rec, dks):
+        for dk in dks:
+            v = str(rec.get(dk) or "")[:10]
+            if v and v != "None":
+                return from_date <= v <= to_date
+        return True
+    def _qty(rec, ks):
+        for k in ks:
+            v = rec.get(k)
+            if v not in (None, "", "None"):
+                try: return abs(int(float(str(v).replace(",", ""))))
+                except Exception: return 0
+        return 0
+
+    if group_by == "product":
+        # ── 제품별 집계 ──
+        # 매핑 그룹으로 BH·OB 상품명 통합
+        mg = _build_mapping_groups()
+        bh_to_group = mg.get("bh_to_group", {}) if mg else {}
+        ob_to_group = mg.get("ob_to_group", {}) if mg else {}
+        ob_code_to_group = mg.get("ob_code_to_group", {}) if mg else {}
+        group_label = mg.get("group_label", {}) if mg else {}
+        group_name = mg.get("group_name", {}) if mg else {}
+
+        def _bh_prod_label(item_name: str) -> str:
+            nm = str(item_name or "").strip()
+            gid = bh_to_group.get(nm)
+            if gid:
+                return group_name.get(gid) or group_label.get(gid) or nm
+            return nm or "상품미상"
+
+        def _ob_prod_label(rec) -> str:
+            nm = _ob_rec_prod_nm(rec)
+            cd = _ob_rec_prod_cd(rec)
+            gid = ob_code_to_group.get(cd) or ob_to_group.get(nm)
+            if gid:
+                return group_name.get(gid) or group_label.get(gid) or nm
+            return nm or cd or "상품미상"
+
+        pf = product_filter.strip().lower()
+
+        for tx in bh_in_raw:
+            for it in tx.get("items", []):
+                q = abs(int(it.get("quantity", 0) or 0))
+                if q:
+                    label = _bh_prod_label(it.get("name", ""))
+                    mat[label]["bh_in"] += q
+        for tx in (bh_out_raw + bh_move_raw):
+            for it in tx.get("items", []):
+                q = abs(int(it.get("quantity", 0) or 0))
+                if q:
+                    label = _bh_prod_label(it.get("name", ""))
+                    mat[label]["bh_out"] += q
+        for tx in bh_adj_raw:
+            for it in tx.get("items", []):
+                q_raw = int(it.get("quantity", 0) or 0)
+                if q_raw < 0:
+                    label = _bh_prod_label(it.get("name", ""))
+                    mat[label]["bh_adj"] += abs(q_raw)
+        for rec in ob_in_raw:
+            if not _in_range(rec, ["input_dt", "input_complete_dt"]): continue
+            q = _qty(rec, ["input_qty"])
+            if q: mat[_ob_prod_label(rec)]["ob_in"] += q
+        for rec in ob_out_raw:
+            if not _in_range(rec, ["out_dt", "out_complete_dt"]): continue
+            q = _qty(rec, ["out_qty"])
+            if not q: continue
+            mat[_ob_prod_label(rec)]["ob_out"] += q
+        for rec in ob_adj_raw:
+            if not _in_range(rec, ["adj_dt", "reg_dt"]): continue
+            q = _qty(rec, ["adj_qty"])
+            if q: mat[_ob_prod_label(rec)]["ob_adj"] += q
+
+        if pf:
+            mat = {k: v for k, v in mat.items() if pf in k.lower()}
+
+    else:
+        # ── 채널별 집계 + 채널×제품 하위 집계 ──
+        mg = _build_mapping_groups()
+        bh_to_group = mg.get("bh_to_group", {}) if mg else {}
+        ob_to_group = mg.get("ob_to_group", {}) if mg else {}
+        ob_code_to_group = mg.get("ob_code_to_group", {}) if mg else {}
+        _group_label = mg.get("group_label", {}) if mg else {}
+        _group_name = mg.get("group_name", {}) if mg else {}
+
+        def _bh_prod(item_name: str) -> str:
+            nm = str(item_name or "").strip()
+            gid = bh_to_group.get(nm)
+            if gid:
+                return _group_name.get(gid) or _group_label.get(gid) or nm
+            return nm or "상품미상"
+
+        def _ob_prod(rec) -> str:
+            nm = _ob_rec_prod_nm(rec)
+            cd = _ob_rec_prod_cd(rec)
+            gid = ob_code_to_group.get(cd) or ob_to_group.get(nm)
+            if gid:
+                return _group_name.get(gid) or _group_label.get(gid) or nm
+            return nm or cd or "상품미상"
+
+        # 채널×제품 이중 키
+        prod_mat: dict = defaultdict(lambda: defaultdict(lambda: {"bh_in": 0, "bh_out": 0, "bh_adj": 0, "ob_in": 0, "ob_out": 0, "ob_adj": 0}))
+
+        def _bh_label(tx):
+            return (bh_ch_res(tx.get("memo") or "") if bh_ch_res else "") or "채널미상"
+        for tx in bh_in_raw:
+            ch = _bh_label(tx)
+            for it in tx.get("items", []):
+                q = abs(int(it.get("quantity", 0) or 0))
+                if q:
+                    mat[ch]["bh_in"] += q
+                    prod_mat[ch][_bh_prod(it.get("name", ""))]["bh_in"] += q
+        for tx in (bh_out_raw + bh_move_raw):
+            ch = _bh_label(tx)
+            for it in tx.get("items", []):
+                q = abs(int(it.get("quantity", 0) or 0))
+                if q:
+                    mat[ch]["bh_out"] += q
+                    prod_mat[ch][_bh_prod(it.get("name", ""))]["bh_out"] += q
+        for tx in bh_adj_raw:
+            ch = _bh_label(tx)
+            for it in tx.get("items", []):
+                q_raw = int(it.get("quantity", 0) or 0)
+                if q_raw < 0:
+                    mat[ch]["bh_adj"] += abs(q_raw)
+                    prod_mat[ch][_bh_prod(it.get("name", ""))]["bh_adj"] += abs(q_raw)
+        def _ob_label(rec):
+            raw = _ob_rec_channel(rec)
+            return (ob_ch_res(raw) if ob_ch_res else raw) or "채널미상"
+        for rec in ob_in_raw:
+            if not _in_range(rec, ["input_dt", "input_complete_dt"]): continue
+            q = _qty(rec, ["input_qty"])
+            if q:
+                ch = _ob_label(rec)
+                mat[ch]["ob_in"] += q
+                prod_mat[ch][_ob_prod(rec)]["ob_in"] += q
+        for rec in ob_out_raw:
+            if not _in_range(rec, ["out_dt", "out_complete_dt"]): continue
+            q = _qty(rec, ["out_qty"])
+            if not q: continue
+            ch = _ob_label(rec)
+            if _ob_rec_channel(rec) in ASSEMBLY_CHANNELS:
+                mat[ch]["ob_adj"] += q
+                prod_mat[ch][_ob_prod(rec)]["ob_adj"] += q
+            else:
+                mat[ch]["ob_out"] += q
+                prod_mat[ch][_ob_prod(rec)]["ob_out"] += q
+        for rec in ob_adj_raw:
+            if not _in_range(rec, ["adj_dt", "reg_dt"]): continue
+            q = _qty(rec, ["adj_qty"])
+            if q:
+                ch = _ob_label(rec)
+                mat[ch]["ob_adj"] += q
+                prod_mat[ch][_ob_prod(rec)]["ob_adj"] += q
+
+    rows = []
+    label_key = "product" if group_by == "product" else "channel"
+    unknown_label = "상품미상" if group_by == "product" else "채널미상"
+    _ord = {"bh_missing": 0, "diff": 1, "ob_bypass": 2, "match": 3, "unknown": 4}
+
+    def _classify(ch_name, m):
+        d = m["bh_out"] - m["ob_out"]
+        if ch_name == unknown_label:
+            return "unknown"
+        if m["bh_out"] == 0 and m["ob_out"] > 0:
+            return "bh_missing"
+        if m["ob_out"] == 0 and m["bh_out"] > 0:
+            return "ob_bypass"
+        if d == 0:
+            return "match"
+        return "diff"
+
+    for ch, m in mat.items():
+        kind = _classify(ch, m)
+        row = {
+            "channel": ch, label_key: ch, **m,
+            "diff_in":  m["bh_in"]  - m["ob_in"],
+            "diff_out": m["bh_out"] - m["ob_out"],
+            "diff_adj": m["bh_adj"] - m["ob_adj"],
+            "kind":     kind,
+        }
+        # 채널별 모드일 때 하위 제품 내역 첨부
+        if group_by == "channel" and ch in prod_mat:
+            prods = []
+            pf = product_filter.strip().lower()
+            for pname, pm in prod_mat[ch].items():
+                if pf and pf not in pname.lower():
+                    continue
+                pk = _classify(pname, pm)
+                prods.append({
+                    "product": pname, **pm,
+                    "diff_in": pm["bh_in"] - pm["ob_in"],
+                    "diff_out": pm["bh_out"] - pm["ob_out"],
+                    "diff_adj": pm["bh_adj"] - pm["ob_adj"],
+                    "kind": pk,
+                })
+            prods.sort(key=lambda r: (_ord[r["kind"]], -(abs(r["diff_out"]) + abs(r["diff_in"]))))
+            row["products"] = prods
+        rows.append(row)
+
+    rows.sort(key=lambda r: (_ord[r["kind"]], -(abs(r["diff_out"]) + abs(r["diff_in"]))))
+    return {
+        "rows": rows, "from": from_date, "to": to_date,
+        "group_by": group_by,
+        "channel_mapped": ch_mapped, "ob_source": ob_source, "errors": errors,
+    }
+
+
+@router.get("/item-out-decompose")
+def item_out_decompose(
+    token: str = Query(...),
+    name: str = Query(""),
+    bh_skus: str = Query(""),       # 콤마구분 — 이 품목의 BH SKU 그룹
+    ob_codes: str = Query(""),      # 콤마구분 — 이 품목의 OB 상품코드 그룹
+    from_date: str = Query(...),
+    to_date: str = Query(...),
+    location_ids: str = Query("228640"),
+):
+    """단일 품목의 BH 출고를 채널별로 분해해 'OB 경유' vs 'OB 미경유(직배송)'로 분류.
+
+    BH는 모든 출고를 기록하지만 OB(아워박스)는 OB 경유 출고만 기록한다.
+    → BH출고 − OB출고 차이가 "OB 미경유 채널(직배송·타물류)"로 설명되는지 자동 판단.
+    - ob_bypass(미경유): 해당 채널에 BH 출고는 있으나 OB 출고가 0 → 직배송 추정.
+    - 경유(routed): OB에도 출고가 잡힌 채널. 이 안의 BH−OB 차이가 진짜 대사 차이.
+    """
+    import re as _re_iod
+    errors: list = []
+    loc_set = {int(x) for x in location_ids.split(",") if str(x).strip().isdigit()}
+    ob_ch_res, bh_ch_res, ch_mapped = _build_channel_resolvers()
+    cfg = U.load_config()
+
+    def _nrm(s: str) -> str:
+        return _re_iod.sub(r"[\s\-_·•\[\]()（）]", "", str(s or "")).lower()
+
+    sku_set = {s.strip() for s in bh_skus.split(",") if s.strip()}
+    code_set = {c.strip() for c in ob_codes.split(",") if c.strip()}
+    nkey = _nrm(name)
+
+    # ── 상품 매칭(매핑 그룹)을 근거로 BH↔OB를 묶는다 ──
+    #   부분문자열 휴리스틱 대신 사용자가 확정한 상품 매칭 그룹으로 판정 →
+    #   같은 그룹이면 코드/SKU 문자열이 달라도 매칭, 다른 그룹(예: 번들)이면 substring 비슷해도 제외.
+    mg = _build_mapping_groups() or {}
+    bh_to_group      = mg.get("bh_to_group", {}) or {}
+    ob_code_to_group = mg.get("ob_code_to_group", {}) or {}
+    ob_to_group      = mg.get("ob_to_group", {}) or {}
+    bh_name_to_group = mg.get("bh_name_to_group", {}) or {}
+    target_groups = set()
+    for s in sku_set:
+        g = bh_to_group.get(s)
+        if g: target_groups.add(g)
+    for c in code_set:
+        g = ob_code_to_group.get(c)
+        if g: target_groups.add(g)
+
+    (bh_in_raw, bh_out_raw, bh_move_raw, bh_adj_raw,
+     ob_in_raw, ob_out_raw, ob_adj_raw, ob_source) = _collect_bh_ob_raw(
+        token, from_date, to_date, loc_set, errors, cfg)
+
+    def _bh_match(it: dict) -> bool:
+        sku = str(it.get("sku") or "")
+        nm  = it.get("name") or ""
+        # 1순위: 상품 매칭 그룹 일치
+        if target_groups:
+            g = bh_to_group.get(sku) or bh_name_to_group.get(nm)
+            if g and g in target_groups:
+                return True
+        # 2순위: 매핑 누락분 대비 정확 SKU 일치 (substring 금지 — 오매칭 방지)
+        if sku_set:
+            return sku in sku_set
+        # 매핑·SKU 정보 없을 때만 이름 폴백
+        return _nrm(nm) == nkey if nkey else False
+
+    def _ob_match(rec: dict) -> bool:
+        cd  = _ob_rec_prod_cd(rec)
+        onm = _ob_rec_prod_nm(rec)
+        if target_groups:
+            g = ob_code_to_group.get(cd) or ob_to_group.get(onm)
+            if g and g in target_groups:
+                return True
+        if code_set:
+            return cd in code_set
+        return _nrm(onm) == nkey if nkey else False
+
+    def _in_range(rec, dks):
+        for dk in dks:
+            v = str(rec.get(dk) or rec.get("header", {}).get(dk) if isinstance(rec.get("header"), dict) else rec.get(dk) or "")[:10]
+            if v and v != "None":
+                return from_date <= v <= to_date
+        return True
+    def _ob_qty(rec):
+        h = rec.get("header", rec) if isinstance(rec, dict) else {}
+        v = h.get("out_qty")
+        if v in (None, "", "None"): return 0
+        try: return abs(int(float(str(v).replace(",", ""))))
+        except Exception: return 0
+
+    from collections import defaultdict as _dd_iod
+    bh_by_ch: dict = _dd_iod(int)
+    ob_by_ch: dict = _dd_iod(int)
+    future_by_ch: dict = _dd_iod(int)   # 채널별 '발송예정(메모일>조회종료일)' BH 출고
+    prebook_list: list = []             # 선등록 거래 상세 [{date, ship_date, channel, qty, memo}]
+
+    def _bh_label(tx):
+        return (bh_ch_res(tx.get("memo") or "") if bh_ch_res else "") or "채널미상"
+    def _ob_label(rec):
+        raw = _ob_rec_channel(rec)
+        return (ob_ch_res(raw) if ob_ch_res else raw) or "채널미상"
+
+    def _memo_ship_date(memo: str, tx_date: str):
+        """메모에서 발송(예정)일 추출. 'N월M일' 우선, 없으면 'M일'(거래월 기준).
+        반환: 'YYYY-MM-DD' 또는 None."""
+        try:
+            tx_dt = datetime.strptime(str(tx_date)[:10], "%Y-%m-%d")
+        except Exception:
+            return None
+        m = _re_iod.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", memo or "")
+        if m:
+            mo, dy = int(m.group(1)), int(m.group(2))
+            for yr in (tx_dt.year, tx_dt.year + 1):
+                try:
+                    cand = datetime(yr, mo, dy)
+                    if (cand - tx_dt).days >= -300:
+                        return cand.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+            return None
+        m2 = _re_iod.search(r"(?<!\d)(\d{1,2})\s*일(?!\s*분)", memo or "")
+        if m2:
+            dy = int(m2.group(1))
+            mo, yr = tx_dt.month, tx_dt.year
+            try:
+                cand = datetime(yr, mo, dy)
+            except Exception:
+                return None
+            # 메모일이 거래일보다 한참 작으면 익월 발송으로 간주 (예: 거래 6/28 메모 '2일' → 7/2)
+            if dy < tx_dt.day - 10:
+                mo2, yr2 = (mo + 1, yr) if mo < 12 else (1, yr + 1)
+                try: cand = datetime(yr2, mo2, dy)
+                except Exception: pass
+            return cand.strftime("%Y-%m-%d")
+        return None
+
+    # BH 출고(순수 out — move 제외; 표의 BH출고 값과 일치)
+    for tx in bh_out_raw:
+        ch = _bh_label(tx)
+        memo = tx.get("memo") or ""
+        tx_date = str(tx.get("transaction_time") or tx.get("created_at") or "")[:10]
+        ship = _memo_ship_date(memo, tx_date)
+        is_future = bool(ship and ship > to_date)   # 메모 발송일이 조회 종료일보다 미래 → 선등록
+        for it in tx.get("items", []):
+            if not _bh_match(it):
+                continue
+            q = abs(int(it.get("quantity", 0) or 0))
+            if q:
+                bh_by_ch[ch] += q
+                if is_future:
+                    future_by_ch[ch] += q
+                    prebook_list.append({"date": tx_date, "ship_date": ship,
+                                         "channel": ch, "qty": q, "memo": memo[:50]})
+    # OB 출고 (전산처리용=세트조립은 출고 아님 → 제외)
+    for rec in ob_out_raw:
+        if _ob_rec_channel(rec) in ASSEMBLY_CHANNELS:
+            continue
+        if not _ob_match(rec):
+            continue
+        if not _in_range(rec, ["out_dt", "out_complete_dt"]):
+            continue
+        q = _ob_qty(rec)
+        if q:
+            ob_by_ch[_ob_label(rec)] += q
+
+    channels = set(bh_by_ch) | set(ob_by_ch)
+    ch_rows = []
+    bypass_bh = routed_bh = routed_ob = bh_missing_ob = prebook_bh = 0
+    for ch in channels:
+        b, o = bh_by_ch.get(ch, 0), ob_by_ch.get(ch, 0)
+        # 선등록(발송예정)은 채널 미매칭 초과분 한도 내에서만 인정 (OB가 이미 잡았으면 제외)
+        pre = min(future_by_ch.get(ch, 0), max(0, b - o))
+        prebook_bh += pre
+        if o == 0 and b > 0:
+            kind = "ob_bypass"; bypass_bh += b
+        elif b == 0 and o > 0:
+            kind = "bh_missing"; bh_missing_ob += o
+        else:
+            kind = "match" if b == o else "diff"
+            routed_bh += b; routed_ob += o
+        ch_rows.append({"channel": ch, "bh_out": b, "ob_out": o, "diff": b - o,
+                        "kind": kind, "prebook": pre})
+
+    _ord = {"ob_bypass": 0, "diff": 1, "bh_missing": 2, "match": 3}
+    ch_rows.sort(key=lambda r: (_ord.get(r["kind"], 9), -abs(r["diff"])))
+    prebook_list.sort(key=lambda x: (x.get("ship_date") or "", -x.get("qty", 0)))
+
+    bh_total = sum(bh_by_ch.values())
+    ob_total = sum(ob_by_ch.values())
+    return {
+        "name": name, "from": from_date, "to": to_date,
+        "bh_out_total": bh_total,
+        "ob_out_total": ob_total,
+        "diff": bh_total - ob_total,
+        "bypass_bh": bypass_bh,            # OB 미경유(직배송) BH 출고 — 차이의 설명분
+        "prebook_bh": prebook_bh,          # BH 선등록(발송예정, 메모일>종료일) — OB 미반영, 곧 해소
+        "routed_bh": routed_bh,            # OB 경유 채널의 BH 출고
+        "routed_ob": routed_ob,            # OB 경유 채널의 OB 출고
+        "routed_diff": routed_bh - routed_ob,  # 경유 채널 내 진짜 대사 차이
+        "real_diff": (bh_total - ob_total) - bypass_bh - prebook_bh,  # 직배송·선등록 제외한 순수 미스매칭
+        "bh_missing_ob": bh_missing_ob,    # BH엔 없고 OB에만 있는 출고
+        "channels": ch_rows,
+        "prebook": prebook_list,           # 선등록 거래 상세
+        "channel_mapped": ch_mapped, "ob_source": ob_source, "errors": errors,
+    }
+
+
+@router.get("/stock-diff-trace")
+def stock_diff_trace(
+    token: str = Query(...),
+    name: str = Query(""),
+    bh_skus: str = Query(""),        # 콤마구분 — 이 품목의 BH SKU 그룹
+    ob_codes: str = Query(""),       # 콤마구분 — 이 품목의 OB 상품코드 그룹
+    from_date: str = Query(...),
+    to_date: str = Query(...),
+    location_ids: str = Query("228640"),
+    bh_stock: Optional[int] = Query(None),   # 현재 BH 재고 (재고현황 행 값)
+    ob_total: Optional[int] = Query(None),   # 현재 OB 총재고
+    ob_unav: int = Query(0),                 # 현재 OB 가용외
+    tol_days: int = Query(3),                # 전표 시점차 허용일
+):
+    """단일 품목 거래 흐름 정밀 대사 — 재고 차이가 '어느 거래에서' 났는지 분해.
+
+    방법: BH·OB의 입고/출고 이벤트를 수량 기준 ±tol_days로 짝짓고(1:1 + 1:N 조합),
+    남는 이벤트를 원인 분류: 교차기록(품목 엇갈림)·선차감(가용외)·기간이전차이·
+    기간경계 시점차·한쪽만 기록. 등식: 차이 = 기간이전차이 + Σ(잔여 이벤트 영향).
+    """
+    import flow_trace as FT
+    errors: list = []
+    loc_set = {int(x) for x in location_ids.split(",") if str(x).strip().isdigit()}
+    cfg = U.load_config()
+
+    sku_set = {s.strip() for s in bh_skus.split(",") if s.strip()}
+    code_set = {c.strip() for c in ob_codes.split(",") if c.strip()}
+    import re as _re_dt
+    def _nrm(s: str) -> str:
+        return _re_dt.sub(r"[\s\-_·•\[\]()（）]", "", str(s or "")).lower()
+    nkey = _nrm(name)
+
+    # 상품 매칭 그룹 (item_out_decompose와 동일 기준)
+    mg = _build_mapping_groups() or {}
+    bh_to_group      = mg.get("bh_to_group", {}) or {}
+    ob_code_to_group = mg.get("ob_code_to_group", {}) or {}
+    ob_to_group      = mg.get("ob_to_group", {}) or {}
+    bh_name_to_group = mg.get("bh_name_to_group", {}) or {}
+    group_name       = mg.get("group_name", {}) or {}
+    group_label      = mg.get("group_label", {}) or {}
+    target_groups = set()
+    for s in sku_set:
+        g = bh_to_group.get(s)
+        if g: target_groups.add(g)
+    for c in code_set:
+        g = ob_code_to_group.get(c)
+        if g: target_groups.add(g)
+
+    (bh_in_raw, bh_out_raw, bh_move_raw, bh_adj_raw,
+     ob_in_raw, ob_out_raw, ob_adj_raw, ob_source) = _collect_bh_ob_raw(
+        token, from_date, to_date, loc_set, errors, cfg)
+
+    def _bh_match(it: dict) -> bool:
+        sku = str(it.get("sku") or "")
+        nm  = it.get("name") or ""
+        if target_groups:
+            g = bh_to_group.get(sku) or bh_name_to_group.get(nm)
+            if g and g in target_groups:
+                return True
+        if sku_set:
+            return sku in sku_set
+        return _nrm(nm) == nkey if nkey else False
+
+    def _ob_match(rec: dict) -> bool:
+        cd  = _ob_rec_prod_cd(rec)
+        onm = _ob_rec_prod_nm(rec)
+        if target_groups:
+            g = ob_code_to_group.get(cd) or ob_to_group.get(onm)
+            if g and g in target_groups:
+                return True
+        if code_set:
+            return cd in code_set
+        return _nrm(onm) == nkey if nkey else False
+
+    # ── 상품 라벨 (교차기록 탐지용 — 전 품목 공통) ──
+    def _bh_prod_label(nm: str, sku: str = "") -> str:
+        gid = bh_to_group.get(sku) or bh_name_to_group.get(str(nm or "").strip())
+        if gid:
+            return str(group_name.get(gid) or group_label.get(gid) or nm)
+        return str(nm or "상품미상")
+
+    def _ob_prod_label(rec) -> str:
+        nm = _ob_rec_prod_nm(rec)
+        cd = _ob_rec_prod_cd(rec)
+        gid = ob_code_to_group.get(cd) or ob_to_group.get(nm)
+        if gid:
+            return str(group_name.get(gid) or group_label.get(gid) or nm)
+        return str(nm or cd or "상품미상")
+
+    # ── 이벤트 빌드 ──
+    def _tx_date(tx) -> str:
+        return str(tx.get("transaction_time") or tx.get("created_at") or "")[:10]
+
+    def _ob_date(rec, dks) -> str:
+        h = rec.get("header", rec) if isinstance(rec, dict) else {}
+        for dk in dks:
+            v = str(h.get(dk) or rec.get(dk) or "")[:10]
+            if v and v != "None":
+                return v
+        return ""
+
+    def _ob_qty_k(rec, key) -> int:
+        h = rec.get("header", rec) if isinstance(rec, dict) else {}
+        v = h.get(key, rec.get(key))
+        if v in (None, "", "None"):
+            return 0
+        try:
+            return int(float(str(v).replace(",", "")))
+        except Exception:
+            return 0
+
+    bh_in_ev, bh_out_ev = [], []
+    ob_in_ev, ob_out_ev = [], []
+    # 교차기록 탐지용: 전 품목 일자별 BH/OB 입·출고 합
+    daily_out: dict = defaultdict(lambda: defaultdict(lambda: {"bh": 0, "ob": 0}))
+    daily_in:  dict = defaultdict(lambda: defaultdict(lambda: {"bh": 0, "ob": 0}))
+
+    for tx, ttype, sign in ([(t, "입고", 1) for t in bh_in_raw] +
+                            [(t, "출고", -1) for t in bh_out_raw] +
+                            [(t, "이동", -1) for t in bh_move_raw] +
+                            [(t, "조정", 0) for t in bh_adj_raw]):
+        d = _tx_date(tx)
+        if not d or not (from_date <= d <= to_date):
+            continue
+        memo = str(tx.get("memo") or "")[:60]
+        for it in tx.get("items", []):
+            q = int(it.get("quantity", 0) or 0)
+            if not q:
+                continue
+            eff = q if ttype == "조정" else sign * abs(q)   # 조정은 부호 그대로
+            label = _bh_prod_label(it.get("name", ""), str(it.get("sku") or ""))
+            (daily_in if eff > 0 else daily_out)[label][d]["bh"] += abs(eff)
+            if not _bh_match(it):
+                continue
+            ev = {"date": d, "qty": abs(eff), "memo": memo, "channel": "", "type": ttype}
+            (bh_in_ev if eff > 0 else bh_out_ev).append(ev)
+
+    for rec in ob_in_raw:
+        d = _ob_date(rec, ["input_dt", "input_complete_dt"])
+        if not d or not (from_date <= d <= to_date):
+            continue
+        q = abs(_ob_qty_k(rec, "input_qty"))
+        if not q:
+            continue
+        label = _ob_prod_label(rec)
+        daily_in[label][d]["ob"] += q
+        if _ob_match(rec):
+            ob_in_ev.append({"date": d, "qty": q, "memo": "",
+                             "channel": _ob_rec_channel(rec), "type": "입고"})
+    for rec in ob_out_raw:
+        d = _ob_date(rec, ["out_dt", "out_complete_dt"])
+        if not d or not (from_date <= d <= to_date):
+            continue
+        q = abs(_ob_qty_k(rec, "out_qty"))
+        if not q:
+            continue
+        ch = _ob_rec_channel(rec)
+        label = _ob_prod_label(rec)
+        daily_out[label][d]["ob"] += q
+        if _ob_match(rec):
+            ob_out_ev.append({"date": d, "qty": q, "memo": "",
+                              "channel": ch,
+                              "type": "세트" if ch in ASSEMBLY_CHANNELS else "출고"})
+    for rec in ob_adj_raw:
+        d = _ob_date(rec, ["adj_dt", "reg_dt"])
+        if not d or not (from_date <= d <= to_date):
+            continue
+        q = _ob_qty_k(rec, "adj_qty")
+        if not q:
+            continue
+        label = _ob_prod_label(rec)
+        (daily_in if q > 0 else daily_out)[label][d]["ob"] += abs(q)
+        if _ob_match(rec):
+            ev = {"date": d, "qty": abs(q), "memo": "", "channel": _ob_rec_channel(rec), "type": "조정"}
+            (ob_in_ev if q > 0 else ob_out_ev).append(ev)
+
+    # OB 출고는 주문라인 단위(수량 1~2 수천 건)라 그대로 매칭하면 조합 탐색이 폭발.
+    # 같은 (일자, 채널, 유형)은 합산 — BH도 일 단위 배치 출고라 매칭 의미는 동일.
+    def _agg_ob_ev(evs: list) -> list:
+        agg: dict = {}
+        for e in evs:
+            k = (e["date"], e.get("channel", ""), e.get("type", ""))
+            if k in agg:
+                agg[k]["qty"] += e["qty"]
+                agg[k]["_n"] += 1
+            else:
+                agg[k] = dict(e)
+                agg[k]["_n"] = 1
+        out = []
+        for e in agg.values():
+            n = e.pop("_n", 1)
+            if n > 1:
+                e["memo"] = f"주문 {n}건 합산"
+            out.append(e)
+        out.sort(key=lambda x: (x["date"], -x["qty"]))
+        return out
+
+    ob_in_ev = _agg_ob_ev(ob_in_ev)
+    ob_out_ev = _agg_ob_ev(ob_out_ev)
+
+    diff_now = (bh_stock - ob_total) if (bh_stock is not None and ob_total is not None) else None
+
+    # ── OB 가용외 스냅샷 타임라인 — 할당(가용→가용외) 시점을 일별 변화량으로 ──
+    # 선차감 판정을 '추정'→스냅샷 '확인'으로 승격하고, 참고(−가용) 기준 차이를 분해하는 데 사용
+    unav_events: list = []
+    snap_info = None
+    try:
+        snaps = stock_snapshots(name=name, codes=ob_codes, limit=2000)
+        series = snaps.get("series") or []
+        in_range = [s for s in series if from_date <= str(s.get("captured_at") or "")[:10] <= to_date]
+        daily_unav: dict = {}
+        for s in in_range:
+            dv = int(s.get("d_unavail") or 0)
+            if dv:
+                d = str(s.get("captured_at") or "")[:10]
+                daily_unav[d] = daily_unav.get(d, 0) + dv
+        unav_events = [{"date": d, "delta": v} for d, v in sorted(daily_unav.items()) if v]
+        if in_range:
+            snap_info = {
+                "from": in_range[0]["captured_at"], "to": in_range[-1]["captured_at"],
+                "unav_first": in_range[0]["unavailable"], "unav_last": in_range[-1]["unavailable"],
+            }
+    except Exception:
+        pass
+
+    result = FT.trace_item(
+        bh_in_ev, bh_out_ev, ob_in_ev, ob_out_ev,
+        diff_now=diff_now, ob_unav=ob_unav,
+        from_date=from_date, to_date=to_date, tol_days=tol_days,
+        daily_out_by_prod={k: dict(v) for k, v in daily_out.items()},
+        daily_in_by_prod={k: dict(v) for k, v in daily_in.items()},
+        target_label=name,
+        unav_events=unav_events,
+    )
+    ob_avail = (ob_total - ob_unav) if ob_total is not None else None
+    result["avail_basis"] = {
+        # 참고(−가용) 기준: BH − OB가용 = (BH − OB총재고) + 가용외
+        "diff_avail": (bh_stock - ob_avail) if (bh_stock is not None and ob_avail is not None) else None,
+        "ob_unav": ob_unav,
+        "unav_events": unav_events,
+        "snapshots": snap_info,
+    }
+    result.update({
+        "name": name, "from": from_date, "to": to_date,
+        "bh_stock": bh_stock, "ob_total": ob_total, "ob_unav": ob_unav,
+        "ob_source": ob_source, "errors": errors,
+    })
+    return result
 
 
 @router.get("/mapping-audit")
@@ -3452,6 +4897,119 @@ def get_weekly_report(report_id: int):
     if not r:
         raise HTTPException(404, "리포트를 찾을 수 없습니다")
     return r
+
+
+# ── OB 가용외(할당) 스냅샷 추적 ──────────────────────────────────────────────
+def _capture_ob_stock_snapshot(force: bool = False, min_gap_min: int = 90) -> dict:
+    """현재 OB 재고(total/available/unavailable)를 품목별로 1회 스냅샷 저장.
+
+    OurBox가 할당 이벤트 로그를 안 주므로, 주기적 스냅샷으로 가용→가용외 전환 시점을 추적.
+    force=False면 최근 스냅샷이 min_gap_min분 이내일 때 건너뜀(리로드 중복 방지).
+    """
+    import receiving_db as _db
+    import ourbox_api as api_mod
+    from datetime import datetime as _dt, timedelta as _td
+    _db.init_db()
+    if not force:
+        last = _db.last_ob_snapshot_at()
+        if last:
+            try:
+                if _dt.now() - _dt.strptime(last, "%Y-%m-%d %H:%M:%S") < _td(minutes=min_gap_min):
+                    return {"saved": False, "skipped": True, "last": last}
+            except Exception:
+                pass
+    cfg = U.load_config()
+    client = api_mod.make_client(cfg)
+    if not client:
+        return {"saved": False, "error": "OurBox 미설정"}
+    raw = client.fetch_stock()
+    items = []
+    for r in raw:
+        cd = str(r.get("sales_product_code") or "")
+        if not cd:
+            continue
+        items.append({
+            "code": cd,
+            "name": (r.get("product_name") or ""),
+            "total": int(r.get("total_stock") or 0),
+            "available": int(r.get("available_stock") or 0),
+            "unavailable": int(r.get("unavailable_stock") or 0),
+        })
+    ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    n = _db.save_ob_stock_snapshot(ts, items)
+    try:
+        _db.prune_ob_snapshots(60)
+    except Exception:
+        pass
+    return {"saved": True, "captured_at": ts, "count": n}
+
+
+@router.post("/capture-stock-snapshot")
+def capture_stock_snapshot(force: bool = Query(True)):
+    """OB 가용/가용외 스냅샷을 지금 1회 찍어 저장 (수동/스케줄 트리거)."""
+    return _capture_ob_stock_snapshot(force=force)
+
+
+@router.get("/stock-snapshots")
+def stock_snapshots(
+    name: str = Query("", description="품목명 (상품 매칭 그룹으로 코드 확장)"),
+    codes: str = Query("", description="OB 코드 직접 지정 (콤마)"),
+    limit: int = Query(2000),
+):
+    """한 품목의 가용/가용외/전체 스냅샷 시계열 — 상품 매칭 그룹 단위로 합산해 반환.
+
+    가용외(할당)가 언제 뛰는지 = 가용→가용외 할당이 떨어진 시점을 d_unavail로 표시.
+    """
+    import receiving_db as _db
+    import re as _re_wr
+    # 상품 매칭 그룹으로 코드 확장 (단일 코드만 보면 그룹 합과 어긋남)
+    code_set = {c.strip() for c in codes.split(",") if c.strip()}
+    nkey = _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", str(name or "")).lower()
+    try:
+        mg = _build_mapping_groups() or {}
+        oc2g = mg.get("ob_code_to_group", {}) or {}
+        o2g = mg.get("ob_to_group", {}) or {}
+        gname = mg.get("group_name", {}) or {}
+        target_groups = set()
+        for c in code_set:
+            g = oc2g.get(c)
+            if g: target_groups.add(g)
+        if name and not target_groups:
+            for onm, g in o2g.items():
+                if _re_wr.sub(r"[\s\-_·•\[\]()（）]", "", str(onm)).lower() == nkey:
+                    target_groups.add(g)
+        if target_groups:
+            for c, g in oc2g.items():
+                if g in target_groups:
+                    code_set.add(c)
+    except Exception:
+        pass
+
+    rows = _db.get_ob_stock_timeline(
+        codes=sorted(code_set) if code_set else None,
+        name_like=name if (name and not code_set) else "",
+        limit=limit,
+    )
+    # captured_at별 그룹 합산
+    from collections import OrderedDict as _OD
+    agg: dict = _OD()
+    for r in rows:
+        t = r["captured_at"]
+        a = agg.setdefault(t, {"captured_at": t, "total": 0, "available": 0, "unavailable": 0, "codes": 0})
+        a["total"] += r["total"]; a["available"] += r["available"]; a["unavailable"] += r["unavailable"]
+        a["codes"] += 1
+    series = list(agg.values())
+    # 연속 스냅샷 간 변화량 (가용외 할당 시점 식별)
+    prev = None
+    for s in series:
+        if prev is not None:
+            s["d_unavail"] = s["unavailable"] - prev["unavailable"]
+            s["d_avail"] = s["available"] - prev["available"]
+            s["d_total"] = s["total"] - prev["total"]
+        else:
+            s["d_unavail"] = s["d_avail"] = s["d_total"] = 0
+        prev = s
+    return {"name": name, "codes": sorted(code_set), "series": series, "count": len(series)}
 
 
 @router.get("/qty-gap")
@@ -3587,6 +5145,59 @@ def delete_set_bom(bom_id: int):
     return {"ok": True}
 
 
+# ── 행 단위 정리(전산정리) 상태 ──────────────────────────────────────
+def _recon_row_key(tx_type: str, sku: str, channel: str, period: str) -> str:
+    """대사 행 고유 키 — 프론트/백엔드 동일 규칙 유지."""
+    return f"{tx_type}|{sku}|{channel or ''}|{period}"
+
+
+@router.get("/status")
+def list_reconcile_status(from_period: str = Query(""), to_period: str = Query("")):
+    """기간 내 행 정리 상태 목록."""
+    import receiving_db as _rdb
+    return {"items": _rdb.get_reconcile_statuses(from_period, to_period)}
+
+
+@router.post("/status")
+def set_reconcile_status(body: dict):
+    """대사 행 정리 상태/메모 저장.
+
+    body: {tx_type, sku, channel, period, status, root_cause?, name?,
+           bh_qty?, ob_qty?, memo?, assignee?}
+    status: reviewing/resolved/hold/ignore
+    """
+    import receiving_db as _rdb
+    tx_type = str(body.get("tx_type", ""))
+    sku     = str(body.get("sku", ""))
+    channel = str(body.get("channel", "") or "")
+    period  = str(body.get("period", ""))
+    status  = str(body.get("status", "reviewing"))
+    if not (tx_type and sku and period):
+        raise HTTPException(400, "tx_type, sku, period는 필수입니다")
+    row_key = _recon_row_key(tx_type, sku, channel, period)
+    try:
+        rec = _rdb.upsert_reconcile_status(
+            row_key, status,
+            tx_type=tx_type, sku=sku, name=str(body.get("name", "")),
+            channel=channel, period=period,
+            root_cause=str(body.get("root_cause", "")),
+            bh_qty=body.get("bh_qty"), ob_qty=body.get("ob_qty"),
+            memo=str(body.get("memo", "")), assignee=str(body.get("assignee", "")),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "record": rec}
+
+
+@router.delete("/status")
+def clear_reconcile_status(tx_type: str = Query(...), sku: str = Query(...),
+                           period: str = Query(...), channel: str = Query("")):
+    """정리 상태 삭제 (미처리로 되돌림)."""
+    import receiving_db as _rdb
+    _rdb.delete_reconcile_status(_recon_row_key(tx_type, sku, channel, period))
+    return {"ok": True}
+
+
 @router.get("/full-match")
 def full_match(
     token: str = Query(...),
@@ -3609,7 +5220,7 @@ def full_match(
     import datetime as _dt_mod
 
     # ── 캐시 확인 (메모리 30분 + 파일 캐시) ──────────────────────────
-    _FM_LOGIC_VER = "v8"  # 매칭 로직 변경 시 증가 → stale 캐시 자동 무효화 (v7: 초월매칭 날짜 페널티 강화)
+    _FM_LOGIC_VER = "v9"  # 매칭 로직 변경 시 증가 → stale 캐시 자동 무효화 (v9: 날짜 하드상한10일+방향가드+다른SKU차단)
     # 월간+(15일 초과) 조회는 BH 범위가 ±7일 고정이라 lookback이 결과에 영향 없음
     # → 키에 실효값 사용: 슬라이더 변경으로 인한 무의미한 전체 재계산 방지
     _span_days = (datetime.strptime(to_date, "%Y-%m-%d") - datetime.strptime(from_date, "%Y-%m-%d")).days
@@ -3773,7 +5384,9 @@ def full_match(
                     import concurrent.futures as _cf_loc
                     _tx_locs: dict = {}
                     with _cf_loc.ThreadPoolExecutor(max_workers=3) as _ex_loc:
-                        _futs = {_ex_loc.submit(_get_bh_tx_loc_id, token, t["id"]): t["id"]
+                        # move는 출발지(from) 기준 — 이 위치發 이동을 놓치지 않도록
+                        _futs = {_ex_loc.submit(_get_bh_tx_loc_id, token, t["id"], "location",
+                                                tx_type == "move"): t["id"]
                                  for t in txs if t.get("id")}
                         for _f in _cf_loc.as_completed(_futs):
                             try:
@@ -4141,6 +5754,20 @@ def full_match(
             date_sc = max(0, 100 - gap * 20)  # 0일=100, 1일=80, 2일=60, 3일=40
             return round(qty_sc * 0.6 + date_sc * 0.4 + 5, 1)  # +5: 스마트스토어합계 보너스
 
+        # ── 공통: 날짜 격차 & 방향 (이하 모든 경로가 공유) ──
+        try:
+            gap = abs((datetime.strptime(b["date"],"%Y-%m-%d")-datetime.strptime(o["date"],"%Y-%m-%d")).days)
+        except Exception:
+            gap = 999
+        same_dir = b["is_positive"] == o["is_positive"]
+
+        # 수정①: 하드 날짜 상한 — 상시출고 품목의 한 달치 거래가 '우연한 수량 근사'만으로
+        #   뒤섞이는 오매칭 차단(예: 메노포즈 5/21출고 ↔ 6/22출고, 32일차). 초월 매칭 포함 전 경로 적용.
+        #   (스마트스토어 합계행은 위에서 ±3일로 이미 처리)
+        _MAX_GAP = 10
+        if gap > _MAX_GAP:
+            return 0.0
+
         # 수량 유사도 (이름보다 먼저 — SKU 초월 매칭에 필요)
         big = max(b["qty"], o["qty"])
         small = min(b["qty"], o["qty"])
@@ -4162,13 +5789,17 @@ def full_match(
         #   → 같은 SKU 후보 여럿일 때 수량이 더 가깝고 날짜가 가까운 쌍이 우선
         b_sku = b.get("map_sku") or ""
         o_sku = o.get("map_sku") or ""
+        # 수정③: 양쪽 모두 SKU가 등록돼 있는데 서로 다르면 다른 상품 → 즉시 탈락
+        #   (이름에 공통 토큰만 있어도 묶이던 다른 SKU 오매칭 차단)
+        if b_sku and o_sku and b_sku != o_sku:
+            return 0.0
         if b_sku and o_sku and b_sku == o_sku and qty_sc >= 70:
-            try:
-                _gap_sku = abs((datetime.strptime(b["date"],"%Y-%m-%d")-datetime.strptime(o["date"],"%Y-%m-%d")).days)
-            except Exception:
-                _gap_sku = 99
-            # 날짜 페널티 강화: 가까운 날짜 우선 (단 초월 매칭은 유지 — 최대 -15)
-            return round(150 - min(ratio * 100, 8) - min(_gap_sku * 0.15, 15), 2)  # 127~150
+            # 수정②: 방향 반대(출고↔입고)는 이동/조정 등 명시 맥락이거나 날짜 매우 근접(≤2일)일 때만
+            #   초월 매칭 허용. (move↔in 같은 정상 케이스는 유지, 먼 날짜 out↔in 오매칭은 일반 경로로)
+            _mv_adj = (b.get("bh_type") in ("move", "adjustment")) or b.get("is_adj") or (o.get("ob_type") == "adjustment")
+            if same_dir or _mv_adj or gap <= 2:
+                # 날짜 페널티 강화: 가까운 날짜 우선 (단 초월 매칭은 유지 — 최대 -15)
+                return round(150 - min(ratio * 100, 8) - min(gap * 0.15, 15), 2)  # 127~150
 
         # 이름 유사도
         if not b["norm"] or not o["norm"]: return 0.0
@@ -4178,21 +5809,15 @@ def full_match(
         # ══ 초월 매칭 2: 이름 매우 유사 + 수량 완전 일치 (SKU 미등록) ══
         # 날짜·유형 무시 (단, 이름 90%+ AND 수량 95%+만) — 동점은 날짜 근접도로 차등
         if name_sc >= 90 and qty_sc >= 95:
-            try:
-                _gap_nm = abs((datetime.strptime(b["date"],"%Y-%m-%d")-datetime.strptime(o["date"],"%Y-%m-%d")).days)
-            except Exception:
-                _gap_nm = 99
-            # 날짜 페널티 강화 (가까운 날짜 우선, 초월 매칭 유지 — 최대 -12)
-            return round(130 - min(ratio * 100, 5) - min(_gap_nm * 0.15, 12), 2)  # 113~130
+            # 수정②: 방향 반대는 날짜 매우 근접(≤2일)일 때만 초월 매칭. 그 외엔 아래 일반 경로(방향 감점 적용)로.
+            if same_dir or gap <= 2:
+                # 날짜 페널티 강화 (가까운 날짜 우선, 초월 매칭 유지 — 최대 -12)
+                return round(130 - min(ratio * 100, 5) - min(gap * 0.15, 12), 2)  # 113~130
 
-        # 날짜 근접도 (wide: 감점 최소화)
-        try:
-            gap = abs((datetime.strptime(b["date"],"%Y-%m-%d")-datetime.strptime(o["date"],"%Y-%m-%d")).days)
-        except: gap = 999
+        # 날짜 근접도 (wide: 감점 최소화) — gap은 위에서 계산됨
         date_sc = max(0, 100 - gap * 1.5)  # 67일 = 0점
 
         # 방향 일치 보너스 / 반대는 소폭 감점 (크로스 방향도 허용 — 유형·날짜·거래처는 UI에서 검토)
-        same_dir = b["is_positive"] == o["is_positive"]
         dir_bonus = 8 if same_dir else -8
 
         # 힌트 보너스
@@ -5287,6 +6912,8 @@ def item_search(
         # 사장된 코드 제거
         ob_in_r  = [r for r in ob_in_r  if str(r.get("prod_cd") or r.get("product_code") or "") not in DEPRECATED_OB_CODES]
         ob_out_r = [r for r in ob_out_r if str(r.get("prod_cd") or r.get("product_code") or "") not in DEPRECATED_OB_CODES]
+        # 기초재고 일괄입고 제거 (OurBox 도입 초기 재고등록 — BH 미대응)
+        ob_in_r  = [r for r in ob_in_r  if str(r.get("input_code") or "").strip() not in OB_INITIAL_STOCK_INPUT_CODES]
         # 전산처리용: 출고(단품) → adj, 입고(세트) → 제외
         ob_out_normal = [r for r in ob_out_r if str(r.get("channel") or r.get("mall_name") or "") not in ASSEMBLY_CHANNELS]
         ob_out_asm    = [r for r in ob_out_r if str(r.get("channel") or r.get("mall_name") or "") in ASSEMBLY_CHANNELS]

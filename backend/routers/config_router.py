@@ -35,9 +35,14 @@ def update_config(body: ConfigUpdate):
 @router.post("/master/upload")
 async def upload_master(file: UploadFile = File(...)):
     data = await file.read()
-    state.master_bytes = data
     import pandas as pd, io
-    df = pd.read_excel(io.BytesIO(data))
+    from fastapi import HTTPException
+    try:
+        df = pd.read_excel(io.BytesIO(data))
+    except Exception as e:
+        # 검증 실패 시 기존 마스터를 유지 — 깨진 파일이 state를 오염시키면 안 됨
+        raise HTTPException(400, f"엑셀 파일이 아니거나 읽을 수 없습니다: {e}")
+    state.master_bytes = data
     return {"ok": True, "rows": len(df), "filename": file.filename}
 
 

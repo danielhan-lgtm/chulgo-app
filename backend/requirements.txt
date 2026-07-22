@@ -4,6 +4,8 @@ python-multipart
 pandas
 openpyxl
 rapidfuzz
+python-pptx
+pdfplumber
 requests
 slack-sdk
 google-auth

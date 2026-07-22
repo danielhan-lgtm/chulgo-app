@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react'
-import { Button, Select, message, Spin, Alert, Row, Col, Upload } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import { Button, Select, message, Spin, Alert, Row, Col, Upload, Switch } from 'antd'
+import { ReloadOutlined, RobotOutlined } from '@ant-design/icons'
 import type { AppConfig, Location, SlackOrder, Page } from '../types'
 import {
   getSlackMessages, downloadSlackFile, toggleSlackReaction, joinSlackChannel,
-  base64ToBlob, convertGeneral, getGeneralColumns, convertNaver, sendToBoxhero, downloadBlob
+  base64ToBlob, convertGeneral, getGeneralColumns, convertNaver, sendToBoxhero, downloadBlob, updateConfig
 } from '../services/api'
 
 interface Props {
@@ -16,14 +16,33 @@ interface Props {
 
 function reactionToStatus(reactions: { name: string; count: number }[]) {
   const STATUS_MAP: Record<string, [string, string, string]> = {
+    // 완료
     white_check_mark: ['완료', '#10b981', '#d1fae5'],
     heavy_check_mark: ['완료', '#10b981', '#d1fae5'],
+    ballot_box_with_check: ['완료', '#10b981', '#d1fae5'],
     check: ['완료', '#10b981', '#d1fae5'],
+    check_mark: ['완료', '#10b981', '#d1fae5'],
     '100': ['완료', '#10b981', '#d1fae5'],
     done: ['완료', '#10b981', '#d1fae5'],
+    ok: ['완료', '#10b981', '#d1fae5'],
+    ok_hand: ['완료', '#10b981', '#d1fae5'],
+    완료: ['완료', '#10b981', '#d1fae5'],
+    완: ['완료', '#10b981', '#d1fae5'],
+    success: ['완료', '#10b981', '#d1fae5'],
+    // 진행중
     hourglass_flowing_sand: ['진행중', '#f59e0b', '#fef3c7'],
     hourglass: ['진행중', '#f59e0b', '#fef3c7'],
+    arrows_counterclockwise: ['진행중', '#f59e0b', '#fef3c7'],
+    loading: ['진행중', '#f59e0b', '#fef3c7'],
+    spinner: ['진행중', '#f59e0b', '#fef3c7'],
+    진행중: ['진행중', '#f59e0b', '#fef3c7'],
+    처리중: ['진행중', '#f59e0b', '#fef3c7'],
+    // 반려
     x: ['반려', '#ef4444', '#fee2e2'],
+    negative_squared_cross_mark: ['반려', '#ef4444', '#fee2e2'],
+    반려: ['반려', '#ef4444', '#fee2e2'],
+    취소: ['반려', '#ef4444', '#fee2e2'],
+    no_entry: ['반려', '#ef4444', '#fee2e2'],
   }
   const priority = ['완료', '반려', '진행중']
   const found: Record<string, [string, string, number]> = {}
@@ -38,6 +57,38 @@ function reactionToStatus(reactions: { name: string; count: number }[]) {
     if (found[p]) return { label: p, color: found[p][0], bg: found[p][1], count: found[p][2] }
   }
   return null
+}
+
+function statusLabelOf(o: SlackOrder): string {
+  return reactionToStatus(o.reactions)?.label || '미처리'
+}
+
+// 슬랙 mrkdwn → 읽기 좋은 텍스트 (멘션/링크/이모지 코드 정리)
+const EMOJI_MAP: Record<string, string> = {
+  package: '📦', warning: '⚠️', white_check_mark: '✅', x: '❌',
+  hourglass_flowing_sand: '⏳', calendar: '📅', date: '📅', pushpin: '📌',
+  memo: '📝', truck: '🚚', bulb: '💡', point_right: '👉', mag: '🔍',
+  bell: '🔔', tada: '🎉', fire: '🔥', star: '⭐',
+}
+
+function decodeSlackLine(line: string): string {
+  return line
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<#[A-Z0-9]+\|([^>]+)>/g, '#$1')
+    .replace(/<(https?:[^|>]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:[^>]+)>/g, '$1')
+    .replace(/:([a-z0-9_+-]+):/g, (m, name) => EMOJI_MAP[name] || m)
+}
+
+function renderInline(line: string) {
+  const parts = line.split(/(\*[^*\n]+\*|`[^`\n]+`)/g)
+  return parts.map((p, i) => {
+    if (p.length > 2 && p.startsWith('*') && p.endsWith('*'))
+      return <strong key={i}>{p.slice(1, -1)}</strong>
+    if (p.length > 2 && p.startsWith('`') && p.endsWith('`'))
+      return <code key={i} style={{ background: '#eef2f7', padding: '0 4px', borderRadius: 4, fontSize: '0.78rem' }}>{p.slice(1, -1)}</code>
+    return p
+  })
 }
 
 function getSummary(parsed: Record<string, string>) {
@@ -67,6 +118,10 @@ export default function SlackOrders({ config, channels, locations }: Props) {
   const [sendingKey, setSendingKey] = useState<string | null>(null)
   const [locationId, setLocationId] = useState<number | undefined>(config.selected_location_id)
   const [memo, setMemo] = useState('')
+  const [statusFilter, setStatusFilter] = useState<string | null>(null)  // null = 전체
+  const [notifyOn, setNotifyOn] = useState<boolean>(!!config.slack_outbound_notify)
+  const [notifyChannel, setNotifyChannel] = useState<string>(config.slack_outbound_channel || '물류_출고')
+  const [notifyTime, setNotifyTime] = useState<string>(config.bh_notify_time || '18:00')
 
   const channelNames = Object.keys(channels)
   const channelId = selectedChannel ? channels[selectedChannel] : ''
@@ -78,6 +133,12 @@ export default function SlackOrders({ config, channels, locations }: Props) {
       setSelectedChannel(def)
     }
   }, [channels])
+
+  useEffect(() => {
+    if (selectedChannel && channels[selectedChannel]) {
+      fetchMessages(channels[selectedChannel])
+    }
+  }, [selectedChannel])
 
   async function fetchMessages(chId: string) {
     if (!config.slack_token || !chId) return
@@ -97,11 +158,22 @@ export default function SlackOrders({ config, channels, locations }: Props) {
   async function handleChannelChange(name: string) {
     setSelectedChannel(name)
     setOrders([])
+    setStatusFilter(null)
     await fetchMessages(channels[name])
   }
 
   async function handleRefresh() {
     if (channelId) await fetchMessages(channelId)
+  }
+
+  async function saveNotify(on: boolean, ch: string, t: string) {
+    setNotifyOn(on); setNotifyChannel(ch); setNotifyTime(t)
+    try {
+      await updateConfig({ slack_outbound_notify: on, slack_outbound_channel: ch, bh_notify_time: t })
+      message.success(on ? `매일 ${t} #${ch}에 출고 요약 ON` : '출고 요약 OFF')
+    } catch {
+      message.error('설정 저장 실패')
+    }
   }
 
   async function handleJoinChannel() {
@@ -188,10 +260,16 @@ export default function SlackOrders({ config, channels, locations }: Props) {
 
   const stats = {
     total: orders.length,
-    done: orders.filter(o => reactionToStatus(o.reactions)?.label === '완료').length,
-    wip: orders.filter(o => reactionToStatus(o.reactions)?.label === '진행중').length,
-    reject: orders.filter(o => reactionToStatus(o.reactions)?.label === '반려').length,
+    done: orders.filter(o => statusLabelOf(o) === '완료').length,
+    wip: orders.filter(o => statusLabelOf(o) === '진행중').length,
+    reject: orders.filter(o => statusLabelOf(o) === '반려').length,
+    todo: orders.filter(o => statusLabelOf(o) === '미처리').length,
   }
+
+  // 필터링된 목록 (원본 인덱스 보존)
+  const visibleOrders = orders
+    .map((o, idx) => ({ o, idx }))
+    .filter(({ o }) => !statusFilter || statusLabelOf(o) === statusFilter)
 
   return (
     <div>
@@ -213,23 +291,61 @@ export default function SlackOrders({ config, channels, locations }: Props) {
         {debug && <span style={{ fontSize: '0.78rem', color: '#9ca3af' }}>{debug}</span>}
       </div>
 
+      {/* BH 출고 → 슬랙 봇 알림 설정 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, padding: '10px 14px', background: notifyOn ? '#ecfdf5' : '#f9fafb', border: `1px solid ${notifyOn ? '#10b981' : '#e5e7eb'}`, borderRadius: 10, flexWrap: 'wrap' }}>
+        <RobotOutlined style={{ color: notifyOn ? '#10b981' : '#9ca3af' }} />
+        <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>박스히어로 출고 일일 요약 봇</span>
+        <Switch checked={notifyOn} onChange={on => saveNotify(on, notifyChannel, notifyTime)} checkedChildren="ON" unCheckedChildren="OFF" />
+        <span style={{ fontSize: '0.78rem', color: '#6b7280', display: 'flex', alignItems: 'center', gap: 6 }}>
+          매일
+          <Select
+            size="small"
+            value={notifyTime}
+            onChange={t => saveNotify(notifyOn, notifyChannel, t)}
+            style={{ width: 90 }}
+            options={Array.from({ length: 48 }, (_, i) => { const v = `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`; return { value: v, label: v } })}
+          />
+          <Select
+            size="small"
+            value={notifyChannel}
+            onChange={ch => saveNotify(notifyOn, ch, notifyTime)}
+            style={{ width: 170 }}
+            options={channelNames.map(n => ({ value: n, label: `#${n}` }))}
+            showSearch
+          />
+        </span>
+        <span style={{ fontSize: '0.72rem', color: '#9ca3af' }}>· 그날 BH 처리된 출고를 거래처별로 취합해 1회 (출고일자 표기)</span>
+      </div>
+
       {/* Status bar */}
       {orders.length > 0 && (
         <Row gutter={8} style={{ marginBottom: 12 }}>
           {[
-            { label: '전체', count: stats.total, bg: '#f9fafb', border: '#e5e7eb', color: '#111827' },
-            { label: '미처리', count: stats.total - stats.done - stats.wip - stats.reject, bg: '#fef9c3', border: '#fde047', color: '#92400e' },
-            { label: '진행중', count: stats.wip, bg: '#eff6ff', border: '#bfdbfe', color: '#1d4ed8' },
-            { label: '완료', count: stats.done, bg: '#f0fdf4', border: '#bbf7d0', color: '#15803d' },
-            { label: '반려', count: stats.reject, bg: '#fef2f2', border: '#fecaca', color: '#dc2626' },
-          ].map(s => (
-            <Col key={s.label} span={4}>
-              <div style={{ background: s.bg, border: `1px solid ${s.border}`, borderRadius: 10, padding: '10px 8px', textAlign: 'center' }}>
-                <div style={{ fontSize: '1.4rem', fontWeight: 800, color: s.color }}>{s.count}</div>
-                <div style={{ fontSize: '0.75rem', color: s.color, fontWeight: 600 }}>{s.label}</div>
-              </div>
-            </Col>
-          ))}
+            { label: '전체', filter: null, count: stats.total, bg: '#f9fafb', border: '#e5e7eb', color: '#111827' },
+            { label: '미처리', filter: '미처리', count: stats.todo, bg: '#fef9c3', border: '#fde047', color: '#92400e' },
+            { label: '진행중', filter: '진행중', count: stats.wip, bg: '#eff6ff', border: '#bfdbfe', color: '#1d4ed8' },
+            { label: '완료', filter: '완료', count: stats.done, bg: '#f0fdf4', border: '#bbf7d0', color: '#15803d' },
+            { label: '반려', filter: '반려', count: stats.reject, bg: '#fef2f2', border: '#fecaca', color: '#dc2626' },
+          ].map(s => {
+            const isActive = statusFilter === s.filter
+            return (
+              <Col key={s.label} span={4}>
+                <div
+                  onClick={() => setStatusFilter(s.filter)}
+                  style={{
+                    background: s.bg,
+                    border: `${isActive ? 2 : 1}px solid ${isActive ? s.color : s.border}`,
+                    borderRadius: 10, padding: '10px 8px', textAlign: 'center', cursor: 'pointer',
+                    boxShadow: isActive ? `0 0 0 2px ${s.bg}, 0 2px 6px rgba(0,0,0,0.08)` : 'none',
+                    transition: 'all 0.12s',
+                  }}
+                >
+                  <div style={{ fontSize: '1.4rem', fontWeight: 800, color: s.color }}>{s.count}</div>
+                  <div style={{ fontSize: '0.75rem', color: s.color, fontWeight: 600 }}>{s.label}</div>
+                </div>
+              </Col>
+            )
+          })}
         </Row>
       )}
 
@@ -249,7 +365,12 @@ export default function SlackOrders({ config, channels, locations }: Props) {
         <Row gutter={[12, 12]}>
           {/* Order list */}
           <Col span={8} style={{ maxHeight: 'calc(100vh - 260px)', overflowY: 'auto' }}>
-            {orders.map((o, idx) => {
+            {visibleOrders.length === 0 && (
+              <div style={{ color: '#9ca3af', fontSize: '0.82rem', textAlign: 'center', padding: 20 }}>
+                해당 상태의 메시지가 없습니다
+              </div>
+            )}
+            {visibleOrders.map(({ o, idx }) => {
               const summ = getSummary(o.parsed)
               const status = reactionToStatus(o.reactions)
               const isSelected = selectedIdx === idx
@@ -267,6 +388,10 @@ export default function SlackOrders({ config, channels, locations }: Props) {
                     <span style={{ fontSize: '0.68rem', color: '#9ca3af' }}>{o.dt} {o.files.length > 0 ? '📎' : ''}</span>
                     {status ? (
                       <span style={{ background: status.bg, color: status.color, borderRadius: 4, padding: '1px 8px', fontSize: '0.7rem', fontWeight: 700 }}>● {status.label}</span>
+                    ) : o.reactions.length > 0 ? (
+                      <span style={{ background: '#fef3c7', color: '#92400e', borderRadius: 4, padding: '1px 8px', fontSize: '0.7rem' }}>
+                        :{o.reactions.map(r => r.name).join(': :')}: 미인식
+                      </span>
                     ) : (
                       <span style={{ background: '#f3f4f6', color: '#9ca3af', borderRadius: 4, padding: '1px 8px', fontSize: '0.7rem' }}>미처리</span>
                     )}
@@ -310,6 +435,22 @@ export default function SlackOrders({ config, channels, locations }: Props) {
                     </>
                   )
                 })()}
+
+                {/* Message detail (raw text) */}
+                {order.raw && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#374151', marginBottom: 6 }}>📄 메시지 세부내역</div>
+                    <div style={{
+                      background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 8,
+                      padding: '10px 14px', fontSize: '0.82rem', color: '#1f2937', lineHeight: 1.7,
+                      wordBreak: 'break-word', maxHeight: 360, overflowY: 'auto',
+                    }}>
+                      {order.raw.split('\n').map((ln, i) => (
+                        <div key={i}>{ln ? renderInline(decodeSlackLine(ln)) : ' '}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Reaction buttons */}
                 <div style={{ marginBottom: 12 }}>

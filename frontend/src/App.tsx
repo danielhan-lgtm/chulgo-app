@@ -6,10 +6,21 @@ import GeneralConverter from './pages/GeneralConverter'
 import NaverConverter from './pages/NaverConverter'
 import SlackOrders from './pages/SlackOrders'
 import GmailOrders from './pages/GmailOrders'
+import OBOrders from './pages/OBOrders'
 import Settings from './pages/Settings'
 import Receiving from './pages/Receiving'
 import DocReview from './pages/DocReview'
 import InvoicePage from './pages/InvoicePage'
+import ReconcilePage from './pages/ReconcilePage'
+import ChannelPage from './pages/ChannelPage'
+import MappingPage from './pages/MappingPage'
+import OrderPlannerPage from './pages/OrderPlannerPage'
+import DisposalReport from './pages/DisposalReport'
+import ExpiryDonationReport from './pages/ExpiryDonationReport'
+import CoupangLoadList from './pages/CoupangLoadList'
+import CoupangGrowthLoad from './pages/CoupangGrowthLoad'
+import KurlyLabel from './pages/KurlyLabel'
+import OutboundForecast from './pages/OutboundForecast'
 import type { Page, AppConfig, Location } from './types'
 import { getConfig, getMasterStatus, getLocations, slackConnect, getGmailStatus } from './services/api'
 
@@ -20,6 +31,13 @@ export default function App() {
   const [channels, setChannels] = useState<Record<string, string>>({})
   const [masterLoaded, setMasterLoaded] = useState(false)
   const [gmailConnected, setGmailConnected] = useState(false)
+
+  // 미매핑 패널 → 매핑 페이지 이동 이벤트 수신
+  useEffect(() => {
+    const handler = () => setPage('mapping')
+    window.addEventListener('navigate-mapping', handler)
+    return () => window.removeEventListener('navigate-mapping', handler)
+  }, [])
 
   useEffect(() => {
     loadAppConfig()
@@ -106,9 +124,20 @@ export default function App() {
       case 'naver': return <NaverConverter config={config} locations={locations} onNavigate={setPage} />
       case 'slack': return <SlackOrders config={config} channels={channels} locations={locations} onNavigate={setPage} />
       case 'gmail': return <GmailOrders config={config} gmailConnected={gmailConnected} locations={locations} onNavigate={setPage} />
+      case 'oborders': return <OBOrders />
       case 'receiving': return <Receiving config={config} />
       case 'docreview': return <DocReview />
       case 'invoice': return <InvoicePage />
+      case 'reconcile': return <ReconcilePage config={config} />
+      case 'channel': return <ChannelPage config={config} />
+      case 'outbound': return <OutboundForecast config={config} />
+      case 'mapping': return <MappingPage config={config} />
+      case 'orderplan': return <OrderPlannerPage />
+      case 'disposal': return <DisposalReport />
+      case 'expiry': return <ExpiryDonationReport />
+      case 'coupangload': return <CoupangLoadList />
+      case 'coupanggrowthload': return <CoupangGrowthLoad />
+      case 'kurlylabel': return <KurlyLabel />
       case 'settings': return (
         <Settings
           config={config}

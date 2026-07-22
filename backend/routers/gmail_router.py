@@ -11,7 +11,7 @@ import state
 router = APIRouter()
 
 FRONTEND_URL = "http://localhost:5173"
-BACKEND_URL = "http://localhost:8080"
+BACKEND_URL = "http://localhost:8081"
 REDIRECT_URI = f"{BACKEND_URL}/api/gmail/callback"
 
 

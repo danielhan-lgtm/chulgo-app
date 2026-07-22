@@ -120,6 +120,42 @@ def init_db():
                 UNIQUE(report_date, location_ids)
             );
             CREATE INDEX IF NOT EXISTS idx_stock_reports_date ON stock_reports(report_date);
+
+            CREATE TABLE IF NOT EXISTS ob_stock_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at TEXT NOT NULL,
+                product_code TEXT NOT NULL,
+                product_name TEXT DEFAULT '',
+                total INTEGER DEFAULT 0,
+                available INTEGER DEFAULT 0,
+                unavailable INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ob_snap_code ON ob_stock_snapshots(product_code, captured_at);
+            CREATE INDEX IF NOT EXISTS idx_ob_snap_time ON ob_stock_snapshots(captured_at);
+
+            -- 재고대사 행 단위 정리(전산정리) 상태/이력 ──────────────
+            -- 각 불일치 행에 대해 담당자가 정리 진행상태와 메모를 기록.
+            -- row_key = "{tx_type}|{sku}|{channel}|{period}" 로 행을 고유 식별.
+            -- status: reviewing(검토중) / resolved(정리완료) / hold(보류) / ignore(무시)
+            CREATE TABLE IF NOT EXISTS reconcile_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                row_key TEXT NOT NULL UNIQUE,
+                tx_type TEXT DEFAULT '',
+                sku TEXT DEFAULT '',
+                name TEXT DEFAULT '',
+                channel TEXT DEFAULT '',
+                period TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'reviewing',
+                root_cause TEXT DEFAULT '',
+                bh_qty INTEGER,
+                ob_qty INTEGER,
+                memo TEXT DEFAULT '',
+                assignee TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_recon_status_period ON reconcile_status(period);
+            CREATE INDEX IF NOT EXISTS idx_recon_status_status ON reconcile_status(status);
         """)
         _migrate_name_mapping_many_to_many(conn)
         _migrate_matched_pairs_ob_name(conn)
@@ -444,6 +480,67 @@ def get_stock_report(report_id: int) -> dict:
         return d
 
 
+# ── OB 가용외(할당) 스냅샷 추적 ──────────────────────────────────────────────
+# OurBox 재고를 주기적으로 찍어 가용→가용외(할당)→출고 전환 시점을 타임라인으로 추적.
+# (OurBox API가 할당 이벤트 로그를 안 주므로 스냅샷 시계열로 근사)
+
+def last_ob_snapshot_at() -> str:
+    """가장 최근 스냅샷 시각 ('YYYY-MM-DD HH:MM:SS') 또는 ''."""
+    with _conn() as conn:
+        r = conn.execute("SELECT MAX(captured_at) AS t FROM ob_stock_snapshots").fetchone()
+        return (r["t"] if r and r["t"] else "") or ""
+
+
+def save_ob_stock_snapshot(captured_at: str, items: list) -> int:
+    """한 시점의 OB 품목별 재고(total/available/unavailable)를 일괄 저장. 저장 건수 반환."""
+    rows = [
+        (captured_at, str(it.get("code") or ""), str(it.get("name") or ""),
+         int(it.get("total") or 0), int(it.get("available") or 0), int(it.get("unavailable") or 0))
+        for it in items if (it.get("code") or it.get("name"))
+    ]
+    if not rows:
+        return 0
+    with _conn() as conn:
+        conn.executemany(
+            """INSERT INTO ob_stock_snapshots
+                 (captured_at, product_code, product_name, total, available, unavailable)
+               VALUES (?,?,?,?,?,?)""",
+            rows,
+        )
+    return len(rows)
+
+
+def get_ob_stock_timeline(codes: list = None, name_like: str = "", limit: int = 1000) -> list:
+    """특정 품목(코드 집합 또는 이름 부분일치)의 스냅샷 시계열을 시간순 반환."""
+    where, params = [], []
+    if codes:
+        where.append("product_code IN (%s)" % ",".join("?" * len(codes)))
+        params += [str(c) for c in codes]
+    if name_like:
+        where.append("product_name LIKE ?")
+        params.append(f"%{name_like}%")
+    clause = (" WHERE " + " OR ".join(where)) if where else ""
+    params.append(int(limit))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"""SELECT captured_at, product_code, product_name, total, available, unavailable
+                FROM ob_stock_snapshots{clause}
+                ORDER BY captured_at ASC, product_code ASC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def prune_ob_snapshots(keep_days: int = 60) -> int:
+    """오래된 스냅샷 정리 (기본 60일 보관). 삭제 건수 반환."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM ob_stock_snapshots WHERE captured_at < datetime('now','localtime',?)",
+            (f"-{int(keep_days)} days",),
+        )
+        return cur.rowcount or 0
+
+
 # ── matched_pairs CRUD ─────────────────────────────────────────────────────
 
 def save_matched_pairs(pairs: list, from_date: str = "", to_date: str = ""):
@@ -530,6 +627,69 @@ def delete_set_bom(bom_id: int):
     """세트 BOM 항목 삭제."""
     with _conn() as conn:
         conn.execute("DELETE FROM set_bom WHERE id=?", (bom_id,))
+
+
+# ── 재고대사 행 단위 정리 상태 ───────────────────────────────────────
+_RECON_STATUS_VALUES = {"reviewing", "resolved", "hold", "ignore"}
+
+
+def upsert_reconcile_status(row_key: str, status: str, *,
+                            tx_type: str = "", sku: str = "", name: str = "",
+                            channel: str = "", period: str = "",
+                            root_cause: str = "", bh_qty=None, ob_qty=None,
+                            memo: str = "", assignee: str = "") -> dict:
+    """대사 행의 정리 상태/메모 저장 (row_key 중복 시 갱신).
+
+    status: reviewing(검토중)/resolved(정리완료)/hold(보류)/ignore(무시)
+    """
+    if status not in _RECON_STATUS_VALUES:
+        raise ValueError(f"status must be one of {_RECON_STATUS_VALUES}")
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO reconcile_status
+                   (row_key, tx_type, sku, name, channel, period, status,
+                    root_cause, bh_qty, ob_qty, memo, assignee, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+               ON CONFLICT(row_key) DO UPDATE SET
+                   status=excluded.status,
+                   root_cause=excluded.root_cause,
+                   bh_qty=excluded.bh_qty,
+                   ob_qty=excluded.ob_qty,
+                   memo=excluded.memo,
+                   assignee=excluded.assignee,
+                   name=excluded.name,
+                   updated_at=datetime('now','localtime')""",
+            (row_key, tx_type, sku, name, channel, period, status,
+             root_cause, bh_qty, ob_qty, memo, assignee)
+        )
+        r = conn.execute("SELECT * FROM reconcile_status WHERE row_key=?", (row_key,)).fetchone()
+        return dict(r) if r else {}
+
+
+def get_reconcile_statuses(from_period: str = "", to_period: str = "") -> list:
+    """기간(period 문자열 사전식 비교) 내 정리 상태 목록.
+
+    period 키는 'YYYY-MM-DD'/'YYYY-MM' 등 사전식 정렬이 곧 시간순이므로
+    범위 필터를 문자열 비교로 처리. 인자 없으면 전체 반환.
+    """
+    with _conn() as conn:
+        sql = "SELECT * FROM reconcile_status"
+        args: list = []
+        conds: list = []
+        if from_period:
+            conds.append("period >= ?"); args.append(from_period)
+        if to_period:
+            conds.append("period <= ?"); args.append(to_period)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY updated_at DESC"
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def delete_reconcile_status(row_key: str):
+    """정리 상태 삭제 (다시 '미처리'로 되돌림)."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM reconcile_status WHERE row_key=?", (row_key,))
 
 
 # 앱 시작 시 DB 초기화

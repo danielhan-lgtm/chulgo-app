@@ -10,3 +10,7 @@ xlrd
 google-auth
 google-auth-oauthlib
 google-api-python-client
+playwright
+anthropic
+python-pptx
+pdfplumber

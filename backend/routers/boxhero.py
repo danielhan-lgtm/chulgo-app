@@ -84,6 +84,7 @@ def send_to_boxhero(body: SendRequest):
             payload=payload,
             source="boxhero",
         )
+        # (슬랙 출고 알림은 slack_outbound 폴러가 BH 트랜잭션을 감지해 일괄 처리 — 이중 포스팅 방지)
         return {"ok": True, "tx_id": tx_id, "missing_skus": missing, "item_count": len(items_payload)}
     except HTTPException:
         raise

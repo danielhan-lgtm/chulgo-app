@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Button, DatePicker, Radio, Table, Tabs, Tag, Alert, Spin, Row, Col, Select, Switch, Tooltip, Drawer, Empty, Modal, Badge, Slider, Input, message } from 'antd'
+import { Button, DatePicker, Radio, Table, Tabs, Tag, Alert, Spin, Row, Col, Select, Switch, Tooltip, Drawer, Empty, Modal, Badge, Slider, Input, message, Dropdown } from 'antd'
 import { SearchOutlined, WarningOutlined, RobotOutlined, CopyOutlined, ApartmentOutlined, TagsOutlined, SwapOutlined, ExportOutlined } from '@ant-design/icons'
 import type { AppConfig, ReconcileResult, ReconcileRow, ReconcileSummary } from '../types'
-import { getReconcile, analyzeReconcile, getLocations, getReconcileDetail, getReconcileMissing, getReconcileFullMatch, getReconcileQtyGap, getReconcileStock, getReconcileItemSearch, getSmartCompare, getMatchedPairs, createWeeklyReport, listWeeklyReports, getWeeklyReport } from '../services/api'
+import { getReconcile, analyzeReconcile, getLocations, getReconcileDetail, getReconcileMissing, getReconcileFullMatch, getReconcileQtyGap, getReconcileStock, getReconcileItemSearch, getSmartCompare, getMatchedPairs, createWeeklyReport, listWeeklyReports, getWeeklyReport, getStockDiffChange, getChannelFlow, getItemOutDecompose, getStockSnapshots, captureStockSnapshot, setReconcileStatus, clearReconcileStatus, getStockDiffTrace } from '../services/api'
+import type { StockDiffTrace } from '../services/api'
+import type { OutDecomp, StockSnap, ReconcileCleanupStatus } from '../services/api'
 import dayjs from 'dayjs'
 
 interface Props {
@@ -36,6 +38,26 @@ const STATUS_CFG = {
 }
 
 const TX_LABEL = { in: '입고', out: '출고', adjustment: '조정' }
+
+// 원인 자동 분류 표시 설정 (백엔드 root_cause와 1:1)
+const ROOT_CAUSE_CFG: Record<string, { label: string; tag: string; desc: string }> = {
+  adj_initial:      { label: '기초재고조정', tag: 'purple',  desc: 'IN/OUT은 일치, 조정(ADJ)만 차이 — BH 기초재고 설정 추정. 조정 제외 토글 또는 OB 조정으로 정리.' },
+  set_bom:          { label: '세트분해',     tag: 'orange',  desc: '세트 수량 비율 차이 — BH 세트단위 / OB 개별단위 추정. 세트 BOM 등록 후 재대사.' },
+  timing:           { label: '시점차이',     tag: 'gold',    desc: '반대 시스템의 다른 기간에 동일 SKU 존재 — 전산 입력 시점 차이. 누적 모드로 재확인 (실제 누락 아닐 가능성).' },
+  product_unmapped: { label: '상품미매핑',   tag: 'geekblue',desc: '매핑 그룹에 없는 품목 — BH SKU ↔ OB 코드 매핑을 추가하면 해소됨.' },
+  channel_unmapped: { label: '채널미매핑',   tag: 'cyan',    desc: '채널 매핑 규칙 누락 — 채널 매핑을 추가하면 해소됨.' },
+  qty_mismatch:     { label: '수량불일치',   tag: 'volcano', desc: '양쪽 모두 기록되었으나 수량이 다름 — 한쪽 전산 오입력 의심. 전표 대조 필요.' },
+  true_missing:     { label: '한쪽누락',     tag: 'red',     desc: '한쪽 시스템에만 기록 — 실제 누락/오입력 의심. 전표 확인 후 정리 필요.' },
+}
+
+// 행 단위 정리(전산정리) 상태 표시 설정
+const CLEANUP_CFG: Record<string, { label: string; tag: string }> = {
+  reviewing: { label: '검토중',   tag: 'processing' },
+  resolved:  { label: '정리완료', tag: 'success' },
+  hold:      { label: '보류',     tag: 'warning' },
+  ignore:    { label: '무시',     tag: 'default' },
+}
+const CLEANUP_ORDER = ['reviewing', 'resolved', 'hold', 'ignore'] as const
 
 function SummaryCards({ s, matchedCount }: { s: ReconcileSummary; matchedCount?: number }) {
   const cards = [
@@ -74,7 +96,13 @@ function normName(s: string) {
   return (s || '').replace(/[^가-힣a-zA-Z0-9]/g, '').toLowerCase()
 }
 
-function ReconcileTable({ rows, showChannel, onRowClick, matchedNames, diffMatchedNames, unmatchedNames, stockMap, showBreakdown }: {
+type CleanupActions = {
+  set: (r: ReconcileRow, status: ReconcileCleanupStatus) => void
+  editMemo: (r: ReconcileRow) => void
+  clear: (r: ReconcileRow) => void
+}
+
+function ReconcileTable({ rows, showChannel, onRowClick, matchedNames, diffMatchedNames, unmatchedNames, stockMap, showBreakdown, cleanup }: {
   rows: ReconcileRow[]
   showChannel?: boolean
   onRowClick?: (r: ReconcileRow) => void
@@ -83,6 +111,7 @@ function ReconcileTable({ rows, showChannel, onRowClick, matchedNames, diffMatch
   unmatchedNames?: Set<string>
   stockMap?: Map<string,{bh:number|null;ob:number|null;obAvail:number|null}>
   showBreakdown?: boolean  // total/product_all 모드에서 in/out/adj 분해 컬럼 표시
+  cleanup?: CleanupActions // 행 단위 정리 상태 설정 액션
 }) {
   const columns = [
     { title: '기간', dataIndex: 'period', key: 'period', width: 120 },
@@ -185,6 +214,57 @@ function ReconcileTable({ rows, showChannel, onRowClick, matchedNames, diffMatch
         return <Tag color={cfg.tag}>{cfg.label}</Tag>
       },
     },
+    {
+      title: () => <Tooltip title="규칙 기반 자동 원인 분류 — 전산 정리 방향 제시"><span>원인</span></Tooltip>,
+      key: 'root_cause', width: 150,
+      render: (_: unknown, r: ReconcileRow) => {
+        if (!r.root_cause || r.root_cause === 'ok') return null
+        const c = ROOT_CAUSE_CFG[r.root_cause]
+        if (!c) return null
+        const tip = r.correction?.action || r.fix_hint || c.desc
+        return (
+          <Tooltip title={<span>{tip}<br/><span style={{ opacity: 0.7, fontSize: '0.72rem' }}>행 클릭 → 수정안·복붙값</span></span>}>
+            <Tag color={c.tag} style={{ margin: 0, cursor: 'help' }}>{c.label}</Tag>
+          </Tooltip>
+        )
+      },
+    },
+    ...(cleanup ? [{
+      title: () => <Tooltip title="전산 정리 진행 상태 — 정리완료/무시는 숨김 토글로 제외 가능"><span>정리</span></Tooltip>,
+      key: 'cleanup', width: 120,
+      render: (_: unknown, r: ReconcileRow) => {
+        if (r.status === 'ok') return null
+        const cur = r.cleanup_status
+        const cfg = cur ? CLEANUP_CFG[cur] : null
+        const menuItems = [
+          ...CLEANUP_ORDER.map(s => ({ key: s, label: `${CLEANUP_CFG[s].label}${cur === s ? ' ✓' : ''}` })),
+          { type: 'divider' as const },
+          { key: '__memo', label: '📝 메모 편집…' },
+          ...(cur ? [{ key: '__clear', label: '↩ 미처리로 초기화' }] : []),
+        ]
+        return (
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: menuItems,
+              onClick: ({ key }) => {
+                if (key === '__memo') cleanup.editMemo(r)
+                else if (key === '__clear') cleanup.clear(r)
+                else cleanup.set(r, key as ReconcileCleanupStatus)
+              },
+            }}
+          >
+            <span onClick={e => e.stopPropagation()} style={{ cursor: 'pointer' }}>
+              {cfg
+                ? <Tooltip title={r.cleanup_memo ? `메모: ${r.cleanup_memo}${r.cleanup_assignee ? ` (${r.cleanup_assignee})` : ''}` : undefined}>
+                    <Tag color={cfg.tag} style={{ margin: 0 }}>{cfg.label}{r.cleanup_memo ? ' 📝' : ''} ▾</Tag>
+                  </Tooltip>
+                : <Tag style={{ margin: 0, borderStyle: 'dashed', color: '#9ca3af', cursor: 'pointer' }}>정리 ▾</Tag>}
+            </span>
+          </Dropdown>
+        )
+      },
+    }] : []),
     // ── 분해 컬럼 (total/product_all 모드에서 mismatch 원인 파악용) ──
     ...(showBreakdown ? [
       {
@@ -487,9 +567,9 @@ export default function ReconcilePage({ config }: Props) {
   type StockCause = { type: string; qty: number|null; desc: string }
   type StockFlow = { bh:{in:number;out:number;adjustment:number}; ob:{in:number;out:number;adjustment:number}; from?:string; to?:string }
   type StockRow = {
-    name:string; sku:string; ob_code:string; ob_codes?:string[]; bh_skus?:string[]
+    name:string; sku:string; ob_code:string; ob_codes?:string[]; bh_skus?:string[]; bh_names?:string[]; ob_names?:string[]
     bh_stock:number|null; ob_stock_total:number|null; ob_stock_available:number|null
-    ob_unusable?:number; diff:number|null; diff_vs_total?:number|null; residual?:number|null; causes?:StockCause[]
+    ob_unusable?:number; diff:number|null; diff_vs_total?:number|null; diff_vs_available?:number|null; residual?:number|null; causes?:StockCause[]
     flow?:StockFlow  // 주간 리포트에서 미리 계산된 거래 분해
     fm?:{ bh_only:FMItem[]; ob_only:FMItem[]; qty_diff:FMMatched[]; from?:string; to?:string }  // 사전계산된 개별 거래 매칭
   }
@@ -511,6 +591,35 @@ export default function ReconcilePage({ config }: Props) {
       setStockData(d)
     } catch { setStockData(null) }
     finally { setStockLoading(false) }
+  }
+
+  // 거래처(채널)별 또는 제품별 입·출고·조정 비교
+  type ProductSubRow = { product:string; bh_in:number; bh_out:number; bh_adj:number; ob_in:number; ob_out:number; ob_adj:number; diff_in:number; diff_out:number; diff_adj:number; kind:'bh_missing'|'diff'|'ob_bypass'|'match'|'unknown' }
+  type ChannelRow = { channel:string; product?:string; bh_in:number; bh_out:number; bh_adj:number; ob_in:number; ob_out:number; ob_adj:number; diff_in:number; diff_out:number; diff_adj:number; kind:'bh_missing'|'diff'|'ob_bypass'|'match'|'unknown'; products?:ProductSubRow[] }
+  const [cfOpen, setCfOpen] = useState(false)
+  const [cfLoading, setCfLoading] = useState(false)
+  const [cfData, setCfData] = useState<{rows:ChannelRow[]; from:string; to:string; group_by?:string; channel_mapped:boolean; ob_source:string}|null>(null)
+  const [cfDays, setCfDays] = useState(7)
+  const [cfGroupBy, setCfGroupBy] = useState<'channel'|'product'>('channel')
+  const [cfProductFilter, setCfProductFilter] = useState('')
+  const [cfExpanded, setCfExpanded] = useState<Set<string>>(new Set())
+  async function fetchChannelFlow(days: number, groupBy?: 'channel'|'product', productFilter?: string) {
+    if (!config.api_token) return
+    const gb = groupBy ?? cfGroupBy
+    const pf = productFilter ?? cfProductFilter
+    const to = dayjs(); const from = to.subtract(days, 'day')
+    setCfOpen(true); setCfLoading(true); setCfData(null)
+    try {
+      const d = await getChannelFlow({
+        token: config.api_token,
+        from_date: from.format('YYYY-MM-DD'), to_date: to.format('YYYY-MM-DD'),
+        location_ids: selectedLocIds.length ? selectedLocIds.join(',') : '228640',
+        group_by: gb,
+        product_filter: gb === 'product' ? pf : undefined,
+      })
+      setCfData(d); setCfExpanded(new Set())
+    } catch { message.error('비교 데이터 조회 실패'); setCfData(null) }
+    finally { setCfLoading(false) }
   }
 
   // 주간 리포트
@@ -548,16 +657,106 @@ export default function ReconcilePage({ config }: Props) {
   const [stockTracePairs, setStockTracePairs] = useState<{bh_qty:number;ob_qty:number;bh_date:string;ob_date:string;bh_name:string;ob_name:string;qty_diff:number}[]>([])
   // 재고현황 필터: 불용 외 차이(잔여)만 보기
   const [stockResidualOnly, setStockResidualOnly] = useState(false)
+  const [stockCardFilter, setStockCardFilter] = useState<null|'ok'|'diff'|'trace'>(null)  // 상단 카드 클릭 필터
+  const [stockCauseFilter, setStockCauseFilter] = useState<string[]>([])                   // 원인 태그 필터
+  const [stockDirFilter, setStockDirFilter] = useState<null|'plus'|'minus'>(null)          // 차이 방향 필터
+  // 재고현황 상품명 검색
+  const [stockSearch, setStockSearch] = useState('')
   // 유형별 거래 비교 (입고/출고/조정 BH vs OB)
-  type TxTotals = { in:number; out:number; adjustment:number }
+  type TxTotals = { in:number; out:number; move:number; adjustment:number }
   const [stockFlow, setStockFlow] = useState<{bh:TxTotals; ob:TxTotals; bh_rows:unknown[]; ob_rows:unknown[]}|null>(null)
   const [stockFlowLoading, setStockFlowLoading] = useState(false)
   const [stockFlowMonths, setStockFlowMonths] = useState(1)  // 거래 분석 기간(개월) — 기본 1개월(빠름), 필요시 늘림
+  // OB 가용외 스냅샷 추적 — 가용→가용외(할당)가 언제 떨어지는지 시계열
+  const [snaps, setSnaps] = useState<StockSnap[]|null>(null)
+  const [snapsLoading, setSnapsLoading] = useState(false)
+  const [snapCapturing, setSnapCapturing] = useState(false)
+  function fetchSnaps(name: string, obCodes?: string[]) {
+    setSnapsLoading(true); setSnaps(null)
+    getStockSnapshots({ name, codes: (obCodes||[]).join(','), limit: 2000 })
+      .then(d => setSnaps(d.series || []))
+      .catch(() => setSnaps([]))
+      .finally(() => setSnapsLoading(false))
+  }
+  async function captureSnapNow(name: string, obCodes?: string[]) {
+    setSnapCapturing(true)
+    try { await captureStockSnapshot(); fetchSnaps(name, obCodes) }
+    catch { /* noop */ }
+    finally { setSnapCapturing(false) }
+  }
+  // 거래 정밀 대사 — 재고 차이가 '어느 거래에서' 났는지 이벤트 단위 분해
+  const [deepTrace, setDeepTrace] = useState<StockDiffTrace|null>(null)
+  const [deepTraceLoading, setDeepTraceLoading] = useState(false)
+  function fetchDeepTrace(row: StockRow, months: number) {
+    if (!config.api_token) return
+    const to = dayjs(); const from = to.subtract(months, 'month')
+    setDeepTraceLoading(true); setDeepTrace(null)
+    getStockDiffTrace({
+      token: config.api_token, name: row.name,
+      bh_skus: (row.bh_skus||[]).join(','), ob_codes: (row.ob_codes||[]).join(','),
+      from_date: from.format('YYYY-MM-DD'), to_date: to.format('YYYY-MM-DD'),
+      location_ids: selectedLocIds.length ? selectedLocIds.join(',') : '228640',
+      bh_stock: row.bh_stock ?? undefined, ob_total: row.ob_stock_total ?? undefined,
+      ob_unav: row.ob_unusable ?? 0,
+    })
+      .then(setDeepTrace)
+      .catch(() => { message.error('거래 정밀 대사 실패'); setDeepTrace(null) })
+      .finally(() => setDeepTraceLoading(false))
+  }
+
+  // 출고 채널 분해 (OB 경유 vs OB 미경유(직배송)) — 출고 차이 원인 자동 분류
+  const [outDecomp, setOutDecomp] = useState<OutDecomp|null>(null)
+  const [outDecompLoading, setOutDecompLoading] = useState(false)
+  function fetchOutDecomp(name: string, months: number, skus?: string[], obCodes?: string[]) {
+    if (!config.api_token) return
+    const to = dayjs(); const from = to.subtract(months, 'month')
+    setOutDecompLoading(true); setOutDecomp(null)
+    getItemOutDecompose({
+      token: config.api_token, name,
+      bh_skus: (skus||[]).join(','), ob_codes: (obCodes||[]).join(','),
+      from_date: from.format('YYYY-MM-DD'), to_date: to.format('YYYY-MM-DD'),
+      location_ids: selectedLocIds.length ? selectedLocIds.join(',') : '228640',
+    })
+      .then(setOutDecomp)
+      .catch(() => setOutDecomp(null))
+      .finally(() => setOutDecompLoading(false))
+  }
   // 개별 거래 매칭 (full-match) — 짝 안 맞는 거래로 전산오류 위치 찾기
   type FMItem = { date:string; name:string; qty:number; bh_type?:string; ob_type?:string }
   type FMMatched = { bh_date:string; ob_date:string; bh_qty:number; ob_qty:number; qty_diff:number; bh_name:string; ob_name:string; day_gap?:number; match_reason?:string }
   const [stockFM, setStockFM] = useState<{matched:FMMatched[]; bh_only:FMItem[]; ob_only:FMItem[]}|null>(null)
   const [stockFMLoading, setStockFMLoading] = useState(false)
+
+  // 재고 차이 변화 추적 — 두 리포트(t1→t2) 사이 품목 차이가 왜 벌어졌는지 분해
+  type DiffSnap = { date:string; bh_stock:number|null; ob_available:number|null; ob_total:number|null; ob_unusable:number|null; diff:number|null; diff_vs_available?:number|null }
+  type DiffTrace = {
+    name:string; t1:DiffSnap; t2:DiffSnap
+    delta_diff:number; delta_diff_available?:number; delta_bh_stock:number; delta_ob_total:number; delta_ob_available:number; delta_ob_unusable:number
+    unavail_returned?:number; prebook_bh?:number
+    prebook?:{date:string; ship_date:string; channel:string; qty:number; memo:string}[]
+    group_change?:{changed:boolean; t1_only_codes:string[]; t2_only_codes:string[]; t1_only_skus:string[]; t2_only_skus:string[]}
+    flow:{bh_in:number;bh_out:number;bh_move:number;bh_adj:number;ob_in:number;ob_out:number;ob_adj:number}
+    contrib:{net_stock_flow:number; ob_unavail_change:number}
+    explained:number; residual:number
+    bh_only:FMItem[]; ob_only:FMItem[]; qty_diff:FMMatched[]
+  }
+  const [diffTrace, setDiffTrace] = useState<DiffTrace|null>(null)
+  const [diffTraceLoading, setDiffTraceLoading] = useState(false)
+  const [diffT1Id, setDiffT1Id] = useState<number|null>(null)
+  function fetchDiffTrace(name: string, t1Id: number) {
+    if (!config.api_token || !t1Id) return
+    setDiffTraceLoading(true); setDiffTrace(null)
+    getStockDiffChange({
+      token: config.api_token, name,
+      report_t1_id: t1Id, report_t2_id: 0,  // t2=최신 저장 리포트
+      location_ids: selectedLocIds.length ? selectedLocIds.join(',') : '228640',
+      include_fm: true,
+    })
+      .then((d: DiffTrace) => setDiffTrace(d))
+      .catch(() => message.error('차이 변화 분석 실패'))
+      .finally(() => setDiffTraceLoading(false))
+  }
+
   function fetchStockFM(months: number) {
     if (!config.api_token) return
     const to = dayjs(); const from = to.subtract(months, 'month')
@@ -573,28 +772,43 @@ export default function ReconcilePage({ config }: Props) {
       .finally(() => setStockFMLoading(false))
   }
 
-  function fetchStockFlow(name: string, months: number) {
+  function fetchStockFlow(name: string, months: number, skus?: string[], obCodes?: string[]) {
     if (!config.api_token) return
     // 재고역산(total) compare 재활용 — OB는 ob_txs_cache로 캐싱되어 빠름 (item-search보다 훨씬 빠름)
     // compare total 행에 bh_in_qty/bh_out_qty/bh_adj_qty/ob_* 분해 필드가 들어있음
     const to = dayjs()
     const from = to.subtract(months, 'month')
     const nkey = normName(name)
+    // SKU/OB코드도 매칭 키로 사용 (위치 필터 시 그룹명이 달라지면 이름만으로는 매칭 실패)
+    const skuSet = new Set([...(skus||[]), ...(obCodes||[])].map(s=>String(s||'')).filter(Boolean))
     setStockFlowLoading(true)
+    // 위치 필터를 재고 현황과 동일하게 적용 (기본 호법센터 228640).
+    //   거래 비교와 재고 비교의 위치 기준을 일치시켜야 차이 방향/크기가 맞음.
+    //   (과거 'OB 0 누락' 우려로 필터를 뺐으나, 실측 결과 OB 합계는 위치필터 ON/OFF 동일 —
+    //    위치 필터는 BH 거래에만 적용돼 타센터(CJ 군포 등) 거래만 정상 제외됨. 검증: 2026-06-22)
     getReconcile({
       token: config.api_token,
       from_date: from.format('YYYY-MM-DD'), to_date: to.format('YYYY-MM-DD'),
       period: 'month', mode: 'total',
-      location_ids: selectedLocIds.length ? selectedLocIds.join(',') : undefined,
+      location_ids: selectedLocIds.length ? selectedLocIds.join(',') : '228640',
       use_mapping: useMapping,
     })
       .then((d: { rows?: Record<string, unknown>[] }) => {
         const rows = d.rows || []
         // 같은 품목(norm 일치) 행들의 분해 합산
-        const acc = { bh:{in:0,out:0,adjustment:0}, ob:{in:0,out:0,adjustment:0} }
+        // ⚠ compare total은 한 품목을 in/out/adj 3행으로 주는데 각 행에 동일한 분해값(sku 전체)이
+        //   복제됨 → sku 중복 제거 후 합산해야 3배 부풀림 방지
+        const acc = { bh:{in:0,out:0,move:0,adjustment:0}, ob:{in:0,out:0,move:0,adjustment:0} }
+        const seen = new Set<string>()
         for (const r of rows) {
-          if (normName(String(r.name || '')) !== nkey) continue
-          acc.bh.in += Number(r.bh_in_qty||0); acc.bh.out += Number(r.bh_out_qty||0); acc.bh.adjustment += Number(r.bh_adj_qty||0)
+          const rSku = String(r.sku || '')
+          const nameMatch = normName(String(r.name || '')) === nkey
+          const skuMatch = skuSet.size > 0 && rSku && [...skuSet].some(s => rSku.includes(s) || s.includes(rSku))
+          if (!nameMatch && !skuMatch) continue
+          const dedupKey = rSku || String(r.name || '')
+          if (seen.has(dedupKey)) continue
+          seen.add(dedupKey)
+          acc.bh.in += Number(r.bh_in_qty||0); acc.bh.out += Number(r.bh_out_qty||0); acc.bh.move += Number(r.bh_move_qty||0); acc.bh.adjustment += Number(r.bh_adj_qty||0)
           acc.ob.in += Number(r.ob_in_qty||0); acc.ob.out += Number(r.ob_out_qty||0); acc.ob.adjustment += Number(r.ob_adj_qty||0)
         }
         setStockFlow({ bh: acc.bh, ob: acc.ob, bh_rows: [], ob_rows: [] })
@@ -608,13 +822,19 @@ export default function ReconcilePage({ config }: Props) {
     setStockTraceRow(r)
     setStockTracePairs([])
     setStockFlow(null)
+    setOutDecomp(null)
+    setSnaps(null)
+    setDeepTrace(null)
+    // 차이 변화 추적 초기화 — 기본 t1 = 현재 리포트(t2=최신) 직전 리포트
+    setDiffTrace(null)
+    setDiffT1Id(weeklyList.length > 1 ? weeklyList[1].id : (weeklyList[0]?.id ?? null))
     getMatchedPairs({ from_date: fromDate, to_date: toDate, name: r.name })
       .then(d => setStockTracePairs(d.pairs || []))
       .catch(() => setStockTracePairs([]))
     // 주간 리포트에 미리 계산된 거래 분해가 있으면 즉시 표시 (API 호출 없음)
     // 없으면 자동 호출하지 않음 — 사용자가 "분석 실행" 버튼을 눌러야 수집 (OB API 느림 대기 방지)
     if (r.flow) {
-      setStockFlow({ bh: r.flow.bh, ob: r.flow.ob, bh_rows: [], ob_rows: [] })
+      setStockFlow({ bh: { move:0, ...r.flow.bh }, ob: { move:0, ...r.flow.ob }, bh_rows: [], ob_rows: [] })
     }
     setStockFlowLoading(false)
     // 주간 리포트에 사전계산된 개별 거래 매칭(fm)이 있으면 즉시 표시 (name 주입해 필터 통과)
@@ -630,10 +850,11 @@ export default function ReconcilePage({ config }: Props) {
 
   function exportStockCsv() {
     if (!stockData) return
-    const hdr = ['상품명','BH재고','OB재고(총)','OB재고(가용)','차이','SKU','OB코드']
+    const hdr = ['상품명','BH재고','OB재고(총)','OB재고(가용)','OB가용외','차이(BH-총)','참고(BH-가용)','SKU','OB코드']
     const rows = stockData.rows.map(r => [
       r.name, r.bh_stock ?? '-', r.ob_stock_total ?? '-',
-      r.ob_stock_available ?? '-', r.diff ?? '-', r.sku, r.ob_code
+      r.ob_stock_available ?? '-', r.ob_unusable ?? '-', r.diff ?? '-',
+      r.diff_vs_available ?? '-', r.sku, r.ob_code
     ])
     const csv = [hdr,...rows].map(r=>r.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\n')
     const a = document.createElement('a')
@@ -997,6 +1218,35 @@ export default function ReconcilePage({ config }: Props) {
     URL.revokeObjectURL(a.href)
   }
 
+  // 수정안 일괄 CSV — 미해결 행의 반자동 조치안 + 복붙용 값 추출
+  function exportCorrectionsCsv() {
+    if (!result) return
+    const hidden = new Set(['resolved', 'ignore'])
+    const rows = result.rows.filter(r =>
+      r.status !== 'ok' && r.correction &&
+      !hidden.has(r.cleanup_status || ''))
+    if (rows.length === 0) { message.info('내보낼 미해결 수정안이 없습니다'); return }
+    const TL: Record<string, string> = { in: '입고', out: '출고', adjustment: '조정' }
+    const header = ['날짜', 'SKU', '상품명', '유형', '채널', 'BH수량', 'OB수량', '원인', '조치시스템', '작업', '수량', '조치내용', '정리상태', '메모']
+    const body = rows.map(r => {
+      const c = r.correction!
+      return [
+        r.period, r.sku, r.name, TL[r.tx_type] || r.tx_type, r.channel || '',
+        r.bh_qty ?? '', r.ob_qty ?? '',
+        r.root_cause && ROOT_CAUSE_CFG[r.root_cause] ? ROOT_CAUSE_CFG[r.root_cause].label : (r.root_cause || ''),
+        c.system, c.op, c.qty, c.action,
+        r.cleanup_status ? (CLEANUP_CFG[r.cleanup_status]?.label || r.cleanup_status) : '미처리',
+        r.cleanup_memo || '',
+      ]
+    })
+    const csv = [header, ...body].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n')
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `재고대사_수정안_${fromDate}_${toDate}.csv`; a.click()
+    URL.revokeObjectURL(a.href)
+  }
+
   // 드릴다운 (행 클릭 → 개별 거래 매칭)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -1137,8 +1387,70 @@ export default function ReconcilePage({ config }: Props) {
     )
   }
 
+  // 원인 자동 분류 필터 ('' = 전체)
+  const [causeFilter, setCauseFilter] = useState<string>('')
+
+  // 정리완료/무시 행 숨김 토글 (클라이언트 측 필터, 즉시 반영)
+  const [hideResolved, setHideResolved] = useState(false)
+  // 정리 담당자 (마지막 사용값 기억)
+  const [cleanupAssignee, setCleanupAssignee] = useState<string>(
+    () => localStorage.getItem('recon_cleanup_assignee') || ''
+  )
+  // 메모 편집 모달
+  const [memoModal, setMemoModal] = useState<{ row: ReconcileRow; memo: string; status: ReconcileCleanupStatus } | null>(null)
+
   const filteredRows = (type: string) =>
-    (result?.rows || []).filter(r => r.tx_type === type)
+    (result?.rows || [])
+      .filter(r => r.tx_type === type)
+      .filter(r => !causeFilter || r.root_cause === causeFilter)
+      .filter(r => !hideResolved || (r.cleanup_status !== 'resolved' && r.cleanup_status !== 'ignore'))
+
+  // ── 정리 상태 저장/갱신 (낙관적 로컬 반영) ──────────────────────────
+  function _patchRow(target: ReconcileRow, patch: Partial<ReconcileRow>) {
+    setResult(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        rows: prev.rows.map(r =>
+          r === target ||
+          (r.tx_type === target.tx_type && r.sku === target.sku &&
+           (r.channel || '') === (target.channel || '') && r.period === target.period)
+            ? { ...r, ...patch } : r
+        ),
+      }
+    })
+  }
+
+  async function applyCleanup(r: ReconcileRow, status: ReconcileCleanupStatus, memo?: string) {
+    try {
+      await setReconcileStatus({
+        tx_type: r.tx_type, sku: r.sku, period: r.period, channel: r.channel || '',
+        status, root_cause: r.root_cause || '', name: r.name,
+        bh_qty: r.bh_qty, ob_qty: r.ob_qty,
+        memo: memo ?? r.cleanup_memo ?? '', assignee: cleanupAssignee,
+      })
+      _patchRow(r, { cleanup_status: status, ...(memo !== undefined ? { cleanup_memo: memo } : {}), cleanup_assignee: cleanupAssignee })
+      message.success(`정리 상태: ${CLEANUP_CFG[status].label}`)
+    } catch (e: unknown) {
+      message.error('정리 상태 저장 실패: ' + String(e))
+    }
+  }
+
+  async function clearCleanup(r: ReconcileRow) {
+    try {
+      await clearReconcileStatus({ tx_type: r.tx_type, sku: r.sku, period: r.period, channel: r.channel || '' })
+      _patchRow(r, { cleanup_status: undefined, cleanup_memo: '', cleanup_assignee: '' })
+      message.success('미처리로 초기화')
+    } catch (e: unknown) {
+      message.error('초기화 실패: ' + String(e))
+    }
+  }
+
+  const cleanupActions: CleanupActions = {
+    set: (r, status) => applyCleanup(r, status),
+    editMemo: (r) => setMemoModal({ row: r, memo: r.cleanup_memo || '', status: r.cleanup_status || 'reviewing' }),
+    clear: (r) => clearCleanup(r),
+  }
 
   return (
     <div>
@@ -1379,6 +1691,11 @@ export default function ReconcilePage({ config }: Props) {
           <Tooltip title="BH·OB 현재 재고 비교 — 잔여 재고 현황">
             <Button onClick={handleStock} disabled={!config.api_token} size="small" type="dashed">
               📦 재고 현황
+            </Button>
+          </Tooltip>
+          <Tooltip title="거래처(채널)별 입·출고·조정을 BH vs OB로 비교 — 채널 단위 누락 즉시 식별">
+            <Button onClick={()=>fetchChannelFlow(cfDays)} disabled={!config.api_token} size="small" type="dashed">
+              🏷️ 거래처별 비교
             </Button>
           </Tooltip>
         </div>
@@ -1915,6 +2232,67 @@ export default function ReconcilePage({ config }: Props) {
                 </div>
               )
             })()}
+            {/* 원인 자동 분류 요약 (규칙 기반, 전 모드 공통) — 칩 클릭 시 해당 원인만 필터 */}
+            {(() => {
+              const rcs = (result as ReconcileResult).root_cause_summary
+              if (!rcs) return null
+              const entries = Object.entries(rcs).filter(([k]) => k !== 'ok' && ROOT_CAUSE_CFG[k])
+              if (entries.length === 0) return null
+              return (
+                <div style={{ marginTop: 10, padding: '10px 14px', background: '#fefce8', borderRadius: 8, border: '1px solid #fde68a', fontSize: '0.78rem', lineHeight: 2.2 }}>
+                  <span style={{ fontWeight: 700, color: '#374151' }}>🧭 원인 자동 분류 (전산 정리 방향): </span>
+                  {entries.map(([k, v]) => {
+                    const c = ROOT_CAUSE_CFG[k]
+                    const active = causeFilter === k
+                    return (
+                      <Tooltip key={k} title={c.desc}>
+                        <Tag
+                          color={active ? c.tag : undefined}
+                          style={{ cursor: 'pointer', margin: '0 4px 0 0', fontWeight: active ? 700 : 400,
+                                   borderColor: active ? undefined : '#d1d5db' }}
+                          onClick={() => setCauseFilter(active ? '' : k)}
+                        >
+                          {c.label} {v.count}건
+                        </Tag>
+                      </Tooltip>
+                    )
+                  })}
+                  {causeFilter && (
+                    <Tag color="default" style={{ cursor: 'pointer', margin: 0 }} onClick={() => setCauseFilter('')}>
+                      ✕ 필터 해제
+                    </Tag>
+                  )}
+                  <div style={{ marginTop: 4, color: '#92400e', fontSize: '0.72rem', fontWeight: 600 }}>
+                    💡 칩을 클릭하면 아래 표가 해당 원인만 표시됩니다. 각 행의 "원인" 컬럼에 정리 방향이 표시됩니다.
+                  </div>
+                </div>
+              )
+            })()}
+            {/* 전산 정리 진행 현황 + 담당자/숨김 토글 */}
+            {(() => {
+              const issueCount = result.rows.filter(r => r.status !== 'ok').length
+              const cc = (result as ReconcileResult).cleanup_counts || {}
+              const done = (cc.resolved || 0) + (cc.ignore || 0)
+              return (
+                <div style={{ marginTop: 10, padding: '10px 14px', background: '#f0fdf4', borderRadius: 8, border: '1px solid #bbf7d0', fontSize: '0.78rem', lineHeight: 2.2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ fontWeight: 700, color: '#374151' }}>🧹 전산 정리 현황: </span>
+                  {CLEANUP_ORDER.map(s => (cc[s] ? (
+                    <Tag key={s} color={CLEANUP_CFG[s].tag} style={{ margin: 0 }}>{CLEANUP_CFG[s].label} {cc[s]}건</Tag>
+                  ) : null))}
+                  <span style={{ color: '#15803d', fontWeight: 600 }}>
+                    정리율 {issueCount > 0 ? Math.round(done / issueCount * 100) : 0}% ({done}/{issueCount})
+                  </span>
+                  <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <Button size="small" icon={<ExportOutlined />} onClick={exportCorrectionsCsv}>수정안 CSV</Button>
+                    <span style={{ fontSize: '0.72rem', color: '#6b7280' }}>담당자</span>
+                    <Input size="small" style={{ width: 90 }} value={cleanupAssignee} placeholder="이름"
+                      onChange={e => { setCleanupAssignee(e.target.value); localStorage.setItem('recon_cleanup_assignee', e.target.value) }} />
+                    <Switch size="small" checked={hideResolved} onChange={setHideResolved}
+                      checkedChildren="정리완료 숨김" unCheckedChildren="전체 표시" />
+                  </span>
+                </div>
+              )
+            })()}
           </div>
 
           {/* 탭별 상세 */}
@@ -2016,7 +2394,8 @@ export default function ReconcilePage({ config }: Props) {
                         <ReconcileTable rows={filteredRows(type)} showChannel={result.by_channel} onRowClick={handleRowClick}
                           matchedNames={exactMatchedNames} diffMatchedNames={diffMatchedNames} unmatchedNames={unmatchedNameSet}
                           stockMap={stockMap.size > 0 ? stockMap : undefined}
-                          showBreakdown={mode === 'total' || mode === 'product_all'} />
+                          showBreakdown={mode === 'total' || mode === 'product_all'}
+                          cleanup={cleanupActions} />
                       )}
                     </>
                   ),
@@ -2672,6 +3051,55 @@ export default function ReconcilePage({ config }: Props) {
         </div>
       </div>
 
+      {/* 정리 메모 편집 Modal */}
+      <Modal
+        open={!!memoModal}
+        onCancel={() => setMemoModal(null)}
+        width={520}
+        title="🧹 전산 정리 메모"
+        okText="저장"
+        cancelText="취소"
+        onOk={async () => {
+          if (!memoModal) return
+          await applyCleanup(memoModal.row, memoModal.status, memoModal.memo)
+          setMemoModal(null)
+        }}
+      >
+        {memoModal && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ fontSize: '0.82rem', color: '#374151' }}>
+              <b>{memoModal.row.name || memoModal.row.sku}</b>
+              <span style={{ color: '#9ca3af', marginLeft: 8 }}>
+                {memoModal.row.period} · {TX_LABEL[memoModal.row.tx_type]}
+                {memoModal.row.channel ? ` · ${memoModal.row.channel}` : ''}
+              </span>
+              <div style={{ marginTop: 4, color: '#6b7280' }}>
+                BH {memoModal.row.bh_qty ?? '—'} / OB {memoModal.row.ob_qty ?? '—'}
+                {memoModal.row.root_cause && ROOT_CAUSE_CFG[memoModal.row.root_cause]
+                  ? <Tag color={ROOT_CAUSE_CFG[memoModal.row.root_cause].tag} style={{ marginLeft: 8 }}>
+                      {ROOT_CAUSE_CFG[memoModal.row.root_cause].label}
+                    </Tag>
+                  : null}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.74rem', color: '#6b7280', marginBottom: 4 }}>정리 상태</div>
+              <Radio.Group size="small" value={memoModal.status}
+                onChange={e => setMemoModal({ ...memoModal, status: e.target.value })}>
+                {CLEANUP_ORDER.map(s => <Radio.Button key={s} value={s}>{CLEANUP_CFG[s].label}</Radio.Button>)}
+              </Radio.Group>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.74rem', color: '#6b7280', marginBottom: 4 }}>메모 (원인·조치 내용)</div>
+              <Input.TextArea rows={3} value={memoModal.memo}
+                onChange={e => setMemoModal({ ...memoModal, memo: e.target.value })}
+                placeholder="예: OB 4/19 출고 누락 → BH에 출고 수기 입력함 / 세트 분해건, 정상" />
+            </div>
+            <div style={{ fontSize: '0.74rem', color: '#9ca3af' }}>담당자: {cleanupAssignee || '(미지정 — 상단에서 입력)'}</div>
+          </div>
+        )}
+      </Modal>
+
       {/* 누락건 추출 Modal */}
       <Modal
         open={missingOpen}
@@ -2784,52 +3212,151 @@ export default function ReconcilePage({ config }: Props) {
           <>
             <Row gutter={12} style={{marginBottom:14}}>
               {[
-                {label:'전체 상품', val:stockData.total, color:'#374151', bg:'#f3f4f6'},
-                {label:'재고 일치', val:stockData.ok_count, color:'#065f46', bg:'#d1fae5'},
-                {label:'재고 차이', val:stockData.diff_count, color:'#991b1b', bg:'#fee2e2'},
-                {label:'거래추적 필요', val:stockData.need_trace_count ?? 0, color:'#7c2d12', bg:'#ffedd5'},
-              ].map(m=>(
-                <Col span={6} key={m.label}>
-                  <div style={{background:m.bg,borderRadius:8,padding:'8px 12px',textAlign:'center'}}>
-                    <div style={{fontSize:'1.4rem',fontWeight:800,color:m.color}}>{m.val}</div>
-                    <div style={{fontSize:'0.72rem',color:m.color}}>{m.label}</div>
-                  </div>
-                </Col>
-              ))}
+                {label:'전체 상품', val:stockData.total, color:'#374151', bg:'#f3f4f6', filter:null as null|'ok'|'diff'|'trace'},
+                {label:'재고 일치', val:stockData.ok_count, color:'#065f46', bg:'#d1fae5', filter:'ok' as const},
+                {label:'재고 차이', val:stockData.diff_count, color:'#991b1b', bg:'#fee2e2', filter:'diff' as const},
+                {label:'거래추적 필요', val:stockData.need_trace_count ?? 0, color:'#7c2d12', bg:'#ffedd5', filter:'trace' as const},
+              ].map(m=>{
+                const active = stockCardFilter === m.filter
+                return (
+                  <Col span={6} key={m.label}>
+                    <div
+                      onClick={()=>setStockCardFilter(m.filter)}
+                      style={{background:m.bg,borderRadius:8,padding:'8px 12px',textAlign:'center',cursor:'pointer',
+                        border:`${active?2:1}px solid ${active?m.color:'transparent'}`,
+                        boxShadow:active?'0 2px 6px rgba(0,0,0,0.10)':'none',transition:'all 0.12s'}}
+                    >
+                      <div style={{fontSize:'1.4rem',fontWeight:800,color:m.color}}>{m.val}</div>
+                      <div style={{fontSize:'0.72rem',color:m.color,fontWeight:active?700:400}}>{m.label}{active&&m.filter?' ✓':''}</div>
+                    </div>
+                  </Col>
+                )
+              })}
             </Row>
             <div style={{fontSize:'0.74rem',color:'#6b7280',marginBottom:8,display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-              <span>차이 = BH재고 − OB가용. <b style={{color:'#7c2d12'}}>잔여</b>는 불용·매핑으로 설명 안 된 진짜 차이(거래 추적 필요). 행 클릭 시 거래 분석.</span>
+              <span><b>차이 = BH재고 − OB총재고</b>(가용+가용외). 가용외(할당·보류)는 OB 내부 상태라 비교 기준에서 빠져, 할당 타이밍에 따른 출렁임 없이 진짜 정합오차만 잡힙니다. <span style={{color:'#9ca3af'}}>참고(−가용)</span>은 기존 엑셀 기준(BH−OB가용). 행 클릭 시 거래 분석.</span>
               <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:6}}>
                 <Switch size="small" checked={stockResidualOnly} onChange={setStockResidualOnly} />
-                <span style={{color:'#7c2d12',fontWeight:600}}>⚠ 불용 외 차이만 보기</span>
+                <span style={{color:'#7c2d12',fontWeight:600}}>⚠ 정합오차 있는 것만 보기</span>
               </span>
             </div>
+            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginBottom:10}}>
+              <Input.Search
+                allowClear
+                placeholder="상품명 · SKU · OB코드 검색"
+                value={stockSearch}
+                onChange={e=>setStockSearch(e.target.value)}
+                style={{maxWidth:300}}
+              />
+              <Select
+                mode="multiple"
+                allowClear
+                size="middle"
+                placeholder="원인 필터"
+                value={stockCauseFilter}
+                onChange={setStockCauseFilter}
+                style={{minWidth:180}}
+                options={[
+                  {value:'가용외', label:'🟡 가용외'},
+                  {value:'매핑다중', label:'🟣 매핑다중'},
+                  {value:'미분류', label:'🔴 미분류(거래추적)'},
+                ]}
+              />
+              <Select
+                allowClear
+                placeholder="차이 방향"
+                value={stockDirFilter ?? undefined}
+                onChange={v=>setStockDirFilter(v ?? null)}
+                style={{width:130}}
+                options={[
+                  {value:'plus', label:'+ BH가 많음'},
+                  {value:'minus', label:'− OB가 많음'},
+                ]}
+              />
+              {(stockCardFilter||stockCauseFilter.length>0||stockDirFilter||stockSearch)&&(
+                <Button size="small" onClick={()=>{setStockCardFilter(null);setStockCauseFilter([]);setStockDirFilter(null);setStockSearch('')}}>
+                  필터 초기화
+                </Button>
+              )}
+            </div>
             <Table size="small"
-              dataSource={stockResidualOnly ? stockData.rows.filter(r=>r.residual!==null && r.residual!==undefined && r.residual!==0) : stockData.rows}
+              dataSource={(() => {
+                let rows = stockResidualOnly ? stockData.rows.filter(r=>r.residual!==null && r.residual!==undefined && r.residual!==0) : stockData.rows
+                // 상단 카드 필터 (전체/일치/차이/추적필요 — 백엔드 카운트와 동일 기준)
+                if (stockCardFilter==='ok') rows = rows.filter(r=>r.diff===0)
+                else if (stockCardFilter==='diff') rows = rows.filter(r=>r.diff!==null && r.diff!==undefined && r.diff!==0)
+                else if (stockCardFilter==='trace') rows = rows.filter(r=>r.residual!==null && r.residual!==undefined && r.residual!==0)
+                // 원인 태그 필터 (하나라도 해당하면 표시)
+                if (stockCauseFilter.length>0) rows = rows.filter(r=>{
+                  const types=(r.causes||[]).map(c=>c.type)
+                  return stockCauseFilter.some(f=>
+                    f==='미분류' ? (r.diff!==null && r.diff!==undefined && r.diff!==0 && types.length===0) : types.includes(f)
+                  )
+                })
+                // 차이 방향 필터
+                if (stockDirFilter==='plus') rows = rows.filter(r=>(r.diff??0)>0)
+                else if (stockDirFilter==='minus') rows = rows.filter(r=>(r.diff??0)<0)
+                const q = stockSearch.trim().toLowerCase()
+                if (q) rows = rows.filter(r =>
+                  (r.name||'').toLowerCase().includes(q) ||
+                  (r.sku||'').toLowerCase().includes(q) ||
+                  (r.ob_code||'').toLowerCase().includes(q) ||
+                  (r.bh_skus||[]).some(s=>(s||'').toLowerCase().includes(q)) ||
+                  (r.ob_codes||[]).some(c=>(c||'').toLowerCase().includes(q)) ||
+                  (r.bh_names||[]).some(n=>(n||'').toLowerCase().includes(q)) ||
+                  (r.ob_names||[]).some(n=>(n||'').toLowerCase().includes(q))
+                )
+                return rows
+              })()}
               rowKey="name"
               pagination={{pageSize:20,showSizeChanger:true,showTotal:t=>`총 ${t}개 상품`}}
               onRow={(r:unknown)=>({onClick:()=>handleStockRowClick(r as StockRow), style:{cursor:'pointer'}})}
               columns={[
-                {title:'상품명', dataIndex:'name', ellipsis:{showTitle:false}, width:260,
+                {title:'상품명', dataIndex:'name', ellipsis:{showTitle:false}, width:260, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>((a as StockRow).name||'').localeCompare((b as StockRow).name||'','ko'),
                   render:(v:string,r:unknown)=>{
-                    const row=r as {diff:number|null}
-                    return <Tooltip title={v} placement="topLeft"><span style={{fontWeight:row.diff!==0&&row.diff!==null?600:400}}>{v}</span></Tooltip>
+                    const row=r as StockRow
+                    const members=Array.from(new Set([...(row.bh_names||[]),...(row.ob_names||[])])).filter(n=>n&&n!==v)
+                    const isGroup=(row.bh_skus?.length||0)>1||(row.ob_codes?.length||0)>1||members.length>0
+                    const tip = isGroup
+                      ? <div><b>{v}</b><div style={{marginTop:4,fontSize:'0.72rem'}}>묶음 {(row.bh_skus?.length||0)} SKU ↔ {(row.ob_codes?.length||0)} 코드</div>
+                          {members.length>0&&<div style={{marginTop:3}}>{[v,...members].map((n,i)=><div key={i}>· {n}</div>)}</div>}</div>
+                      : v
+                    return <Tooltip title={tip} placement="topLeft">
+                      <span style={{fontWeight:row.diff!==0&&row.diff!==null?600:400}}>
+                        {isGroup&&<Tag color="purple" style={{margin:'0 4px 0 0',fontSize:'0.62rem',padding:'0 4px',lineHeight:'16px'}}>묶음{members.length>0?`+${members.length}`:''}</Tag>}
+                        {v}
+                      </span>
+                    </Tooltip>
                   }},
-                {title:'BH 재고', dataIndex:'bh_stock', width:84, align:'right' as const,
+                {title:'BH 재고', dataIndex:'bh_stock', width:84, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).bh_stock??-Infinity))-(((b as StockRow).bh_stock??-Infinity)),
                   render:(v:number|null)=>v===null?<span style={{color:'#d1d5db'}}>—</span>:<span style={{color:'#1e3a8a',fontWeight:600}}>{v.toLocaleString()}</span>},
-                {title:'OB 가용', dataIndex:'ob_stock_available', width:84, align:'right' as const,
+                {title:<Tooltip title="OurBox 총재고 = 가용 + 가용외. 비교 기준(차이 = BH재고 − OB총)">OB 총<span style={{color:'#9ca3af'}}>ⓘ</span></Tooltip>, dataIndex:'ob_stock_total', width:84, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).ob_stock_total??-Infinity))-(((b as StockRow).ob_stock_total??-Infinity)),
+                  render:(v:number|null)=>v===null?<span style={{color:'#d1d5db'}}>—</span>:<span style={{color:'#111827',fontWeight:600}}>{v.toLocaleString()}</span>},
+                {title:'OB 가용', dataIndex:'ob_stock_available', width:84, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).ob_stock_available??-Infinity))-(((b as StockRow).ob_stock_available??-Infinity)),
                   render:(v:number|null)=>v===null?<span style={{color:'#d1d5db'}}>—</span>:<span style={{color:'#92400e'}}>{v.toLocaleString()}</span>},
-                {title:'OB 가용외', dataIndex:'ob_unusable', width:78, align:'right' as const,
-                  render:(v:number)=>!v?<span style={{color:'#d1d5db'}}>0</span>:<Tooltip title="OurBox 가용외 수량(unavailable) = 출고 할당·작업중·불용 등. 가용에서 빠져 있어 BH재고와 차이로 잡힘"><span style={{color:'#a16207',cursor:'help'}}>{v.toLocaleString()}</span></Tooltip>},
-                {title:'차이', dataIndex:'diff', width:80, align:'right' as const,
+                {title:'OB 가용외', dataIndex:'ob_unusable', width:78, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).ob_unusable??0))-(((b as StockRow).ob_unusable??0)),
+                  render:(v:number)=>!v?<span style={{color:'#d1d5db'}}>0</span>:<Tooltip title="OurBox 가용외 수량(unavailable) = 출고 할당·작업중·불용 등. 총재고엔 포함되므로 차이엔 영향 없음(참고)"><span style={{color:'#a16207',cursor:'help'}}>{v.toLocaleString()}</span></Tooltip>},
+                {title:<Tooltip title="차이 = BH재고 − OB총재고. 가용외(할당) 타이밍에 흔들리지 않는 기준. 클릭 정렬: 값 기준 (기본 정렬은 |차이| 큰 순)">차이<span style={{color:'#9ca3af'}}>ⓘ</span></Tooltip>, dataIndex:'diff', width:80, align:'right' as const, showSorterTooltip:false,
                   render:(v:number|null)=>{
                     if(v===null) return <span style={{color:'#d1d5db'}}>—</span>
                     if(v===0) return <Tag color="success" style={{margin:0}}>✓</Tag>
                     return <span style={{color:v>0?'#2563eb':'#ef4444',fontWeight:700}}>{v>0?'+':''}{v.toLocaleString()}</span>
                   },
-                  sorter:(a:unknown,b:unknown)=>Math.abs((b as {diff:number|null}).diff??0)-Math.abs((a as {diff:number|null}).diff??0),
-                  defaultSortOrder:'ascend' as const},
-                {title:'잔여(거래차)', dataIndex:'residual', width:90, align:'right' as const,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).diff??-Infinity))-(((b as StockRow).diff??-Infinity))},
+                {title:<Tooltip title="참고: BH재고 − OB가용 (기존 엑셀 기준). 가용외 할당 타이밍에 따라 출렁임">참고(−가용)<span style={{color:'#9ca3af'}}>ⓘ</span></Tooltip>, dataIndex:'diff_vs_available', width:90, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).diff_vs_available??-Infinity))-(((b as StockRow).diff_vs_available??-Infinity)),
+                  render:(v:number|null)=>{
+                    if(v===null||v===undefined) return <span style={{color:'#d1d5db'}}>—</span>
+                    if(v===0) return <span style={{color:'#9ca3af'}}>0</span>
+                    return <span style={{color:'#9ca3af'}}>{v>0?'+':''}{v.toLocaleString()}</span>
+                  }},
+                {title:'잔여(거래차)', dataIndex:'residual', width:90, align:'right' as const, showSorterTooltip:false,
+                  sorter:(a:unknown,b:unknown)=>(((a as StockRow).residual??-Infinity))-(((b as StockRow).residual??-Infinity)),
                   render:(v:number|null)=>{
                     if(v===null||v===undefined) return <span style={{color:'#d1d5db'}}>—</span>
                     if(v===0) return <Tag color="success" style={{margin:0,fontSize:'0.68rem'}}>설명됨</Tag>
@@ -2840,7 +3367,7 @@ export default function ReconcilePage({ config }: Props) {
                     const row=r as StockRow
                     const cs=row.causes||[]
                     if(!cs.length) {
-                      if(row.diff && row.diff!==0) return <Tag color="error" style={{margin:0,fontSize:'0.68rem'}}>미분류(거래추적)</Tag>
+                      if(row.diff && row.diff!==0) return <Tooltip title="행을 클릭한 뒤 '🧭 거래 정밀 대사'를 실행하면 어느 거래에서 차이났는지 자동 분해됩니다"><Tag color="error" style={{margin:0,fontSize:'0.68rem',cursor:'help'}}>미분류(거래추적)</Tag></Tooltip>
                       return <span style={{color:'#d1d5db'}}>—</span>
                     }
                     return <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>
@@ -2875,28 +3402,42 @@ export default function ReconcilePage({ config }: Props) {
                   <div style={{fontWeight:700, marginBottom:8, color:'#92400e'}}>🔍 {r.name} — 차이 원인 상세</div>
                   <div style={{display:'flex', gap:18, flexWrap:'wrap', marginBottom:10}}>
                     <span>박스히어로 재고 <b style={{color:'#1e3a8a'}}>{fmt(bh)}</b></span>
-                    <span>OB 가용 <b style={{color:'#92400e'}}>{fmt(av)}</b></span>
-                    <span>OB 총재고 <b>{fmt(tot)}</b> (가용외 {fmt(un)} 포함)</span>
+                    <span>OB 총재고 <b>{fmt(tot)}</b></span>
+                    <span style={{color:'#6b7280'}}>(가용 {fmt(av)} + 가용외 {fmt(un)})</span>
                     <span>차이 <b style={{color:diff>=0?'#2563eb':'#ef4444'}}>{sign(diff)}</b></span>
                   </div>
                   {/* 단계별 설명 */}
                   <div style={{background:'#fff', borderRadius:6, padding:'8px 12px', border:'1px solid #fef3c7'}}>
-                    <div>① <b>차이 {sign(diff)}</b> = BH재고 {fmt(bh)} − OB가용 {fmt(av)}</div>
+                    <div>① <b>차이 {sign(diff)}</b> = BH재고 {fmt(bh)} − OB총재고 {fmt(tot)}</div>
                     {un > 0 && (
                       <div>② <b style={{color:'#a16207'}}>OB 가용외 {fmt(un)}개</b>: OurBox가 가용에서 뺀 수량(출고 할당·작업중·불용 등).
-                        {' '}BH 재고엔 포함돼 있어 그만큼 BH가 많아 보입니다.
-                        {diff > 0 && un > 0 && ` 차이 ${fmt(diff)} 중 ${fmt(Math.min(un,diff))}개가 이걸로 설명됩니다.`}
-                        {diff < 0 && ` (이 품목은 BH가 오히려 적어, 가용외는 직접 원인은 아니지만 참고용입니다.)`}
+                        {' '}<b>총재고에 이미 포함</b>돼 있어 이 차이엔 영향이 없습니다(참고). 가용 기준 차이는 {sign(r.diff_vs_available ?? (bh - av))} — 할당 타이밍에 따라 출렁이므로 비교 기준으로 쓰지 않습니다.
                       </div>
                     )}
                     {(r.causes||[]).some(c=>c.type==='매핑다중') && (
-                      <div>③ <b style={{color:'#7c3aed'}}>매핑 다중</b>: BH SKU {r.bh_skus?.length||0}개 ↔ OB 코드 {r.ob_codes?.length||0}개가 한 그룹으로 합산됨. 묶음이 정확한지 상품 매핑 확인 권장.</div>
+                      <div>③ <b style={{color:'#7c3aed'}}>매핑 다중</b>: BH SKU {r.bh_skus?.length||0}개 ↔ OB 코드 {r.ob_codes?.length||0}개가 한 그룹으로 합산됨. 묶음이 정확한지 상품 매핑 확인 권장.
+                        {(r.bh_names?.length||0)>0 && (
+                          <div style={{marginTop:2,paddingLeft:14,fontSize:'0.76rem',color:'#6b21a8'}}>
+                            · BH({r.bh_names!.length}): {r.bh_names!.join(', ')}
+                          </div>
+                        )}
+                        {(r.ob_names?.length||0)>0 && (
+                          <div style={{paddingLeft:14,fontSize:'0.76rem',color:'#6b21a8'}}>
+                            · OB({r.ob_names!.length}): {r.ob_names!.join(', ')}
+                          </div>
+                        )}
+                        {(r.ob_codes?.length||0)>0 && (
+                          <div style={{paddingLeft:14,fontSize:'0.72rem',color:'#9ca3af'}}>
+                            · OB코드: {r.ob_codes!.join(', ')}
+                          </div>
+                        )}
+                      </div>
                     )}
                     <div style={{marginTop:4, paddingTop:4, borderTop:'1px dashed #fde68a'}}>
                       ④ <b style={{color:'#7c2d12'}}>잔여 {sign(resid)}</b>:
                       {resid === 0
-                        ? ' 불용·매핑으로 차이가 모두 설명됩니다. 추가 조치 불필요 ✅'
-                        : ` 불용/매핑으로 설명 안 되는 진짜 재고 차이입니다. 아래 거래 내역에서 한쪽에만 기록된 입·출고를 확인하세요.`}
+                        ? ' BH재고와 OB총재고가 일치합니다. 추가 조치 불필요 ✅'
+                        : ` BH·OB 총재고가 실제로 어긋난 정합오차입니다(기초재고 베이스·입출고 누락 등). 아래 거래 내역에서 한쪽에만 기록된 입·출고를 확인하세요.`}
                     </div>
                   </div>
                   {(!r.causes || r.causes.length===0) && diff !== 0 && (
@@ -2904,6 +3445,213 @@ export default function ReconcilePage({ config }: Props) {
                       ⚠ 자동 분류된 원인이 없습니다(부자재이거나 매핑 미등록일 수 있음). 아래 거래 비교로 확인하세요.
                     </div>
                   )}
+
+                  {/* 재고 차이 변화 추적 — 두 시점(t1→t2) 사이 차이가 왜 벌어졌나 */}
+                  <div style={{marginTop:10, paddingTop:10, borderTop:'1px dashed #fcd34d'}}>
+                    <div style={{fontWeight:700, marginBottom:4, color:'#7c2d12', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                      <span>📈 재고 차이 변화 추적 — 언제·왜 벌어졌나</span>
+                      <Select size="small" style={{minWidth:160}} placeholder="비교 기준(이전) 리포트"
+                        value={diffT1Id ?? undefined}
+                        options={weeklyList.map(w=>({value:w.id, label:`${w.report_date} 기준`}))}
+                        onChange={(v:number)=>setDiffT1Id(v)} />
+                      <Button size="small" type="primary" loading={diffTraceLoading} disabled={!diffT1Id}
+                        onClick={()=>fetchDiffTrace(r.name, diffT1Id!)}>
+                        {diffTrace ? '↻ 다시' : '▶ 변화 분석'}
+                      </Button>
+                      <span style={{fontSize:'0.72rem',color:'#9ca3af'}}>(최신 리포트 대비)</span>
+                    </div>
+                    {!diffTrace ? (
+                      <div style={{color:'#9ca3af',fontSize:'0.76rem'}}>
+                        {diffTraceLoading ? '두 시점 재고차 분해 중... (거래 수집 포함, 수분 걸릴 수 있어요)'
+                          : '↑ 이전 리포트를 골라 누르면, 그 시점부터 지금까지 BH·OB 차이가 왜 벌어졌는지(OB 가용외 변동 vs 실제 입·출고 흐름)를 분해합니다.'}
+                      </div>
+                    ) : (() => {
+                      const dt = diffTrace
+                      const sign = (n:number)=> n>0?`+${n.toLocaleString()}`:n.toLocaleString()
+                      const fmtn = (n:number)=> Math.abs(n).toLocaleString()
+                      // 한 줄 결론(verdict): Δ변화의 주원인 + 선등록(절대차이 기여) 요약
+                      const unav = dt.contrib.ob_unavail_change || 0
+                      const flowc = dt.contrib.net_stock_flow || 0
+                      const returned = dt.unavail_returned || 0
+                      const prebook = dt.prebook_bh || 0
+                      const unavT2 = dt.t2.ob_unusable || 0
+                      const unavInvolved = Math.abs(unav) >= 50 || unavT2 >= 50
+                      const deltaAv = dt.delta_diff_available ?? (flowc + unav)
+                      let vColor = '#0e7490', vBg = '#ecfeff', vBorder = '#a5f3fc'
+                      const parts: string[] = []
+                      const caveats: string[] = []
+                      // 주지표는 총재고 기준 → 차이 변화 = 입·출고 순흐름차(가용외는 비교에서 제외)
+                      if (Math.abs(flowc) >= 50) {
+                        vColor = '#9a3412'; vBg = '#fff7ed'; vBorder = '#fed7aa'
+                        parts.push(`총재고 기준 차이 변화는 입·출고 순흐름차(${sign(flowc)})입니다 — 실제 거래 누락/중복 가능성. 아래 개별 거래를 확인하세요.`)
+                      } else {
+                        vColor = '#166534'; vBg = '#f0fdf4'; vBorder = '#bbf7d0'
+                        parts.push(`총재고 기준 차이 변화는 ${sign(flowc)}로 작습니다 — 실제 거래 누락은 아닙니다.`)
+                      }
+                      // 가용외 변동은 총재고 비교에서 제외됨을 명시 (참고)
+                      if (unavInvolved) {
+                        if (returned > 0)
+                          parts.push(`참고로 이 기간 OB 가용외(할당·보류)가 ${fmtn(returned)}개 가용으로 환원됐지만, 총재고엔 포함되므로 차이엔 영향 없습니다(가용 기준이었다면 ${sign(deltaAv)} 출렁였을 부분).`)
+                        else
+                          parts.push(`참고로 OB 가용외가 ${sign(unav)} 변동했지만 총재고 비교라 차이엔 영향 없습니다(가용 기준이었다면 ${sign(deltaAv)}).`)
+                      }
+                      // 선등록 ↔ 가용외 자동 연결: BH가 미리 차감한 발송예정분이 OB엔 할당(가용외)으로 잡혀있을 가능성
+                      if (prebook > 0) {
+                        const shipDates = (dt.prebook || []).map(p=>p.ship_date).filter(Boolean).sort()
+                        const shipHint = shipDates.length ? ` (발송예정 ${shipDates[0]}${shipDates.length>1?` 외`:''})` : ''
+                        if (unavT2 >= prebook)
+                          parts.push(`또한 현재 차이엔 BH 선등록(발송예정) ${fmtn(prebook)}개가 포함${shipHint} — BH는 이미 차감했고 OurBox엔 발송용으로 할당(가용외 ${fmtn(unavT2)}개에 포함 추정) 상태일 가능성이 큽니다. 발송완료되면 가용외·전체 동시 감소하며 자동 정합됩니다.`)
+                        else
+                          parts.push(`또한 현재 차이엔 BH 선등록(발송예정) ${fmtn(prebook)}개가 포함${shipHint} — BH가 미래 발송분을 미리 차감했고, OurBox엔 실제 발송 시점에 할당(가용외)으로 잡혔다가 출고완료되며 자동 정합됩니다(시점차).`)
+                      }
+                      // 가용외 변동성 경고
+                      if (unavInvolved)
+                        caveats.push('가용외는 OurBox 출고 주문 할당분이라 주문 할당 타이밍에 따라 스냅샷마다 크게 출렁입니다. 이 순간 차이값보다 입·출고 흐름(순흐름차)으로 판단하세요.')
+                      // 매핑 그룹 구성 변화 — 거래 없이 가용/가용외가 변한 '흔적'의 실체일 수 있음
+                      const gc = dt.group_change
+                      const gcChanged = !!(gc && gc.changed)
+                      let gcMsg = ''
+                      if (gcChanged) {
+                        const seg: string[] = []
+                        if (gc!.t1_only_codes.length) seg.push(`${dt.t1.date}에만 포함된 OB코드 ${gc!.t1_only_codes.join(', ')}`)
+                        if (gc!.t2_only_codes.length) seg.push(`${dt.t2.date}에만 포함된 OB코드 ${gc!.t2_only_codes.join(', ')}`)
+                        if (gc!.t1_only_skus.length)  seg.push(`${dt.t1.date}에만 포함된 BH SKU ${gc!.t1_only_skus.join(', ')}`)
+                        if (gc!.t2_only_skus.length)  seg.push(`${dt.t2.date}에만 포함된 BH SKU ${gc!.t2_only_skus.join(', ')}`)
+                        gcMsg = `두 시점의 매핑 그룹 구성이 다릅니다 — ${seg.join(' · ')}. 같은 '${dt.name}' 행이라도 속을 구성하는 코드가 달라, 빠진 코드의 재고(가용·가용외 포함)가 거래 없이 사라지거나 합쳐집니다. 위 가용외 변동의 상당 부분이 실제 할당 해제가 아니라 이 그룹 재구성에서 왔을 수 있습니다.`
+                      }
+                      return (
+                        <div style={{fontSize:'0.78rem'}}>
+                          <div style={{marginBottom:6}}>
+                            차이 <b>{dt.t1.date}</b> {sign(dt.t1.diff??0)} → <b>{dt.t2.date}</b> {sign(dt.t2.diff??0)}
+                            {'  '}<b style={{color: dt.delta_diff===0?'#10b981':'#ef4444'}}>(Δ {sign(dt.delta_diff)})</b>
+                          </div>
+                          {gcChanged && (
+                            <div style={{background:'#fef2f2', border:'1px solid #fecaca', borderRadius:6, padding:'7px 10px', marginBottom:8, color:'#b91c1c', lineHeight:1.5}}>
+                              <b>🚨 그룹 구성 불일치(비교 왜곡 주의):</b> {gcMsg}
+                            </div>
+                          )}
+                          <div style={{background:vBg, border:`1px solid ${vBorder}`, borderRadius:6, padding:'7px 10px', marginBottom:8, color:vColor, lineHeight:1.5}}>
+                            <b>📌 결론:</b> {parts.join(' ').replace(/\*\*/g,'')}
+                            {caveats.length>0 && <div style={{marginTop:5, paddingTop:5, borderTop:`1px dashed ${vBorder}`, fontSize:'0.72rem', opacity:0.92}}>⚠ {caveats.join(' ')}</div>}
+                          </div>
+                          <table style={{width:'100%',borderCollapse:'collapse',marginBottom:6,fontSize:'0.76rem'}}>
+                            <tbody>
+                              <tr style={{borderBottom:'1px solid #fef3c7'}}>
+                                <td style={{padding:'3px 6px'}}>OB 가용외(할당·보류) 변동</td>
+                                <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:'#9ca3af'}}>{sign(dt.contrib.ob_unavail_change)}</td>
+                                <td style={{padding:'3px 6px',color:'#9ca3af',fontSize:'0.72rem'}}>총재고 비교라 차이엔 영향 없음(참고). 가용 기준일 때만 출렁임</td>
+                              </tr>
+                              <tr style={{borderBottom:'1px solid #fef3c7'}}>
+                                <td style={{padding:'3px 6px'}}>입·출고 순흐름 차이 (BH−OB)</td>
+                                <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:'#7c2d12'}}>{sign(dt.contrib.net_stock_flow)}</td>
+                                <td style={{padding:'3px 6px',color:'#9ca3af',fontSize:'0.72rem'}}>크면 실제 입·출고 누락 의심 → 아래 거래 확인</td>
+                              </tr>
+                              {Math.abs(dt.residual)>0 && (
+                                <tr>
+                                  <td style={{padding:'3px 6px',color:'#9ca3af'}}>잔차(스냅샷 경계)</td>
+                                  <td style={{padding:'3px 6px',textAlign:'right',color:'#9ca3af'}}>{sign(dt.residual)}</td>
+                                  <td/>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                          <div style={{fontSize:'0.72rem',color:'#6b7280',lineHeight:1.5}}>
+                            BH재고 {dt.t1.bh_stock?.toLocaleString()} → {dt.t2.bh_stock?.toLocaleString()} ({sign(dt.delta_bh_stock)}) · {' '}
+                            OB전체 {dt.t1.ob_total?.toLocaleString()} → {dt.t2.ob_total?.toLocaleString()} ({sign(dt.delta_ob_total)}) · {' '}
+                            OB가용 {dt.t1.ob_available?.toLocaleString()} → {dt.t2.ob_available?.toLocaleString()} ({sign(dt.delta_ob_available)}) · {' '}
+                            OB가용외 {dt.t1.ob_unusable?.toLocaleString()} → {dt.t2.ob_unusable?.toLocaleString()} ({sign(dt.delta_ob_unusable)})
+                          </div>
+                          {(dt.bh_only.length>0 || dt.ob_only.length>0 || dt.qty_diff.length>0) && (
+                            <div style={{marginTop:6, paddingTop:6, borderTop:'1px dashed #fde68a'}}>
+                              <b style={{color:'#7c2d12'}}>이 기간 한쪽에만 기록된 거래 (참고용 단서)</b>
+                              <div style={{fontSize:'0.7rem',color:'#9ca3af',marginBottom:3}}>※ 아래 거래는 위 분해 수치에 이미 합산 반영됨. 메모를 보고 "직배송/누락/보정" 성격을 판단하세요.</div>
+                              {dt.ob_only.map((x: FMItem & {channel?:string},i:number)=><div key={'o'+i} style={{paddingLeft:8,color:'#991b1b'}}>· OB에만 {x.date} [{x.ob_type}] <b>{x.qty.toLocaleString()}</b>{x.channel?<span style={{color:'#9ca3af'}}> · {x.channel}</span>:null}</div>)}
+                              {dt.bh_only.map((x: FMItem & {memo?:string;channel?:string},i:number)=><div key={'b'+i} style={{paddingLeft:8,color:'#1e3a8a'}}>· BH에만 {x.date} [{x.bh_type}] <b>{x.qty.toLocaleString()}</b>{x.memo?<span style={{color:'#6b7280'}}> · {x.memo}</span>:null}</div>)}
+                              {dt.qty_diff.map((x: FMMatched & {bh_memo?:string},i:number)=><div key={'q'+i} style={{paddingLeft:8,color:'#7c2d12'}}>· 수량차 {x.bh_date} BH {x.bh_qty?.toLocaleString()} / OB {x.ob_qty?.toLocaleString()} ({sign(x.qty_diff)}){x.bh_memo?<span style={{color:'#6b7280'}}> · {x.bh_memo}</span>:null}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
+                  </div>
+
+                  {/* 거래 정밀 대사 — 이벤트 단위로 차이 발생 지점·원인 자동 분해 */}
+                  <div style={{marginTop:10, paddingTop:10, borderTop:'1px dashed #fcd34d'}}>
+                    <div style={{fontWeight:700, marginBottom:4, color:'#7c2d12', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                      <span>🧭 거래 정밀 대사 — 어느 거래에서 차이났나</span>
+                      <Button size="small" type="primary" loading={deepTraceLoading}
+                        onClick={()=>fetchDeepTrace(r, stockFlowMonths)}>
+                        {deepTrace ? '↻ 다시 대사' : '▶ 정밀 대사 실행'}
+                      </Button>
+                      <span style={{fontSize:'0.72rem',color:'#9ca3af'}}>(최근 {stockFlowMonths}개월 · 기간은 아래 라디오와 공유)</span>
+                    </div>
+                    {!deepTrace ? (
+                      <div style={{color:'#9ca3af',fontSize:'0.76rem'}}>
+                        {deepTraceLoading
+                          ? '입·출고 이벤트 짝짓기 중... (같은 수량 ±3일 → 분할기록 상쇄 → 잔여 원인 분류)'
+                          : '↑ 실행하면 BH·OB 입출고를 이벤트 단위로 짝짓고, 남는 거래를 교차기록·선차감(가용외)·기간이전·누락으로 자동 분류합니다.'}
+                      </div>
+                    ) : (() => {
+                      const dt2 = deepTrace
+                      const sign = (n:number)=> n>0?`+${n.toLocaleString()}`:n.toLocaleString()
+                      const tagColor = (t:string)=>
+                        t.startsWith('교차기록') ? 'magenta'
+                        : t.startsWith('선차감') ? 'gold'
+                        : t.startsWith('기간이전 선반영') ? 'cyan'
+                        : t==='기간이전차이' ? 'orange'
+                        : t.startsWith('기간경계') ? 'default'
+                        : t==='BH만 기록' ? 'geekblue'
+                        : t==='OB만 기록' ? 'volcano' : 'default'
+                      const eqOk = dt2.residual === 0 || dt2.residual === null
+                      return (
+                        <div style={{fontSize:'0.78rem'}}>
+                          <div style={{background: eqOk?'#f0fdf4':'#fef2f2', border:`1px solid ${eqOk?'#bbf7d0':'#fecaca'}`, borderRadius:6, padding:'7px 10px', marginBottom:8, lineHeight:1.6}}>
+                            <b>📌 등식 검증:</b> 차이 {sign(dt2.diff_now ?? 0)} = 기간이전 {sign(dt2.opening_gap ?? 0)} + 잔여거래 합 {sign(dt2.explained - (dt2.opening_gap ?? 0))}
+                            {'  '}→ 미해소 <b style={{color: eqOk?'#166534':'#b91c1c'}}>{sign(dt2.residual ?? 0)}</b>
+                            {eqOk ? ' ✅ 전부 설명됨' : ' ⚠ 설명 안 된 잔차 있음'}
+                            <span style={{marginLeft:10, color:'#9ca3af', fontSize:'0.72rem'}}>
+                              (짝지어진 거래: 입고 {dt2.matched_in} · 출고 {dt2.matched_out}건 — 시점차 ±3일·분할기록 흡수)
+                            </span>
+                          </div>
+                          {dt2.avail_basis && dt2.avail_basis.diff_avail !== null && (dt2.avail_basis.ob_unav !== 0 || dt2.avail_basis.diff_avail !== (dt2.diff_now ?? 0)) && (
+                            <div style={{background:'#fffbeb', border:'1px solid #fde68a', borderRadius:6, padding:'7px 10px', marginBottom:8, lineHeight:1.6}}>
+                              <b>📎 참고(−가용) 기준 분해:</b> BH−OB가용 <b>{sign(dt2.avail_basis.diff_avail)}</b> = 차이(총재고) {sign(dt2.diff_now ?? 0)} + 가용외 {sign(dt2.avail_basis.ob_unav)}
+                              <span style={{marginLeft:8, color:'#9ca3af', fontSize:'0.72rem'}}>— 총재고 차이 원인은 아래 목록, 가용외 몫은 할당 시점으로 분해:</span>
+                              {dt2.avail_basis.unav_events.length > 0 ? (
+                                <div style={{fontSize:'0.72rem', color:'#78716c', marginTop:2}}>
+                                  가용외 변동(스냅샷): {dt2.avail_basis.unav_events.map(u=>`${u.date} ${u.delta>0?'+':''}${u.delta.toLocaleString()}`).join(' · ')}
+                                  <span style={{color:'#a8a29e'}}> (+는 주문 할당 = 가용→가용외, −는 발송 완료·할당 해제)</span>
+                                </div>
+                              ) : (
+                                <div style={{fontSize:'0.72rem', color:'#a8a29e', marginTop:2}}>
+                                  기간 내 가용외 변동 스냅샷 없음 — 지금 가용외 {dt2.avail_basis.ob_unav.toLocaleString()}개는 스냅샷 보관(60일) 이전 또는 조회 기간 밖에 할당된 것. 위 스냅샷 그래프에서 할당 시점을 확인하세요.
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          <div style={{fontSize:'0.72rem', color:'#6b7280', marginBottom:6}}>
+                            기간 흐름: BH 입고 {dt2.totals.bh_in.toLocaleString()} / OB 입고 {dt2.totals.ob_in.toLocaleString()} ·
+                            BH 출고 {dt2.totals.bh_out.toLocaleString()} / OB 출고 {dt2.totals.ob_out.toLocaleString()}
+                          </div>
+                          {dt2.causes.length === 0 ? (
+                            <div style={{color:'#166534'}}>잔여 거래 없음 — 기간 내 모든 입·출고가 양쪽에서 일치합니다 ✅</div>
+                          ) : dt2.causes.map((c,i)=>(
+                            <div key={i} style={{display:'flex', gap:8, alignItems:'flex-start', padding:'5px 8px', borderBottom:'1px solid #fef3c7', background: c.type.startsWith('교차기록')?'#fdf2f8':undefined}}>
+                              <Tag color={tagColor(c.type)} style={{margin:0, fontSize:'0.68rem', flexShrink:0}}>{c.type}</Tag>
+                              <b style={{color: c.impact>0?'#2563eb':c.impact<0?'#ef4444':'#9ca3af', flexShrink:0, minWidth:52, textAlign:'right'}}>{sign(c.impact)}</b>
+                              <span style={{color:'#374151', lineHeight:1.5}}>
+                                {c.desc}
+                                {c.partner && <b style={{color:'#be185d'}}> ↔ {c.partner}</b>}
+                              </span>
+                            </div>
+                          ))}
+                          {(dt2.errors||[]).length > 0 && (
+                            <div style={{marginTop:6, color:'#b45309', fontSize:'0.72rem'}}>⚠ {dt2.errors.join(' · ')}</div>
+                          )}
+                        </div>
+                      )
+                    })()}
+                  </div>
 
                   {/* 유형별 거래 비교 — 잔여 차이가 입고/출고/조정 어디서 났는지 */}
                   <div style={{marginTop:10}}>
@@ -2916,7 +3664,7 @@ export default function ReconcilePage({ config }: Props) {
                         <Radio.Button value={12}>1년</Radio.Button>
                       </Radio.Group>
                       <Button size="small" type="primary" loading={stockFlowLoading}
-                        onClick={()=>fetchStockFlow(r.name, stockFlowMonths)}>
+                        onClick={()=>fetchStockFlow(r.name, stockFlowMonths, r.bh_skus, r.ob_codes)}>
                         {stockFlow ? '↻ 다시 분석' : '▶ 거래 분석 실행'}
                       </Button>
                     </div>
@@ -2927,8 +3675,9 @@ export default function ReconcilePage({ config }: Props) {
                           : '↑ "거래 분석 실행"을 누르면 이 품목의 입고/출고/조정을 BH·OB 비교합니다. (주간 리포트로 보면 미리 계산되어 즉시 표시됩니다)'}
                       </div>
                     ) : (() => {
-                      const types: {k:keyof TxTotals;label:string}[] = [{k:'in',label:'입고'},{k:'out',label:'출고'},{k:'adjustment',label:'조정/등록'}]
+                      const types: {k:keyof TxTotals;label:string}[] = [{k:'in',label:'입고'},{k:'out',label:'출고'},{k:'move',label:'이동(위치이전)'},{k:'adjustment',label:'조정/등록'}]
                       return (
+                        <>
                         <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.78rem'}}>
                           <thead><tr style={{background:'#fef3c7'}}>
                             <th style={{padding:'3px 6px',textAlign:'left'}}>유형</th>
@@ -2944,19 +3693,168 @@ export default function ReconcilePage({ config }: Props) {
                               const interp = df===0 ? '일치' :
                                 t.k==='in' ? (df>0?'BH 입고가 더 많음 (OB 입고 누락/미등록 의심)':'OB 입고가 더 많음 (BH 입고 누락 의심)') :
                                 t.k==='out' ? (df>0?'BH 출고가 더 많음 (OB 출고 누락)':'OB 출고가 더 많음 (BH 출고 미입력 의심)') :
-                                (df>0?'BH 조정이 더 많음':'OB 조정이 더 많음')
+                                t.k==='move' ? 'BH 위치이전 — 총 재고 불변, 출고와 별개' :
+                                '참고용 — BH 실사·기초정리 조정이 섞여 1:1 대사 어려움'
                               return (
                                 <tr key={t.k} style={{borderBottom:'1px solid #fef3c7'}}>
                                   <td style={{padding:'3px 6px'}}>{t.label}</td>
                                   <td style={{padding:'3px 6px',textAlign:'right',color:'#1e3a8a'}}>{b.toLocaleString()}</td>
                                   <td style={{padding:'3px 6px',textAlign:'right',color:'#92400e'}}>{o.toLocaleString()}</td>
-                                  <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:df===0?'#10b981':df>0?'#2563eb':'#ef4444'}}>{df>0?'+':''}{df.toLocaleString()}</td>
-                                  <td style={{padding:'3px 6px',color:df===0?'#6b7280':'#7c2d12',fontSize:'0.74rem'}}>{interp}</td>
+                                  <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:(t.k==='adjustment'||t.k==='move')?'#9ca3af':(df===0?'#10b981':df>0?'#2563eb':'#ef4444')}}>{df>0?'+':''}{df.toLocaleString()}</td>
+                                  <td style={{padding:'3px 6px',color:(t.k==='adjustment'||t.k==='move')?'#9ca3af':(df===0?'#6b7280':'#7c2d12'),fontSize:'0.74rem'}}>{interp}</td>
                                 </tr>
                               )
                             })}
                           </tbody>
                         </table>
+                        <div style={{fontSize:'0.7rem',color:'#9ca3af',marginTop:4,lineHeight:1.4}}>
+                          ※ 조정/등록은 세트조립(OB 전산처리용↔BH 조정)·재고 실사·기초재고 정리가 섞여 있어 BH·OB 1:1 대사가 어렵습니다 — <b>참고용</b>. 차이 판단은 입고·출고 위주로 보세요.
+                        </div>
+                        </>
+                      )
+                    })()}
+                  </div>
+
+                  {/* 출고 채널 분해 — BH출고−OB출고 차이를 'OB 미경유(직배송)' vs '경유 채널 실제차이'로 분류 */}
+                  <div style={{marginTop:12, paddingTop:10, borderTop:'1px solid #fde68a'}}>
+                    <div style={{fontWeight:700, marginBottom:6, color:'#7c2d12', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                      <span>🚚 출고 채널 분해 — 차이가 직배송인가, 진짜 누락인가</span>
+                      <Button size="small" type="primary" loading={outDecompLoading}
+                        onClick={()=>fetchOutDecomp(r.name, stockFlowMonths, r.bh_skus, r.ob_codes)}>
+                        {outDecomp ? '↻ 다시' : '▶ 출고 채널 분해'}
+                      </Button>
+                      <span style={{fontSize:'0.72rem',color:'#9ca3af'}}>(최근 {stockFlowMonths}개월, 채널별 BH vs OB)</span>
+                    </div>
+                    {!outDecomp ? (
+                      <div style={{color:'#9ca3af',fontSize:'0.76rem'}}>
+                        {outDecompLoading ? '채널별 출고 수집·분류 중... (OB 수집 포함, 수분 걸릴 수 있어요)'
+                          : '↑ 누르면 이 품목의 BH 출고를 채널별로 나눠 "OB 미경유(직배송)"과 "OB 경유 채널의 실제 차이"로 분해합니다.'}
+                      </div>
+                    ) : (() => {
+                      const od = outDecomp
+                      const fmt = (n:number)=>n.toLocaleString()
+                      const sgn = (n:number)=>(n>0?'+':'')+n.toLocaleString()
+                      const KIND_LABEL: Record<string,string> = { ob_bypass:'직배송(OB 미경유)', bh_missing:'OB만 기록', diff:'양쪽 차이', match:'일치' }
+                      const KIND_COLOR: Record<string,string> = { ob_bypass:'#7c3aed', bh_missing:'#ef4444', diff:'#d97706', match:'#10b981' }
+                      return (
+                        <>
+                          <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:8}}>
+                            {[
+                              {label:'BH 출고', val:fmt(od.bh_out_total), color:'#1e3a8a', bg:'#dbeafe', hint:'기간 내 BH 출고 합계'},
+                              {label:'OB 출고', val:fmt(od.ob_out_total), color:'#92400e', bg:'#fef3c7', hint:'기간 내 OB(아워박스) 출고 합계'},
+                              {label:'차이(BH−OB)', val:sgn(od.diff), color: od.diff===0?'#10b981':'#2563eb', bg:'#e0e7ff', hint:'아래 직배송+선등록+순미스매칭으로 분해됨'},
+                              {label:'직배송(OB 미경유)', val:fmt(od.bypass_bh), color:'#7c3aed', bg:'#f3e8ff', hint:'BH만 출고·OB 0인 채널 합 — 아워박스 미경유(직배송). 차이의 정상 설명분'},
+                              {label:'선등록(발송예정)', val:fmt(od.prebook_bh), color:'#0891b2', bg:'#cffafe', hint:'메모 발송일이 조회 종료일보다 미래 — BH가 미리 등록, OB는 실제 발송 후 기록. 곧 해소될 시점차'},
+                              {label:'순수 미스매칭', val:sgn(od.real_diff), color: od.real_diff===0?'#10b981':'#dc2626', bg:'#fee2e2', hint:'직배송·선등록 제외한 나머지 — 진짜 점검 대상(한쪽 누락/중복 의심)'},
+                            ].map((c,i)=>(
+                              <Tooltip key={i} title={c.hint||''}>
+                                <div style={{flex:'1 1 120px',background:c.bg,borderRadius:6,padding:'6px 10px',minWidth:110}}>
+                                  <div style={{fontSize:'0.68rem',color:'#6b7280'}}>{c.label}</div>
+                                  <div style={{fontSize:'1rem',fontWeight:700,color:c.color}}>{c.val}</div>
+                                </div>
+                              </Tooltip>
+                            ))}
+                          </div>
+                          <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.76rem'}}>
+                            <thead><tr style={{background:'#fef3c7'}}>
+                              <th style={{padding:'3px 6px',textAlign:'left'}}>채널</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>BH 출고</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>OB 출고</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>차이</th>
+                              <th style={{padding:'3px 6px',textAlign:'left'}}>분류</th>
+                            </tr></thead>
+                            <tbody>
+                              {od.channels.map((c,i)=>(
+                                <tr key={i} style={{borderBottom:'1px solid #fef3c7'}}>
+                                  <td style={{padding:'3px 6px'}}>{c.channel}</td>
+                                  <td style={{padding:'3px 6px',textAlign:'right',color:'#1e3a8a'}}>{fmt(c.bh_out)}</td>
+                                  <td style={{padding:'3px 6px',textAlign:'right',color:'#92400e'}}>{fmt(c.ob_out)}</td>
+                                  <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:c.diff===0?'#10b981':c.diff>0?'#2563eb':'#ef4444'}}>{sgn(c.diff)}</td>
+                                  <td style={{padding:'3px 6px'}}>
+                                    <Tag style={{margin:0}} color={KIND_COLOR[c.kind]}>{KIND_LABEL[c.kind]||c.kind}</Tag>
+                                    {c.prebook>0 && <Tag style={{margin:'0 0 0 4px'}} color="#0891b2">선등록 {fmt(c.prebook)}</Tag>}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {od.prebook.length>0 && (
+                            <div style={{marginTop:8, background:'#ecfeff', border:'1px solid #a5f3fc', borderRadius:6, padding:'6px 10px'}}>
+                              <b style={{color:'#0891b2',fontSize:'0.78rem'}}>📅 BH 선등록(발송예정) 거래 — OB는 실제 발송 후 기록되어 아직 없음</b>
+                              {od.prebook.map((p,i)=>(
+                                <div key={i} style={{fontSize:'0.74rem',color:'#155e75',paddingLeft:8,marginTop:2}}>
+                                  · {p.date} 등록 → <b>{p.ship_date} 발송예정</b> · {p.qty.toLocaleString()} · {p.channel}
+                                  <span style={{color:'#6b7280'}}> · {p.memo}</span>
+                                </div>
+                              ))}
+                              <div style={{fontSize:'0.7rem',color:'#0e7490',marginTop:3}}>※ 조회 종료일을 발송예정일 이후로 늘리면 OB에도 잡혀 차이가 사라집니다.</div>
+                            </div>
+                          )}
+                          <div style={{fontSize:'0.7rem',color:'#9ca3af',marginTop:4,lineHeight:1.4}}>
+                            ※ <b style={{color:'#7c3aed'}}>직배송(OB 미경유)</b>: BH엔 출고됐으나 OB엔 없는 채널(아워박스 미경유).
+                            {' '}<b style={{color:'#0891b2'}}>선등록</b>: 발송예정일이 미래라 OB 미반영(시점차).
+                            {' '}<b style={{color:'#d97706'}}>양쪽 차이</b>(선등록 제외분)가 진짜 점검 대상(한쪽 누락/중복 의심).
+                          </div>
+                          {od.errors.length>0 && <div style={{fontSize:'0.68rem',color:'#ef4444',marginTop:3}}>{od.errors.join(' · ')}</div>}
+                        </>
+                      )
+                    })()}
+                  </div>
+
+                  {/* OB 가용외 추적 — 가용→가용외(할당)가 언제 떨어지는지 시계열 */}
+                  <div style={{marginTop:12, paddingTop:10, borderTop:'1px solid #fde68a'}}>
+                    <div style={{fontWeight:700, marginBottom:6, color:'#7c2d12', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                      <span>📈 가용외 추적 — 가용→가용외(할당) 언제 떨어지나</span>
+                      <Button size="small" type="primary" loading={snapsLoading}
+                        onClick={()=>fetchSnaps(r.name, r.ob_codes)}>
+                        {snaps ? '↻ 다시' : '▶ 스냅샷 추이 보기'}
+                      </Button>
+                      <Button size="small" loading={snapCapturing}
+                        onClick={()=>captureSnapNow(r.name, r.ob_codes)}>
+                        지금 1회 캡처
+                      </Button>
+                      <span style={{fontSize:'0.72rem',color:'#9ca3af'}}>(2시간마다 자동 기록)</span>
+                    </div>
+                    {!snaps ? (
+                      <div style={{color:'#9ca3af',fontSize:'0.76rem'}}>
+                        {snapsLoading ? '스냅샷 불러오는 중...'
+                          : '↑ OurBox 가용/가용외/전체를 시각별로 기록한 추이입니다. 가용외(할당)가 뛰는 시점 = 가용에서 할당이 떨어진 때.'}
+                      </div>
+                    ) : snaps.length===0 ? (
+                      <div style={{color:'#9ca3af',fontSize:'0.76rem'}}>아직 기록된 스냅샷이 없습니다. "지금 1회 캡처"를 누르면 현재 상태가 저장되고, 이후 2시간마다 자동 기록됩니다.</div>
+                    ) : (() => {
+                      const f=(n:number)=>n.toLocaleString()
+                      const sg=(n:number)=>(n>0?'+':'')+n.toLocaleString()
+                      return (
+                        <>
+                          <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.76rem'}}>
+                            <thead><tr style={{background:'#fef3c7'}}>
+                              <th style={{padding:'3px 6px',textAlign:'left'}}>시각</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>전체</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>가용</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>가용외(할당)</th>
+                              <th style={{padding:'3px 6px',textAlign:'right'}}>Δ가용외</th>
+                            </tr></thead>
+                            <tbody>
+                              {snaps.map((s,i)=>{
+                                const big = Math.abs(s.d_unavail) >= 100
+                                return (
+                                  <tr key={i} style={{borderBottom:'1px solid #fef3c7', background: big?'#eff6ff':undefined}}>
+                                    <td style={{padding:'3px 6px'}}>{s.captured_at}</td>
+                                    <td style={{padding:'3px 6px',textAlign:'right',color:'#6b7280'}}>{f(s.total)}</td>
+                                    <td style={{padding:'3px 6px',textAlign:'right',color:'#1e3a8a'}}>{f(s.available)}</td>
+                                    <td style={{padding:'3px 6px',textAlign:'right',fontWeight:700,color:'#a16207'}}>{f(s.unavailable)}</td>
+                                    <td style={{padding:'3px 6px',textAlign:'right',fontWeight:big?700:400,color:i===0?'#9ca3af':s.d_unavail>0?'#2563eb':s.d_unavail<0?'#ef4444':'#9ca3af'}}>{i===0?'—':sg(s.d_unavail)}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                          <div style={{fontSize:'0.7rem',color:'#9ca3af',marginTop:4,lineHeight:1.4}}>
+                            ※ <b style={{color:'#2563eb'}}>Δ가용외 +</b>: 그 시점에 가용→가용외 <b>할당이 떨어짐</b>(주문 접수/지시). <b style={{color:'#ef4444'}}>Δ가용외 −</b>: 출고완료(발송)되거나 할당 취소로 풀림. 파란 행 = 변동 큰 시점.
+                            {' '}자동 기록은 2시간 간격이라 더 정밀히 보려면 "지금 1회 캡처"로 수동 추가하세요.
+                          </div>
+                        </>
                       )
                     })()}
                   </div>
@@ -3029,6 +3927,138 @@ export default function ReconcilePage({ config }: Props) {
                 )}
               </div>
             )}
+          </>
+        )}
+      </Modal>
+
+      {/* 거래처(채널)별 / 제품별 비교 모달 */}
+      <Modal open={cfOpen} onCancel={()=>setCfOpen(false)} width={1080} footer={null}
+        title={<span>🏷️ {cfGroupBy === 'product' ? '제품별' : '거래처별'} 비교 — BH vs OB 입·출고·조정 (누락 즉시 식별)</span>}>
+        <div style={{display:'flex', alignItems:'center', gap:10, marginBottom:10, flexWrap:'wrap'}}>
+          <Radio.Group size="small" value={cfGroupBy} onChange={e=>{setCfGroupBy(e.target.value); fetchChannelFlow(cfDays, e.target.value)}}>
+            <Radio.Button value="channel">거래처별</Radio.Button>
+            <Radio.Button value="product">제품별</Radio.Button>
+          </Radio.Group>
+          <span style={{color:'#d1d5db'}}>|</span>
+          <Radio.Group size="small" value={cfDays} onChange={e=>{setCfDays(e.target.value); fetchChannelFlow(e.target.value)}}>
+            <Radio.Button value={7}>최근 1주</Radio.Button>
+            <Radio.Button value={14}>2주</Radio.Button>
+            <Radio.Button value={30}>1개월</Radio.Button>
+          </Radio.Group>
+          <Input.Search
+            size="small" placeholder="제품명 검색" allowClear
+            style={{width:220}}
+            value={cfProductFilter}
+            onChange={e=>setCfProductFilter(e.target.value)}
+            onSearch={v=>fetchChannelFlow(cfDays, undefined, v)}
+            enterButton="조회"
+          />
+          {cfData && <span style={{fontSize:'0.78rem', color:'#6b7280'}}>{cfData.from} ~ {cfData.to}{cfGroupBy==='channel' && !cfData.channel_mapped && ' · ⚠ 채널 매핑 없음'}</span>}
+        </div>
+        {cfLoading ? (
+          <div style={{padding:'40px 0', textAlign:'center'}}><Spin tip="거래처별 거래 수집·집계 중... (OB 수집 포함, 수분 걸릴 수 있어요)" /></div>
+        ) : !cfData ? (
+          <Empty description="기간을 선택하면 거래처별 BH·OB 비교를 보여줍니다" />
+        ) : (
+          <>
+            <div style={{fontSize:'0.75rem', color:'#6b7280', marginBottom:6, lineHeight:1.6}}>
+              우선순위로 정렬됨: <Tag color="red">🔴 {cfGroupBy==='product'?'BH에만':'BH 등록 누락 의심'}</Tag> (OB만 있음) → <Tag color="orange">🟡 차이</Tag> (양쪽 다 있으나 차이) → <Tag color="blue">🔵 {cfGroupBy==='product'?'OB에만':'직배송 의심'}</Tag> (BH만 있음) → <Tag color="green">🟢 일치</Tag>
+            </div>
+            {cfGroupBy === 'product' && <div style={{fontSize:'0.72rem', color:'#9ca3af', marginBottom:6}}>총 {cfData.rows.length}개 제품 · 차이 있는 제품 {cfData.rows.filter(r=>r.kind==='diff'||r.kind==='bh_missing'||r.kind==='ob_bypass').length}개</div>}
+            <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%', borderCollapse:'collapse', fontSize:'0.8rem', minWidth:820}}>
+              <thead>
+                <tr style={{background:'#f9fafb', borderBottom:'2px solid #e5e7eb'}}>
+                  <th style={{padding:'6px 8px', textAlign:'left'}}>분류</th>
+                  <th style={{padding:'6px 8px', textAlign:'left'}}>{cfGroupBy==='product'?'제품명':'거래처'}</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>BH 출고</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>OB 출고</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>출고 차이</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>BH 입고</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>OB 입고</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>BH 조정</th>
+                  <th style={{padding:'6px 8px', textAlign:'right'}}>OB 조정</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(()=>{
+                  const kindMeta: Record<string,{tag:string;color:string;bg:string;label:string}> = {
+                    bh_missing: {tag:'🔴', color:'red',    bg:'#fef2f2', label:'BH 누락'},
+                    diff:       {tag:'🟡', color:'orange', bg:'#fffbeb', label:'차이'},
+                    ob_bypass:  {tag:'🔵', color:'blue',   bg:'#eff6ff', label:'직배송'},
+                    match:      {tag:'🟢', color:'green',  bg:'',        label:'일치'},
+                    unknown:    {tag:'⚪', color:'default',bg:'#f9fafb', label:'채널미상'},
+                  }
+                  const pf = cfProductFilter.trim().toLowerCase()
+                  const renderRow = (r: ChannelRow | ProductSubRow, i: number, indent=false) => {
+                    const km = kindMeta[r.kind] || kindMeta.unknown
+                    const dColor = r.diff_out===0 ? '#10b981' : r.diff_out>0 ? '#2563eb' : '#ef4444'
+                    const emph = r.kind==='bh_missing' || (r.kind==='diff' && Math.abs(r.diff_out) >= 100)
+                    const label = ('product' in r && r.product) || ('channel' in r && (r as ChannelRow).channel) || ''
+                    return (
+                      <tr key={`${indent?'p':'c'}-${i}`} style={{borderBottom:'1px solid #f3f4f6', background: indent ? '#fafbfc' : (km.bg || undefined)}}>
+                        <td style={{padding:'5px 8px'}}><Tag color={km.color} style={indent?{fontSize:'0.65rem'}:undefined}>{km.tag} {km.label}</Tag></td>
+                        <td style={{padding:'5px 8px', fontWeight: emph?700:400, paddingLeft: indent?28:8, fontSize: indent?'0.76rem':undefined, color: indent?'#374151':undefined}}>{label}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color: indent?'#6b7280':'#1e3a8a'}}>{r.bh_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color: indent?'#6b7280':'#92400e'}}>{r.ob_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', fontWeight:700, color:dColor}}>{r.diff_out>0?'+':''}{r.diff_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.bh_in.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.ob_in.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.bh_adj.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.ob_adj.toLocaleString()}</td>
+                      </tr>
+                    )
+                  }
+                  const out: React.ReactNode[] = []
+                  cfData.rows.forEach((r,i) => {
+                    const hasProducts = cfGroupBy==='channel' && r.products && r.products.length > 0
+                    const filteredProducts = hasProducts
+                      ? (pf ? r.products!.filter(p=>p.product.toLowerCase().includes(pf)) : r.products!)
+                      : []
+                    // 채널모드+제품필터 시: 매칭 제품 없으면 채널 행 자체를 숨김
+                    if (cfGroupBy==='channel' && pf && filteredProducts.length === 0) return
+                    const isExpanded = cfExpanded.has(r.channel)
+                    const km = kindMeta[r.kind] || kindMeta.unknown
+                    const dColor = r.diff_out===0 ? '#10b981' : r.diff_out>0 ? '#2563eb' : '#ef4444'
+                    const emph = r.kind==='bh_missing' || (r.kind==='diff' && Math.abs(r.diff_out) >= 100)
+                    out.push(
+                      <tr key={`c-${i}`} style={{borderBottom:'1px solid #f3f4f6', background: km.bg || undefined, cursor: hasProducts?'pointer':undefined}}
+                        onClick={()=>{
+                          if (!hasProducts) return
+                          setCfExpanded(prev=>{const n=new Set(prev); n.has(r.channel)?n.delete(r.channel):n.add(r.channel); return n})
+                        }}>
+                        <td style={{padding:'5px 8px'}}><Tag color={km.color}>{km.tag} {km.label}</Tag></td>
+                        <td style={{padding:'5px 8px', fontWeight: emph?700:400}}>
+                          {hasProducts && <span style={{color:'#9ca3af', marginRight:4, fontSize:'0.7rem'}}>{isExpanded?'▼':'▶'}</span>}
+                          {r.product || r.channel}
+                          {hasProducts && <span style={{color:'#9ca3af', fontSize:'0.7rem', marginLeft:6}}>({filteredProducts.length}개 제품)</span>}
+                        </td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#1e3a8a'}}>{r.bh_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#92400e'}}>{r.ob_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', fontWeight:700, color:dColor}}>{r.diff_out>0?'+':''}{r.diff_out.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.bh_in.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.ob_in.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.bh_adj.toLocaleString()}</td>
+                        <td style={{padding:'5px 8px', textAlign:'right', color:'#9ca3af'}}>{r.ob_adj.toLocaleString()}</td>
+                      </tr>
+                    )
+                    if (isExpanded && filteredProducts.length > 0) {
+                      filteredProducts.forEach((p,j) => out.push(renderRow(p, j, true)))
+                    }
+                  })
+                  return out
+                })()}
+              </tbody>
+            </table>
+            </div>
+            <div style={{fontSize:'0.72rem', color:'#9ca3af', marginTop:8, lineHeight:1.6}}>
+              {cfGroupBy === 'product' ? (
+                <>※ <b>🔴 BH에만</b>: OB엔 있는데 BH 출고 0 — 누락 가능성. <b>🔵 OB에만</b>: BH에만 출고 있음 — OB 미등록. <b>🟡 차이</b>: 양쪽 다 있으나 수량 다름. 매핑 설정에 따라 BH·OB 상품명이 통합됩니다.</>
+              ) : (
+                <>※ 거래처 행을 <b>클릭</b>하면 해당 거래처의 <b>제품별 내역</b>이 펼쳐집니다. 제품명 검색으로 특정 제품만 볼 수도 있어요.{' '}
+                <b>🔴 BH 누락</b>: OB엔 있는데 BH가 0. <b>🔵 직배송</b>: BH에만 있음(호법 미경유). <b>🟡 차이</b>: 양쪽 수량 어긋남.</>
+              )}
+            </div>
           </>
         )}
       </Modal>
@@ -3126,6 +4156,45 @@ export default function ReconcilePage({ config }: Props) {
             : '개별 거래 매칭'
         }
       >
+        {/* 반자동 수정안 — 이 행을 어떻게 정리하면 되는지 + 복붙용 값 */}
+        {detailRow?.correction && detailRow.status !== 'ok' && (() => {
+          const c = detailRow.correction!
+          const sysCfg: Record<string, { label: string; color: string }> = {
+            BH: { label: '박스히어로에 입력', color: '#1e3a8a' },
+            OB: { label: '아워박스에 입력', color: '#991b1b' },
+            MAPPING: { label: '매핑/세트 등록', color: '#7c3aed' },
+            REVIEW: { label: '대조 검토', color: '#b45309' },
+            NONE: { label: '조치 불필요', color: '#6b7280' },
+          }
+          const sc = sysCfg[c.system] || sysCfg.REVIEW
+          return (
+            <div style={{ fontSize: '0.82rem', marginBottom: 16, background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontWeight: 700, marginBottom: 6, color: '#5b21b6', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                💊 수정안 <Tag style={{ margin: 0, color: sc.color, borderColor: sc.color }}>{sc.label}</Tag>
+                {detailRow.root_cause && ROOT_CAUSE_CFG[detailRow.root_cause] &&
+                  <Tag color={ROOT_CAUSE_CFG[detailRow.root_cause].tag} style={{ margin: 0 }}>{ROOT_CAUSE_CFG[detailRow.root_cause].label}</Tag>}
+              </div>
+              <div style={{ color: '#374151', marginBottom: 8 }}>{c.action}</div>
+              {(c.system === 'BH' || c.system === 'OB' || c.system === 'REVIEW') && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <code style={{ flex: 1, background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6, padding: '4px 8px', fontSize: '0.74rem', overflowX: 'auto', whiteSpace: 'nowrap' }}>
+                    {c.copy_text.replace(/\t/g, ' | ')}
+                  </code>
+                  <Button size="small" icon={<CopyOutlined />}
+                    onClick={() => { navigator.clipboard.writeText(c.copy_text); message.success('복사됨 (탭 구분 — 스프레드시트 붙여넣기 가능)') }}>
+                    복사
+                  </Button>
+                </div>
+              )}
+              <div style={{ marginTop: 8, display: 'flex', gap: 6 }}>
+                <Button size="small" type="primary" style={{ background: '#059669', borderColor: '#059669' }}
+                  onClick={() => { applyCleanup(detailRow, 'resolved'); }}>✓ 정리완료 표시</Button>
+                <Button size="small" onClick={() => cleanupActions.editMemo(detailRow)}>📝 메모</Button>
+              </div>
+            </div>
+          )
+        })()}
+
         {/* 확정 매칭 근거 — 전체수량 매칭에서 확정된 쌍 (검증용) */}
         {rowPairs.length > 0 && (
           <div style={{ fontSize: '0.8rem', marginBottom: 16, background: '#ecfeff', border: '1px solid #a5f3fc', borderRadius: 8, padding: '8px 12px' }}>

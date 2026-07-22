@@ -1,0 +1,5 @@
+config.json
+실행.bat
+__pycache__
+*.pyc
+.git

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Button, Alert, Spin, Row, Col, Select, message } from 'antd'
+import { Button, Alert, Spin, Row, Col, Select, InputNumber, message } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import type { AppConfig, Location, GmailOrder, Page } from '../types'
 import {
@@ -24,12 +24,13 @@ export default function GmailOrders({ config, gmailConnected, locations }: Props
   const [converting, setConverting] = useState<string | null>(null)
   const [matchData, setMatchData] = useState<Record<string, any>>({})
   const [staged, setStaged] = useState<Record<string, any[]>>({})
+  const [mapEdits, setMapEdits] = useState<Record<string, { original_name: string; qty: number; mapped_name: string; is_unmatched: boolean }[]>>({})
   const [locationId, setLocationId] = useState<number | undefined>(config.selected_location_id)
   const [memo, setMemo] = useState('')
   const [sendingKey, setSendingKey] = useState<string | null>(null)
 
   useEffect(() => {
-    if (gmailConnected) fetchMessages()
+    if (gmailConnected || config.gmail_token) fetchMessages()
   }, [gmailConnected])
 
   async function fetchMessages() {
@@ -55,18 +56,38 @@ export default function GmailOrders({ config, gmailConnected, locations }: Props
     }
   }
 
+  function initMapEdits(fileKey: string, data: any) {
+    const rows = [
+      ...(data.results || []).map((r: any) => ({
+        original_name: r.original_name,
+        qty: r.quantity,
+        mapped_name: r.matched_name,
+        is_unmatched: false,
+      })),
+      ...(data.unmatched || []).map((r: any) => ({
+        original_name: r.original_name,
+        qty: r.quantity,
+        mapped_name: r.best_candidate || '',
+        is_unmatched: true,
+      })),
+    ]
+    setMapEdits(prev => ({ ...prev, [fileKey]: rows }))
+    setStaged(prev => ({ ...prev, [fileKey]: [] }))
+  }
+
   async function handleConvert(fileKey: string, b64: string, format: 'general' | 'naver', thresh: number, fname: string) {
     const blob = base64ToBlob(b64)
     setConverting(fileKey)
     try {
+      let data: any
       if (format === 'naver') {
-        const data = await convertNaver(blob, fname, thresh)
-        setMatchData(prev => ({ ...prev, [fileKey]: data }))
+        data = await convertNaver(blob, fname, thresh)
       } else {
         const colData = await getGeneralColumns(blob, fname)
-        const data = await convertGeneral(blob, fname, colData.name_col, colData.qty_col, thresh)
-        setMatchData(prev => ({ ...prev, [fileKey]: data }))
+        data = await convertGeneral(blob, fname, colData.name_col, colData.qty_col, thresh)
       }
+      setMatchData(prev => ({ ...prev, [fileKey]: data }))
+      initMapEdits(fileKey, data)
     } catch (e: any) {
       message.error('변환 실패: ' + (e.response?.data?.detail || e.message))
     } finally {
@@ -216,24 +237,104 @@ export default function GmailOrders({ config, gmailConnected, locations }: Props
                         )}
                       </div>
 
-                      {md && (
+                      {md && mapEdits[fileKey] && (
                         <div style={{ marginTop: 10 }}>
                           <div style={{ fontSize: '0.78rem', fontWeight: 700, marginBottom: 6 }}>
                             변환 결과: ✅ {md.results?.length || 0}건 / ❌ {md.unmatched?.length || 0}건
                           </div>
-                          {(() => {
-                            const curStaged = st.length > 0 ? st : (md.results || []).filter((r: any) => r.sku).map((r: any) => ({ sku: r.sku, quantity: r.quantity, price: r.price || 0 }))
-                            if (st.length === 0 && curStaged.length > 0) {
-                              setStaged(prev => ({ ...prev, [fileKey]: curStaged }))
-                            }
-                            return (
-                              <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>
-                                스테이징: {curStaged.length}종 · {curStaged.reduce((s: number, i: any) => s + i.quantity, 0)}개
-                              </div>
-                            )
-                          })()}
+
+                          {/* Mapping table */}
+                          <div style={{ border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden', marginBottom: 8 }}>
+                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                              <thead>
+                                <tr style={{ background: '#f3f4f6' }}>
+                                  <th style={{ padding: '5px 8px', textAlign: 'left', color: '#6b7280', fontWeight: 600, width: '30%' }}>원본 상품명</th>
+                                  <th style={{ padding: '5px 8px', textAlign: 'left', color: '#6b7280', fontWeight: 600, width: '40%' }}>매핑 상품</th>
+                                  <th style={{ padding: '5px 8px', textAlign: 'center', color: '#6b7280', fontWeight: 600, width: '15%' }}>수량</th>
+                                  <th style={{ padding: '5px 8px', textAlign: 'center', color: '#6b7280', fontWeight: 600, width: '15%' }}>상태</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {mapEdits[fileKey].map((row, ri) => (
+                                  <tr key={ri} style={{ borderTop: '1px solid #f3f4f6', background: row.is_unmatched ? '#fff7ed' : '#fff' }}>
+                                    <td style={{ padding: '4px 8px', color: '#374151' }}>
+                                      {row.original_name}
+                                    </td>
+                                    <td style={{ padding: '4px 8px' }}>
+                                      <Select
+                                        size="small"
+                                        value={row.mapped_name || undefined}
+                                        onChange={val => {
+                                          setMapEdits(prev => {
+                                            const rows = [...prev[fileKey]]
+                                            rows[ri] = { ...rows[ri], mapped_name: val }
+                                            return { ...prev, [fileKey]: rows }
+                                          })
+                                        }}
+                                        placeholder="상품 선택..."
+                                        style={{ width: '100%' }}
+                                        showSearch
+                                        allowClear
+                                        options={(md.master_names || []).map((n: string) => ({ value: n, label: n }))}
+                                        filterOption={(input, opt) => (opt?.label as string || '').toLowerCase().includes(input.toLowerCase())}
+                                      />
+                                    </td>
+                                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
+                                      <InputNumber
+                                        size="small"
+                                        min={0}
+                                        value={row.qty}
+                                        onChange={val => {
+                                          setMapEdits(prev => {
+                                            const rows = [...prev[fileKey]]
+                                            rows[ri] = { ...rows[ri], qty: val ?? 0 }
+                                            return { ...prev, [fileKey]: rows }
+                                          })
+                                        }}
+                                        style={{ width: 60 }}
+                                      />
+                                    </td>
+                                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
+                                      {row.is_unmatched
+                                        ? <span style={{ color: '#f59e0b', fontWeight: 600 }}>❌ 미매칭</span>
+                                        : <span style={{ color: '#10b981', fontWeight: 600 }}>✅ 매칭</span>
+                                      }
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+
+                          {/* Confirm mapping button */}
+                          <Button
+                            size="small"
+                            type="default"
+                            style={{ marginBottom: 8 }}
+                            onClick={() => {
+                              const masterByName = md.master_by_name || {}
+                              const confirmed = mapEdits[fileKey]
+                                .filter(row => row.mapped_name && row.qty > 0 && masterByName[row.mapped_name])
+                                .map(row => ({
+                                  sku: masterByName[row.mapped_name].sku,
+                                  quantity: row.qty,
+                                  price: masterByName[row.mapped_name].price || 0,
+                                }))
+                              setStaged(prev => ({ ...prev, [fileKey]: confirmed }))
+                              message.success(`매핑 확정: ${confirmed.length}종 ${confirmed.reduce((s, i) => s + i.quantity, 0)}개`)
+                            }}
+                          >
+                            🔗 매핑 확정
+                          </Button>
+
+                          {st.length > 0 && (
+                            <div style={{ fontSize: '0.78rem', color: '#374151', marginBottom: 8 }}>
+                              스테이징: <strong>{st.length}종 · {st.reduce((s: number, i: any) => s + i.quantity, 0)}개</strong>
+                            </div>
+                          )}
+
                           {st.length > 0 && config.api_token && (
-                            <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
+                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                               <Select
                                 placeholder="위치"
                                 value={locationId}

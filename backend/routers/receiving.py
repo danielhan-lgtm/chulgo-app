@@ -5,6 +5,7 @@ import threading
 import json
 from datetime import datetime
 
+import requests as _requests
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -19,7 +20,7 @@ import boxhero_incoming as bh
 
 router = APIRouter()
 
-_sync_status = {"status": "idle", "lastSyncTime": None, "lastSyncError": None}
+_sync_status = {"status": "idle", "lastSyncTime": None, "lastSyncError": None, "lastNewCount": None}
 _sync_lock = threading.Lock()
 
 
@@ -81,15 +82,26 @@ def approve_receiving(put_sno: str):
     tx_time = None
     if rec.get("put_compt_dtm"):
         try:
-            tx_time = datetime.strptime(rec["put_compt_dtm"][:19], "%Y-%m-%d %H:%M:%S").isoformat()
+            from datetime import timedelta
+            dt_kst = datetime.strptime(rec["put_compt_dtm"][:19], "%Y-%m-%d %H:%M:%S")
+            tx_time = (dt_kst - timedelta(hours=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             pass
 
-    result = bh.create_in_transaction(
-        api_token, location_id, tx_items,
-        memo=f"아워박스 입고번호: {put_sno} ({rec.get('put_depot_nm', '')})",
-        tx_time=tx_time,
-    )
+    try:
+        result = bh.create_in_transaction(
+            api_token, location_id, tx_items,
+            memo=f"아워박스 입고번호: {put_sno} ({rec.get('put_depot_nm', '')})",
+            tx_time=tx_time,
+        )
+    except _requests.exceptions.HTTPError as e:
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text if e.response else str(e)
+        raise HTTPException(502, f"박스히어로 API 오류: {detail}")
+    except Exception as e:
+        raise HTTPException(500, f"승인 처리 중 오류: {str(e)}")
     db.update_status(put_sno, "approved", result["id"])
     unmapped = [i["sale_prod_nm"] for i in items if not i.get("boxhero_item_id")]
     return {
@@ -128,14 +140,12 @@ def ignore_receiving(put_sno: str):
 
 def _run_sync():
     global _sync_status
-    if _sync_status["status"] == "syncing":
-        return
-    _sync_status["status"] = "syncing"
     _sync_status["lastSyncError"] = None
     try:
         import ourbox_scraper
         cfg = _load_cfg()
-        ourbox_scraper.sync_new_receivings(cfg.get("ourbox_id", ""), cfg.get("ourbox_pw", ""))
+        n = ourbox_scraper.sync_new_receivings(cfg.get("ourbox_id", ""), cfg.get("ourbox_pw", ""))
+        _sync_status["lastNewCount"] = n
         _sync_status["lastSyncTime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _sync_status["status"] = "idle"
     except Exception as e:
@@ -145,8 +155,12 @@ def _run_sync():
 
 @router.post("/sync")
 def manual_sync():
-    if _sync_status["status"] == "syncing":
-        return {"message": "이미 동기화 중입니다."}
+    # 상태를 스레드 시작 전에 동기적으로 바꿔야 프론트 폴링이 시작 직후의
+    # 'idle'을 완료로 오인하지 않음 (중복 실행 방지 겸)
+    with _sync_lock:
+        if _sync_status["status"] == "syncing":
+            return {"message": "이미 동기화 중입니다.", "already": True}
+        _sync_status["status"] = "syncing"
     t = threading.Thread(target=_run_sync, daemon=True)
     t.start()
     return {"message": "동기화 시작됨"}

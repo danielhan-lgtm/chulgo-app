@@ -3,7 +3,9 @@ import { Button, Upload, message, Tooltip } from 'antd'
 import {
   DashboardOutlined, FileExcelOutlined, ShoppingOutlined,
   MessageOutlined, MailOutlined, SettingOutlined, InboxOutlined,
-  ImportOutlined, AuditOutlined, FileTextOutlined,
+  ImportOutlined, AuditOutlined, FileTextOutlined, DiffOutlined, BarChartOutlined, LinkOutlined,
+  CalendarOutlined, DeleteOutlined, FilePptOutlined, TagsOutlined, LineChartOutlined,
+  ShopOutlined, GiftOutlined,
 } from '@ant-design/icons'
 import type { Page } from '../types'
 import { uploadMaster } from '../services/api'
@@ -17,16 +19,57 @@ interface Props {
   masterLoaded: boolean
 }
 
-const NAV_ITEMS: { key: Page; icon: React.ReactNode; label: string }[] = [
-  { key: 'dashboard', icon: <DashboardOutlined />, label: '대시보드' },
-  { key: 'general', icon: <FileExcelOutlined />, label: '일반 형식' },
-  { key: 'naver', icon: <ShoppingOutlined />, label: '네이버 형식' },
-  { key: 'slack', icon: <MessageOutlined />, label: 'Slack 출고요청' },
-  { key: 'gmail', icon: <MailOutlined />, label: 'Gmail 출고요청' },
-  { key: 'receiving', icon: <ImportOutlined />, label: '입고 정산기' },
-  { key: 'docreview', icon: <AuditOutlined />, label: '서류 검토' },
-  { key: 'invoice', icon: <FileTextOutlined />, label: '거래명세서' },
-  { key: 'settings', icon: <SettingOutlined />, label: '설정' },
+const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; label: string }[] }[] = [
+  {
+    title: '현황',
+    items: [
+      { key: 'dashboard', icon: <DashboardOutlined />, label: '대시보드' },
+      { key: 'channel', icon: <BarChartOutlined />, label: '채널별 현황' },
+      { key: 'outbound', icon: <LineChartOutlined />, label: '출고 예측' },
+    ],
+  },
+  {
+    title: '출고 변환',
+    items: [
+      { key: 'general', icon: <FileExcelOutlined />, label: '일반 형식' },
+      { key: 'naver', icon: <ShoppingOutlined />, label: '네이버 형식' },
+      { key: 'slack', icon: <MessageOutlined />, label: 'Slack 출고요청' },
+      { key: 'gmail', icon: <MailOutlined />, label: 'Gmail 출고요청' },
+      { key: 'oborders', icon: <ShopOutlined />, label: 'OB 주문 (카페24·카카오)' },
+    ],
+  },
+  {
+    title: '채널 출고',
+    items: [
+      { key: 'coupangload', icon: <FilePptOutlined />, label: '쿠팡 적재리스트' },
+      { key: 'coupanggrowthload', icon: <FilePptOutlined />, label: '쿠팡 그로스 적재리스트' },
+      { key: 'kurlylabel', icon: <TagsOutlined />, label: '컬리 라벨지' },
+      { key: 'invoice', icon: <FileTextOutlined />, label: '거래명세서' },
+    ],
+  },
+  {
+    title: '입고 · 발주',
+    items: [
+      { key: 'orderplan', icon: <CalendarOutlined />, label: '발주 캘린더' },
+      { key: 'receiving', icon: <ImportOutlined />, label: '입고 정산기' },
+      { key: 'docreview', icon: <AuditOutlined />, label: '서류 검토' },
+    ],
+  },
+  {
+    title: '재고 관리',
+    items: [
+      { key: 'reconcile', icon: <DiffOutlined />, label: '재고 대사' },
+      { key: 'mapping', icon: <LinkOutlined />, label: '상품 매핑' },
+      { key: 'disposal', icon: <DeleteOutlined />, label: '폐기 리포트' },
+      { key: 'expiry', icon: <GiftOutlined />, label: '기부 리포트 (소비기한)' },
+    ],
+  },
+  {
+    title: '시스템',
+    items: [
+      { key: 'settings', icon: <SettingOutlined />, label: '설정' },
+    ],
+  },
 ]
 
 export default function Sidebar({ page, onPageChange, bhConnected, slackConnected, gmailConnected, masterLoaded }: Props) {
@@ -67,23 +110,27 @@ export default function Sidebar({ page, onPageChange, bhConnected, slackConnecte
 
       {/* Navigation */}
       <div style={{ padding: '12px 8px', flex: 1, overflow: 'auto' }}>
-        <div style={{ color: '#6b6e8a', fontSize: '0.68rem', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6, paddingLeft: 8 }}>메뉴</div>
-        {NAV_ITEMS.map(item => (
-          <button
-            key={item.key}
-            onClick={() => onPageChange(item.key)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 10, width: '100%',
-              padding: '9px 12px', borderRadius: 8, border: 'none', cursor: 'pointer',
-              background: page === item.key ? '#1a1d27' : 'transparent',
-              color: page === item.key ? '#10b981' : '#9ca3af',
-              fontSize: '0.85rem', fontWeight: page === item.key ? 600 : 400,
-              marginBottom: 2, transition: 'all 0.15s', textAlign: 'left',
-            }}
-          >
-            <span style={{ fontSize: '0.9rem' }}>{item.icon}</span>
-            {item.label}
-          </button>
+        {NAV_GROUPS.map((group, gi) => (
+          <div key={group.title} style={{ marginBottom: gi < NAV_GROUPS.length - 1 ? 14 : 0 }}>
+            <div style={{ color: '#6b6e8a', fontSize: '0.68rem', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6, paddingLeft: 8 }}>{group.title}</div>
+            {group.items.map(item => (
+              <button
+                key={item.key}
+                onClick={() => onPageChange(item.key)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                  padding: '9px 12px', borderRadius: 8, border: 'none', cursor: 'pointer',
+                  background: page === item.key ? '#1a1d27' : 'transparent',
+                  color: page === item.key ? '#10b981' : '#9ca3af',
+                  fontSize: '0.85rem', fontWeight: page === item.key ? 600 : 400,
+                  marginBottom: 2, transition: 'all 0.15s', textAlign: 'left',
+                }}
+              >
+                <span style={{ fontSize: '0.9rem' }}>{item.icon}</span>
+                {item.label}
+              </button>
+            ))}
+          </div>
         ))}
 
         <div style={{ borderTop: '1px solid #2e2f45', margin: '12px 0' }} />

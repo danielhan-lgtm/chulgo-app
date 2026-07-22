@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>입고 정산기</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Malgun Gothic', sans-serif; background: #f0f2f5; color: #333; }
+
+    .header {
+      background: #2c3e50;
+      color: white;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .header h1 { font-size: 18px; }
+    .header-right { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+    .sync-status { padding: 4px 10px; border-radius: 12px; font-size: 12px; }
+    .sync-status.idle { background: #27ae60; }
+    .sync-status.syncing { background: #f39c12; animation: pulse 1s infinite; }
+    .sync-status.error { background: #e74c3c; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+    .nav-tabs { background: #34495e; display: flex; padding: 0 24px; }
+    .nav-tab { color: #bdc3c7; padding: 12px 18px; cursor: pointer; font-size: 14px; border-bottom: 3px solid transparent; transition: all 0.2s; }
+    .nav-tab:hover { color: white; }
+    .nav-tab.active { color: white; border-bottom-color: #3498db; }
+
+    .container { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* 일괄처리 툴바 */
+    .bulk-bar {
+      display: none; align-items: center; gap: 10px; padding: 10px 16px;
+      background: #eaf4ff; border: 1px solid #aed6f1; border-radius: 8px;
+      margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .bulk-bar.visible { display: flex; }
+    .bulk-count { font-weight: 700; color: #2980b9; font-size: 14px; }
+    .bulk-progress { width: 100%; margin-top: 6px; display: none; }
+    .bulk-progress-bar { height: 6px; background: #ddd; border-radius: 3px; overflow: hidden; }
+    .bulk-progress-fill { height: 100%; background: #27ae60; border-radius: 3px; transition: width 0.3s; }
+    .bulk-progress-label { font-size: 11px; color: #7f8c8d; margin-top: 3px; }
+
+    /* 체크박스 */
+    .record-check { width: 18px; height: 18px; cursor: pointer; accent-color: #3498db; flex-shrink: 0; }
+    .select-all-wrap { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; cursor: pointer; margin-bottom: 8px; }
+    .select-all-wrap input { width: 16px; height: 16px; accent-color: #3498db; cursor: pointer; }
+
+    /* 입고 목록 */
+    .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
+    .filter-bar select, .filter-bar input {
+      padding: 7px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px;
+    }
+
+    /* 달력 */
+    .date-picker-wrap { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+    .date-input { padding: 7px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; width: 120px; cursor: pointer; background: white; }
+    .date-input:focus { outline: none; border-color: #3498db; }
+    .date-sep { color: #7f8c8d; font-size: 13px; }
+
+    .cal-popup {
+      position: absolute; top: calc(100% + 6px); left: 0; z-index: 1000;
+      background: white; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+      padding: 14px; width: 560px; display: none;
+    }
+    .cal-popup.open { display: flex; gap: 16px; }
+    .cal-panel { flex: 1; }
+    .cal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .cal-header span { font-size: 14px; font-weight: 700; }
+    .cal-nav { background: none; border: none; cursor: pointer; font-size: 16px; color: #3498db; padding: 2px 6px; border-radius: 4px; }
+    .cal-nav:hover { background: #e8f4fd; }
+    .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+    .cal-dow { text-align: center; font-size: 11px; color: #7f8c8d; padding: 4px 0; font-weight: 600; }
+    .cal-dow:first-child { color: #e74c3c; }
+    .cal-dow:last-child { color: #3498db; }
+    .cal-day {
+      text-align: center; font-size: 13px; padding: 6px 2px; border-radius: 6px;
+      cursor: pointer; transition: background 0.1s; position: relative;
+    }
+    .cal-day:hover:not(.empty):not(.other-month) { background: #e8f4fd; }
+    .cal-day.empty, .cal-day.other-month { color: #ccc; cursor: default; }
+    .cal-day.today { font-weight: 700; color: #3498db; }
+    .cal-day.in-range { background: #ebf5fb; border-radius: 0; }
+    .cal-day.range-start, .cal-day.range-end { background: #3498db !important; color: white !important; border-radius: 6px; }
+    .cal-day.range-start { border-radius: 6px 0 0 6px; }
+    .cal-day.range-end { border-radius: 0 6px 6px 0; }
+    .cal-day.range-start.range-end { border-radius: 6px; }
+    .cal-day.sun { color: #e74c3c; }
+    .cal-day.sat { color: #3498db; }
+    .cal-day.range-start, .cal-day.range-end { color: white !important; }
+
+    .cal-footer { margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap; border-top: 1px solid #f0f0f0; padding-top: 10px; }
+    .quick-btn { padding: 4px 10px; background: #f0f2f5; border: 1px solid #ddd; border-radius: 12px; font-size: 12px; cursor: pointer; }
+    .quick-btn:hover { background: #e8f4fd; border-color: #3498db; color: #3498db; }
+    .cal-apply { margin-left: auto; padding: 5px 14px; background: #3498db; color: white; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    .cal-apply:hover { background: #2980b9; }
+    .cal-clear { padding: 5px 10px; background: none; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; cursor: pointer; color: #7f8c8d; }
+    .cal-clear:hover { border-color: #e74c3c; color: #e74c3c; }
+    .btn { padding: 7px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: inherit; }
+    .btn-primary { background: #3498db; color: white; }
+    .btn-primary:hover { background: #2980b9; }
+    .btn-success { background: #27ae60; color: white; }
+    .btn-success:hover { background: #229954; }
+    .btn-danger { background: #e74c3c; color: white; }
+    .btn-danger:hover { background: #c0392b; }
+    .btn-secondary { background: #95a5a6; color: white; }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    .card { background: white; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); margin-bottom: 12px; overflow: hidden; }
+
+    .record-header {
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      border-bottom: 1px solid #f0f0f0;
+      transition: background 0.15s;
+    }
+    .record-header:hover { background: #f8f9fa; }
+
+    .record-no { font-weight: 700; color: #2c3e50; font-size: 15px; min-width: 60px; }
+    .record-info { flex: 1; }
+    .record-info .title { font-size: 14px; font-weight: 600; }
+    .record-info .meta { font-size: 12px; color: #7f8c8d; margin-top: 2px; }
+    .record-badge { font-size: 11px; padding: 3px 8px; border-radius: 10px; font-weight: 600; }
+    .badge-pending { background: #ffeeba; color: #856404; }
+    .badge-approved { background: #d4edda; color: #155724; }
+    .badge-ignored { background: #f8d7da; color: #721c24; }
+
+    .status-icon { font-size: 20px; min-width: 28px; text-align: center; }
+
+    .record-actions { display: flex; gap: 8px; }
+
+    .record-detail { padding: 14px 18px; background: #f8f9fa; display: none; }
+    .record-detail.open { display: block; }
+
+    .items-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .items-table th { background: #2c3e50; color: white; padding: 8px 12px; text-align: left; }
+    .items-table td { padding: 7px 12px; border-bottom: 1px solid #e9ecef; }
+    .items-table tr:last-child td { border-bottom: none; }
+    .mapped { color: #27ae60; font-weight: 600; }
+    .unmapped { color: #e74c3c; }
+
+    .approve-footer { margin-top: 12px; display: flex; align-items: center; gap: 10px; }
+    .unmapped-warning { font-size: 12px; color: #e74c3c; }
+
+    .empty-state { text-align: center; padding: 60px 20px; color: #95a5a6; }
+    .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+
+    /* 매핑 페이지 */
+    .mapping-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media(max-width: 900px) { .mapping-layout { grid-template-columns: 1fr; } }
+
+    .panel { background: white; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); padding: 16px; }
+    .panel h3 { font-size: 15px; margin-bottom: 12px; color: #2c3e50; padding-bottom: 8px; border-bottom: 2px solid #3498db; }
+
+    .search-input { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; margin-bottom: 10px; }
+
+    .item-list { max-height: 400px; overflow-y: auto; border: 1px solid #e9ecef; border-radius: 6px; }
+    .item-row { padding: 9px 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f0f0f0; cursor: pointer; font-size: 13px; transition: background 0.1s; }
+    .item-row:hover { background: #e8f4fd; }
+    .item-row:last-child { border-bottom: none; }
+    .item-row.selected { background: #d6eaf8; }
+    .item-row .item-name { flex: 1; }
+    .item-row .item-code { color: #7f8c8d; font-size: 11px; margin-left: 8px; }
+
+    .mapping-arrow { text-align: center; font-size: 24px; padding: 20px; display: flex; align-items: center; justify-content: center; }
+
+    .mapping-confirm { background: white; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); padding: 16px; margin-top: 16px; }
+    .mapping-confirm h3 { font-size: 15px; margin-bottom: 12px; }
+    .mapping-preview { display: flex; align-items: center; gap: 12px; padding: 10px; background: #f8f9fa; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+    .mapping-preview .arrow { color: #3498db; font-size: 18px; }
+
+    .existing-mappings { margin-top: 20px; }
+    .mapping-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+    .mapping-row:last-child { border-bottom: none; }
+    .mapping-row .del-btn { margin-left: auto; }
+
+    /* Toast */
+    .toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+    .toast { padding: 12px 18px; border-radius: 8px; color: white; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); animation: slideIn 0.3s ease; min-width: 200px; }
+    .toast-success { background: #27ae60; }
+    .toast-error { background: #e74c3c; }
+    .toast-info { background: #3498db; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    .stats-bar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+    .stat-card { background: white; border-radius: 8px; padding: 12px 18px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); text-align: center; min-width: 100px; cursor: pointer; transition: box-shadow 0.15s, transform 0.15s; }
+    .stat-card:hover { box-shadow: 0 3px 10px rgba(0,0,0,0.15); transform: translateY(-1px); }
+    .stat-card.active-filter { box-shadow: 0 0 0 2px #3498db; }
+    .stat-card .num { font-size: 24px; font-weight: 700; }
+    .stat-card .label { font-size: 11px; color: #7f8c8d; margin-top: 2px; }
+    .stat-pending .num { color: #f39c12; }
+    .stat-approved .num { color: #27ae60; }
+    .stat-ignored .num { color: #95a5a6; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📦 입고 정산기</h1>
+  <div class="header-right">
+    <span id="lastSync" style="opacity:0.7">마지막 동기화: -</span>
+    <span id="syncStatusBadge" class="sync-status idle">대기중</span>
+    <button class="btn btn-primary btn-sm" onclick="manualSync()">🔄 지금 동기화</button>
+  </div>
+</div>
+
+<div class="nav-tabs">
+  <div class="nav-tab active" onclick="switchTab('receivings')">📋 입고 목록</div>
+  <div class="nav-tab" onclick="switchTab('mapping')">🔗 상품 매핑</div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<div class="container">
+
+  <!-- 입고 목록 탭 -->
+  <div id="tab-receivings" class="tab-content active">
+    <div class="stats-bar" id="statsBar"></div>
+    <div class="filter-bar">
+      <select id="filterStatus" onchange="loadReceivings()">
+        <option value="">전체 상태</option>
+        <option value="pending" selected>대기중</option>
+        <option value="approved">승인완료</option>
+        <option value="ignored">무시됨</option>
+      </select>
+
+      <!-- 날짜 범위 선택 -->
+      <div class="date-picker-wrap" id="datePickerWrap">
+        <input type="text" class="date-input" id="dateFrom" placeholder="시작일" readonly onclick="openCal(event)">
+        <span class="date-sep">~</span>
+        <input type="text" class="date-input" id="dateTo" placeholder="종료일" readonly onclick="openCal(event)">
+        <div class="cal-popup" id="calPopup">
+          <div class="cal-panel" id="calLeft"></div>
+          <div class="cal-panel" id="calRight"></div>
+          <div style="position:absolute;bottom:14px;left:14px;right:14px">
+            <div class="cal-footer">
+              <button class="quick-btn" onclick="setQuick(0)">오늘</button>
+              <button class="quick-btn" onclick="setQuick(7)">7일</button>
+              <button class="quick-btn" onclick="setQuick(30)">30일</button>
+              <button class="quick-btn" onclick="setQuick(90)">3개월</button>
+              <button class="cal-clear" onclick="clearDate()">초기화</button>
+              <button class="cal-apply" onclick="applyDate()">적용</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <input type="text" id="filterSearch" placeholder="입고번호 or 상품명 검색" oninput="loadReceivings()" style="width:200px">
+    </div>
+    <!-- 일괄처리 툴바 -->
+    <div class="bulk-bar" id="bulkBar">
+      <span class="bulk-count" id="bulkCount">0개 선택됨</span>
+      <button class="btn btn-success btn-sm" onclick="bulkApprove()">✅ 일괄 승인</button>
+      <button class="btn btn-danger btn-sm" onclick="bulkIgnore()">🚫 일괄 무시</button>
+      <button class="btn btn-secondary btn-sm" onclick="deselectAll()">✕ 선택 해제</button>
+      <div class="bulk-progress" id="bulkProgress">
+        <div class="bulk-progress-bar"><div class="bulk-progress-fill" id="bulkFill" style="width:0%"></div></div>
+        <div class="bulk-progress-label" id="bulkLabel"></div>
+      </div>
+    </div>
+
+    <!-- 전체 선택 -->
+    <div class="select-all-wrap" id="selectAllWrap" style="display:none">
+      <input type="checkbox" id="chkAll" onchange="toggleSelectAll(this.checked)">
+      <label for="chkAll">대기중 전체 선택</label>
+    </div>
+
+    <div id="receivingList"></div>
+  </div>
+
+  <!-- 상품 매핑 탭 -->
+  <div id="tab-mapping" class="tab-content">
+    <div class="mapping-layout">
+      <div class="panel">
+        <h3>아워박스 상품 <span style="font-size:11px;color:#7f8c8d" id="ourboxTotal"></span>
+          <button class="btn btn-sm btn-secondary" style="float:right;margin-top:-2px" onclick="toggleManualInput()">✏️ 직접 입력</button>
+        </h3>
+        <div id="manualInputArea" style="display:none;padding:8px;background:#fffbe6;border:1px solid #ffe58f;border-radius:6px;margin-bottom:8px">
+          <div style="font-size:12px;color:#7f8c8d;margin-bottom:6px">아워박스 목록에 없는 상품을 직접 입력합니다</div>
+          <input type="text" id="manualProdCd" placeholder="상품코드 (prod_cd)" style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;margin-bottom:4px">
+          <input type="text" id="manualProdNm" placeholder="상품명" style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;margin-bottom:6px">
+          <button class="btn btn-primary btn-sm" onclick="applyManualInput()">이 상품으로 선택</button>
+          <button class="btn btn-sm btn-secondary" onclick="toggleManualInput()" style="margin-left:6px">닫기</button>
+        </div>
+        <input type="text" class="search-input" id="searchOurbox" placeholder="상품명 검색..." oninput="filterOurbox()">
+        <div class="item-list" id="ourboxList"></div>
+      </div>
+      <div class="panel">
+        <h3>박스히어로 상품 <span style="font-size:11px;color:#7f8c8d" id="boxheroTotal"></span></h3>
+        <input type="text" class="search-input" id="searchBoxhero" placeholder="상품명 또는 SKU 검색..." oninput="filterBoxhero()">
+        <div class="item-list" id="boxheroList"></div>
+      </div>
+    </div>
+
+    <div class="mapping-confirm" id="mappingConfirm" style="display:none">
+      <h3>🔗 매핑 연결</h3>
+      <div class="mapping-preview" id="mappingPreview"></div>
+      <button class="btn btn-success" onclick="saveMapping()">✅ 매핑 저장</button>
+      <button class="btn btn-secondary" onclick="cancelMapping()" style="margin-left:8px">취소</button>
+    </div>
+
+    <div class="existing-mappings card" style="margin-top:20px">
+      <div style="padding:14px 18px;border-bottom:1px solid #f0f0f0;display:flex;align-items:center;gap:12px">
+        <span style="font-weight:700;font-size:15px;color:#2c3e50">📌 저장된 매핑 목록 <span id="mappingCount" style="font-size:12px;color:#7f8c8d;font-weight:400"></span></span>
+        <button class="btn btn-primary btn-sm" onclick="autoMap()" id="autoMapBtn" style="margin-left:auto">
+          ⚡ 바코드 자동 매핑
+        </button>
+      </div>
+      <div id="mappingList"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let receivings = [];
+let ourboxProducts = [];
+let boxheroItems = [];
+let selectedOurbox = null;
+let selectedBoxhero = null;
+let selectedSnos = new Set();
+
+// ==================== 달력 ====================
+let calState = {
+  leftYear: new Date().getFullYear(),
+  leftMonth: new Date().getMonth(),
+  rangeStart: null,
+  rangeEnd: null,
+  hovering: null,
+  selecting: false  // false=첫클릭대기, true=두번째클릭대기
+};
+
+function fmt(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function parseDate(s) {
+  if (!s) return null;
+  const [y,m,d] = s.split('-').map(Number);
+  return new Date(y, m-1, d);
+}
+
+function openCal(e) {
+  e.stopPropagation();
+  const popup = document.getElementById('calPopup');
+  if (popup.classList.contains('open')) { popup.classList.remove('open'); return; }
+  // 현재 선택값으로 달력 초기화
+  if (calState.rangeStart) {
+    calState.leftYear = calState.rangeStart.getFullYear();
+    calState.leftMonth = calState.rangeStart.getMonth();
+  } else {
+    const now = new Date();
+    calState.leftYear = now.getFullYear();
+    calState.leftMonth = now.getMonth() > 0 ? now.getMonth() - 1 : 0;
+    if (now.getMonth() === 0) calState.leftYear--;
+  }
+  renderCals();
+  popup.classList.add('open');
+}
+
+function renderCals() {
+  document.getElementById('calLeft').innerHTML = renderCalMonth(calState.leftYear, calState.leftMonth, 'left');
+  const rightMonth = calState.leftMonth === 11 ? 0 : calState.leftMonth + 1;
+  const rightYear = calState.leftMonth === 11 ? calState.leftYear + 1 : calState.leftYear;
+  document.getElementById('calRight').innerHTML = renderCalMonth(rightYear, rightMonth, 'right') +
+    '<div style="height:52px"></div>'; // footer space
+}
+
+function renderCalMonth(year, month, side) {
+  const DOWS = ['일','월','화','수','목','금','토'];
+  const monthNames = ['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'];
+  const today = new Date(); today.setHours(0,0,0,0);
+
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  let html = `<div class="cal-header">`;
+  if (side === 'left') {
+    html += `<button class="cal-nav" onclick="calNav(-1)">‹</button>`;
+  } else {
+    html += `<span style="width:28px"></span>`;
+  }
+  html += `<span>${year}년 ${monthNames[month]}</span>`;
+  if (side === 'right') {
+    html += `<button class="cal-nav" onclick="calNav(1)">›</button>`;
+  } else {
+    html += `<span style="width:28px"></span>`;
+  }
+  html += `</div><div class="cal-grid">`;
+
+  DOWS.forEach((d,i) => html += `<div class="cal-dow" style="${i===0?'color:#e74c3c':i===6?'color:#3498db':''}">${d}</div>`);
+
+  for (let i = 0; i < firstDay; i++) html += `<div class="cal-day empty"></div>`;
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(year, month, d);
+    const dateStr = fmt(date);
+    const dow = date.getDay();
+
+    let cls = 'cal-day';
+    if (dow === 0) cls += ' sun';
+    if (dow === 6) cls += ' sat';
+    if (date.getTime() === today.getTime()) cls += ' today';
+
+    const s = calState.rangeStart, e = calState.rangeEnd || calState.hovering;
+    const [lo, hi] = s && e ? (s <= e ? [s,e] : [e,s]) : [s, s];
+
+    if (lo && hi) {
+      if (date.getTime() === lo.getTime()) cls += ' range-start';
+      if (date.getTime() === hi.getTime()) cls += ' range-end';
+      if (date > lo && date < hi) cls += ' in-range';
+    } else if (lo && date.getTime() === lo.getTime()) {
+      cls += ' range-start range-end';
+    }
+
+    html += `<div class="${cls}" data-date="${dateStr}" onclick="calClick('${dateStr}')" onmouseenter="calHover('${dateStr}')">${d}</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function calNav(dir) {
+  calState.leftMonth += dir;
+  if (calState.leftMonth > 11) { calState.leftMonth = 0; calState.leftYear++; }
+  if (calState.leftMonth < 0) { calState.leftMonth = 11; calState.leftYear--; }
+  renderCals();
+}
+
+function calClick(dateStr) {
+  const date = parseDate(dateStr);
+  if (!calState.selecting || !calState.rangeStart) {
+    // 첫 번째 클릭 - 시작일 선택
+    calState.rangeStart = date;
+    calState.rangeEnd = null;
+    calState.selecting = true;
+  } else {
+    // 두 번째 클릭 - 종료일 선택
+    if (date < calState.rangeStart) {
+      calState.rangeEnd = calState.rangeStart;
+      calState.rangeStart = date;
+    } else {
+      calState.rangeEnd = date;
+    }
+    calState.selecting = false;
+  }
+  renderCals();
+  updateDateInputs();
+}
+
+function calHover(dateStr) {
+  if (calState.selecting && calState.rangeStart) {
+    calState.hovering = parseDate(dateStr);
+    renderCals();
+  }
+}
+
+function updateDateInputs() {
+  document.getElementById('dateFrom').value = calState.rangeStart ? fmt(calState.rangeStart) : '';
+  document.getElementById('dateTo').value = calState.rangeEnd ? fmt(calState.rangeEnd) : '';
+}
+
+function setQuick(days) {
+  const end = new Date(); end.setHours(0,0,0,0);
+  const start = new Date(end); start.setDate(start.getDate() - days);
+  calState.rangeStart = start;
+  calState.rangeEnd = end;
+  calState.selecting = false;
+  calState.leftYear = start.getFullYear();
+  calState.leftMonth = start.getMonth();
+  renderCals();
+  updateDateInputs();
+  if (days === 0) { applyDate(); } // 오늘은 바로 적용
+}
+
+function clearDate() {
+  calState.rangeStart = null;
+  calState.rangeEnd = null;
+  calState.hovering = null;
+  calState.selecting = false;
+  updateDateInputs();
+  renderCals();
+  loadReceivings();
+  document.getElementById('calPopup').classList.remove('open');
+}
+
+function applyDate() {
+  document.getElementById('calPopup').classList.remove('open');
+  loadReceivings();
+}
+
+// 팝업 외부 클릭 시 닫기
+document.addEventListener('click', e => {
+  const wrap = document.getElementById('datePickerWrap');
+  if (!wrap.contains(e.target)) {
+    document.getElementById('calPopup').classList.remove('open');
+  }
+});
+
+// ==================== 탭 전환 ====================
+function switchTab(tab) {
+  document.querySelectorAll('.nav-tab').forEach((t, i) => {
+    t.classList.toggle('active', ['receivings','mapping'][i] === tab);
+  });
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  if (tab === 'mapping') loadMappingPage();
+}
+
+// ==================== 동기화 상태 ====================
+async function checkSyncStatus() {
+  const data = await fetch('/api/sync/status').then(r => r.json());
+  const badge = document.getElementById('syncStatusBadge');
+  const lastSync = document.getElementById('lastSync');
+
+  badge.className = 'sync-status ' + data.status;
+  badge.textContent = data.status === 'syncing' ? '동기화중...' : data.status === 'error' ? '오류' : '대기중';
+
+  if (data.status === 'error' && data.lastSyncError) {
+    lastSync.textContent = '오류: ' + data.lastSyncError;
+    lastSync.style.color = '#e74c3c';
+    showToast('동기화 오류: ' + data.lastSyncError, 'error');
+  } else {
+    lastSync.style.color = '';
+    if (data.lastSyncTime) lastSync.textContent = '마지막: ' + data.lastSyncTime;
+  }
+  if (data.status !== 'syncing') loadReceivings();
+}
+
+async function manualSync() {
+  await fetch('/api/sync', { method: 'POST' });
+  showToast('동기화 시작됨', 'info');
+  setTimeout(checkSyncStatus, 1000);
+}
+
+// ==================== 입고 목록 ====================
+async function loadReceivings() {
+  const data = await fetch('/api/receivings').then(r => r.json());
+  receivings = data;
+
+  const filterStatus = document.getElementById('filterStatus').value;
+  const filterSearch = document.getElementById('filterSearch').value.toLowerCase();
+  const dateFrom = calState.rangeStart;
+  const dateTo = calState.rangeEnd || calState.rangeStart;
+
+  const filtered = data.filter(r => {
+    if (filterStatus && r.status !== filterStatus) return false;
+    if (dateFrom) {
+      const recDate = parseDate((r.put_req_dt || '').substring(0, 10));
+      if (!recDate) return false;
+      const toEnd = new Date(dateTo); toEnd.setHours(23,59,59,999);
+      if (recDate < dateFrom || recDate > toEnd) return false;
+    }
+    if (filterSearch) {
+      return r.put_sno.includes(filterSearch) ||
+        (r.vendor_nm || '').toLowerCase().includes(filterSearch) ||
+        (r.items || []).some(i => (i.sale_prod_nm || '').toLowerCase().includes(filterSearch));
+    }
+    return true;
+  });
+
+  // 통계 (날짜 필터 기준)
+  const base = dateFrom ? filtered : data;
+  const pending = base.filter(r => r.status === 'pending').length;
+  const approved = base.filter(r => r.status === 'approved').length;
+  const ignored = base.filter(r => r.status === 'ignored').length;
+  const dateLabel = dateFrom
+    ? ` <span style="font-size:11px;font-weight:400;color:#7f8c8d">${fmt(dateFrom)}${dateTo && dateTo.getTime()!==dateFrom.getTime() ? ' ~ '+fmt(dateTo) : ''}</span>`
+    : '';
+  const curFilter = document.getElementById('filterStatus').value;
+  document.getElementById('statsBar').innerHTML = `
+    <div class="stat-card stat-pending ${curFilter==='pending'?'active-filter':''}" onclick="setStatusFilter('pending')"><div class="num">${pending}</div><div class="label">대기중${dateLabel}</div></div>
+    <div class="stat-card stat-approved ${curFilter==='approved'?'active-filter':''}" onclick="setStatusFilter('approved')"><div class="num">${approved}</div><div class="label">승인완료</div></div>
+    <div class="stat-card stat-ignored ${curFilter==='ignored'?'active-filter':''}" onclick="setStatusFilter('ignored')"><div class="num">${ignored}</div><div class="label">무시됨</div></div>
+    <div class="stat-card ${curFilter===''?'active-filter':''}" style="margin-left:auto" onclick="setStatusFilter('')"><div class="num" style="color:#2c3e50;font-size:18px">${filtered.length}</div><div class="label">전체</div></div>
+  `;
+
+  const container = document.getElementById('receivingList');
+  if (filtered.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">📭</div><div>입고 내역이 없습니다.</div></div>';
+    document.getElementById('selectAllWrap').style.display = 'none';
+    return;
+  }
+
+  container.innerHTML = filtered.map(r => renderRecord(r)).join('');
+
+  // 대기중 항목이 있을 때만 전체선택 표시
+  const hasPending = filtered.some(r => r.status === 'pending');
+  document.getElementById('selectAllWrap').style.display = hasPending ? 'flex' : 'none';
+  const chkAll = document.getElementById('chkAll');
+  if (chkAll) { chkAll.checked = false; chkAll.indeterminate = false; }
+  deselectAll();
+}
+
+function renderRecord(r) {
+  const statusIcon = r.status === 'approved' ? '✅' : r.status === 'ignored' ? '🚫' : '⏳';
+  const badgeClass = r.status === 'approved' ? 'badge-approved' : r.status === 'ignored' ? 'badge-ignored' : 'badge-pending';
+  const badgeText = r.status === 'approved' ? '승인완료' : r.status === 'ignored' ? '무시됨' : '대기중';
+  const items = r.items || [];
+  const mappedCount = items.filter(i => i.boxhero_item_id).length;
+
+  const checkboxHtml = r.status === 'pending' ? `
+    <input type="checkbox" class="record-check" data-sno="${r.put_sno}"
+      onclick="event.stopPropagation(); updateBulkBar()"
+      ${selectedSnos.has(r.put_sno) ? 'checked' : ''}>
+  ` : `<span style="width:18px;display:inline-block"></span>`;
+
+  const actionsHtml = r.status === 'pending' ? `
+    <button class="btn btn-success btn-sm" onclick="event.stopPropagation();approve('${r.put_sno}')">✅ 승인</button>
+    <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();ignore('${r.put_sno}')">🚫 무시</button>
+  ` : r.status === 'approved' ? `
+    <span style="font-size:12px;color:#27ae60">TX#${r.boxhero_tx_id || '-'}</span>
+    <button class="btn btn-sm" style="background:#fff3cd;color:#856404;border:1px solid #ffc107" onclick="event.stopPropagation();cancelApproval('${r.put_sno}')">🔄 취소</button>
+  ` : '';
+
+  const itemsHtml = items.map(i => {
+    const mapped = i.boxhero_item_id
+      ? `<span class="mapped">✅ ${i.boxhero_item_nm || ''}</span>`
+      : `<span class="unmapped">❌ 매핑 없음</span>`;
+    return `<tr>
+      <td>${i.sale_prod_nm || ''}</td>
+      <td>${i.prod_cd || ''}</td>
+      <td style="text-align:right">${(i.put_qty||0).toLocaleString()}</td>
+      <td>${mapped}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="card" id="card-${r.put_sno}">
+      <div class="record-header" onclick="toggleDetail('${r.put_sno}')">
+        ${checkboxHtml}
+        <div class="status-icon">${statusIcon}</div>
+        <div class="record-no">#${r.put_sno}</div>
+        <div class="record-info">
+          <div class="title">${r.put_depot_nm || ''} · ${r.vendor_nm || ''} · ${r.put_type_nm || ''}</div>
+          <div class="meta">입고요청: ${r.put_req_dt || ''} · 완료: ${r.put_compt_dtm || ''} · 상품 ${r.item_cnt || 0}종 · 총 ${(r.tot_put_qty||0).toLocaleString()}개 · 매핑: ${mappedCount}/${items.length}</div>
+        </div>
+        <span class="record-badge ${badgeClass}">${badgeText}</span>
+        <div class="record-actions" onclick="event.stopPropagation()">${actionsHtml}</div>
+      </div>
+      <div class="record-detail" id="detail-${r.put_sno}">
+        <table class="items-table">
+          <thead><tr><th>상품명</th><th>아워박스 상품코드</th><th style="text-align:right">입고수량</th><th>박스히어로 매핑</th></tr></thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        ${r.status === 'pending' ? `
+          <div class="approve-footer">
+            <button class="btn btn-success" onclick="approve('${r.put_sno}')">✅ 박스히어로에 입고 등록</button>
+            <button class="btn btn-danger" onclick="ignore('${r.put_sno}')">🚫 무시</button>
+            ${mappedCount < items.length ? `<span class="unmapped-warning">⚠ ${items.length - mappedCount}개 상품 매핑 없음 (매핑된 ${mappedCount}개만 등록됨)</span>` : ''}
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function toggleDetail(put_sno) {
+  document.getElementById('detail-' + put_sno).classList.toggle('open');
+}
+
+function setStatusFilter(status) {
+  document.getElementById('filterStatus').value = status;
+  loadReceivings();
+}
+
+async function approve(put_sno) {
+  if (!confirm(`입고번호 #${put_sno}를 박스히어로에 등록하시겠습니까?`)) return;
+
+  const res = await fetch(`/api/receivings/${put_sno}/approve`, { method: 'POST' });
+  const data = await res.json();
+
+  if (res.ok) {
+    showToast(`✅ 등록 완료! 박스히어로 TX#${data.boxhero_tx_id}`, 'success');
+    if (data.unmapped_count > 0) {
+      showToast(`⚠ 매핑 없는 상품 ${data.unmapped_count}개 제외됨`, 'error');
+    }
+    loadReceivings();
+  } else {
+    showToast('❌ ' + (data.detail || '오류'), 'error');
+  }
+}
+
+async function cancelApproval(put_sno) {
+  if (!confirm(`입고번호 #${put_sno}의 박스히어로 등록을 취소하시겠습니까?\n(박스히어로 트랜잭션이 삭제되고 상태가 대기중으로 초기화됩니다)`)) return;
+  const res = await fetch(`/api/receivings/${put_sno}/cancel`, { method: 'POST' });
+  const data = await res.json();
+  if (res.ok) {
+    showToast('취소 완료. 대기중으로 초기화됐습니다.', 'info');
+    loadReceivings();
+  } else {
+    showToast('취소 실패: ' + (data.detail || '오류'), 'error');
+  }
+}
+
+async function ignore(put_sno) {
+  if (!confirm(`입고번호 #${put_sno}를 무시하시겠습니까?`)) return;
+  await fetch(`/api/receivings/${put_sno}/ignore`, { method: 'POST' });
+  showToast('무시됨', 'info');
+  loadReceivings();
+}
+
+// ==================== 매핑 페이지 ====================
+async function loadMappingPage() {
+  document.getElementById('ourboxList').innerHTML = '<div style="padding:20px;text-align:center;color:#7f8c8d">로딩 중...</div>';
+  document.getElementById('boxheroList').innerHTML = '<div style="padding:20px;text-align:center;color:#7f8c8d">로딩 중...</div>';
+
+  const [ourboxData, boxheroData, mappings] = await Promise.all([
+    fetch('/api/ourbox-products').then(r => r.json()),
+    fetch('/api/boxhero-items').then(r => r.json()),
+    fetch('/api/mappings').then(r => r.json())
+  ]);
+
+  ourboxProducts = (ourboxData.data || []);
+  boxheroItems = boxheroData;
+
+  document.getElementById('ourboxTotal').textContent = `(총 ${ourboxData.total || ourboxProducts.length}개)`;
+  document.getElementById('boxheroTotal').textContent = `(총 ${boxheroItems.length}개)`;
+
+  renderOurboxList();
+  renderBoxheroList();
+  renderMappings(mappings);
+}
+
+function renderOurboxList() {
+  const search = document.getElementById('searchOurbox').value.toLowerCase();
+  const filtered = ourboxProducts.filter(p =>
+    !search || (p.sale_prod_nm || '').toLowerCase().includes(search) || (p.prod_cd || '').includes(search)
+  );
+
+  document.getElementById('ourboxList').innerHTML = filtered.slice(0, 100).map(p => `
+    <div class="item-row ${selectedOurbox?.prod_cd === p.prod_cd ? 'selected' : ''}"
+         onclick="selectOurbox(${JSON.stringify(p).replace(/"/g, '&quot;')})">
+      <span class="item-name">${p.sale_prod_nm || ''}</span>
+      <span class="item-code">${p.prod_cd || ''}</span>
+    </div>
+  `).join('') || '<div style="padding:12px;color:#7f8c8d;text-align:center">검색 결과 없음</div>';
+}
+
+function renderBoxheroList() {
+  const search = document.getElementById('searchBoxhero').value.toLowerCase();
+  const filtered = boxheroItems.filter(i =>
+    !search || (i.name || '').toLowerCase().includes(search) || (i.sku || '').includes(search)
+  );
+
+  document.getElementById('boxheroList').innerHTML = filtered.slice(0, 100).map(i => `
+    <div class="item-row ${selectedBoxhero?.id === i.id ? 'selected' : ''}"
+         onclick="selectBoxhero(${JSON.stringify(i).replace(/"/g, '&quot;')})">
+      <span class="item-name">${i.name || ''}</span>
+      <span class="item-code">${i.sku || ''}</span>
+    </div>
+  `).join('') || '<div style="padding:12px;color:#7f8c8d;text-align:center">검색 결과 없음</div>';
+}
+
+function filterOurbox() { renderOurboxList(); }
+function filterBoxhero() { renderBoxheroList(); }
+
+function toggleManualInput() {
+  const area = document.getElementById('manualInputArea');
+  area.style.display = area.style.display === 'none' ? 'block' : 'none';
+}
+
+function applyManualInput() {
+  const prod_cd = document.getElementById('manualProdCd').value.trim();
+  const sale_prod_nm = document.getElementById('manualProdNm').value.trim();
+  if (!prod_cd) { alert('상품코드를 입력해주세요.'); return; }
+  selectOurbox({ prod_cd, sale_prod_nm: sale_prod_nm || prod_cd });
+  document.getElementById('manualInputArea').style.display = 'none';
+  showToast(`"${sale_prod_nm || prod_cd}" 선택됨`, 'success');
+}
+
+function selectOurbox(p) {
+  selectedOurbox = p;
+  renderOurboxList();
+  updateMappingPreview();
+}
+
+function selectBoxhero(i) {
+  selectedBoxhero = i;
+  renderBoxheroList();
+  updateMappingPreview();
+}
+
+function updateMappingPreview() {
+  const confirm = document.getElementById('mappingConfirm');
+  if (!selectedOurbox || !selectedBoxhero) { confirm.style.display = 'none'; return; }
+
+  confirm.style.display = 'block';
+  document.getElementById('mappingPreview').innerHTML = `
+    <span>📦 ${selectedOurbox.sale_prod_nm}<br><small style="color:#7f8c8d">${selectedOurbox.prod_cd}</small></span>
+    <span class="arrow">→</span>
+    <span>🗃 ${selectedBoxhero.name}<br><small style="color:#7f8c8d">SKU: ${selectedBoxhero.sku || '-'}</small></span>
+  `;
+}
+
+function cancelMapping() {
+  selectedOurbox = null;
+  selectedBoxhero = null;
+  document.getElementById('mappingConfirm').style.display = 'none';
+  renderOurboxList();
+  renderBoxheroList();
+}
+
+async function saveMapping() {
+  if (!selectedOurbox || !selectedBoxhero) return;
+
+  const res = await fetch('/api/mappings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ourbox_prod_cd: selectedOurbox.prod_cd,
+      ourbox_prod_nm: selectedOurbox.sale_prod_nm,
+      boxhero_item_id: selectedBoxhero.id,
+      boxhero_item_nm: selectedBoxhero.name,
+      boxhero_sku: selectedBoxhero.sku
+    })
+  });
+
+  if (res.ok) {
+    showToast('✅ 매핑 저장됨', 'success');
+    cancelMapping();
+    const mappings = await fetch('/api/mappings').then(r => r.json());
+    renderMappings(mappings);
+  } else {
+    showToast('❌ 저장 실패', 'error');
+  }
+}
+
+function renderMappings(mappings) {
+  document.getElementById('mappingCount').textContent = `(${mappings.length}개)`;
+  document.getElementById('mappingList').innerHTML = mappings.length === 0
+    ? '<div style="padding:20px;text-align:center;color:#7f8c8d">매핑 없음. 위에서 상품을 선택해 연결하세요.</div>'
+    : mappings.map(m => `
+      <div class="mapping-row">
+        <span style="flex:1">${m.ourbox_prod_nm || m.ourbox_prod_cd}</span>
+        <span style="color:#3498db;margin:0 8px">→</span>
+        <span style="flex:1">${m.boxhero_item_nm || ''} <small style="color:#7f8c8d">(SKU: ${m.boxhero_sku || '-'})</small></span>
+        <button class="btn btn-danger btn-sm del-btn" onclick="deleteMapping('${m.ourbox_prod_cd}')">삭제</button>
+      </div>
+    `).join('');
+}
+
+async function autoMap() {
+  if (!confirm('아워박스 바코드와 박스히어로 SKU를 자동으로 매칭합니다.\n기존 매핑은 덮어씌워집니다. 계속하시겠습니까?')) return;
+
+  const btn = document.getElementById('autoMapBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 매핑 중...';
+
+  try {
+    const res = await fetch('/api/mappings/auto', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`✅ 자동 매핑 완료! ${data.added}개 연결 / ${data.skipped}개 미매칭`, 'success');
+      const mappings = await fetch('/api/mappings').then(r => r.json());
+      renderMappings(mappings);
+      document.getElementById('mappingCount').textContent = `(${mappings.length}개)`;
+    } else {
+      showToast('❌ ' + (data.detail || '오류'), 'error');
+    }
+  } catch (e) {
+    showToast('❌ 오류: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ 바코드 자동 매핑';
+  }
+}
+
+async function deleteMapping(prod_cd) {
+  if (!confirm('매핑을 삭제하시겠습니까?')) return;
+  await fetch('/api/mappings/' + encodeURIComponent(prod_cd), { method: 'DELETE' });
+  showToast('삭제됨', 'info');
+  const mappings = await fetch('/api/mappings').then(r => r.json());
+  renderMappings(mappings);
+}
+
+// ==================== Toast ====================
+function showToast(msg, type = 'info') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 4000);
+}
+
+// ==================== 일괄처리 ====================
+function updateBulkBar() {
+  // 현재 체크된 체크박스 기준으로 selectedSnos 동기화
+  selectedSnos.clear();
+  document.querySelectorAll('.record-check:checked').forEach(cb => {
+    selectedSnos.add(cb.dataset.sno);
+  });
+
+  const count = selectedSnos.size;
+  const bulkBar = document.getElementById('bulkBar');
+  const selectAllWrap = document.getElementById('selectAllWrap');
+  bulkBar.classList.toggle('visible', count > 0);
+  document.getElementById('bulkCount').textContent = `${count}개 선택됨`;
+
+  // 전체선택 체크박스 상태 동기화
+  const allPendingChecks = document.querySelectorAll('.record-check');
+  const chkAll = document.getElementById('chkAll');
+  if (chkAll && allPendingChecks.length > 0) {
+    chkAll.indeterminate = count > 0 && count < allPendingChecks.length;
+    chkAll.checked = count > 0 && count === allPendingChecks.length;
+  }
+}
+
+function toggleSelectAll(checked) {
+  document.querySelectorAll('.record-check').forEach(cb => { cb.checked = checked; });
+  updateBulkBar();
+}
+
+function deselectAll() {
+  document.querySelectorAll('.record-check').forEach(cb => { cb.checked = false; });
+  selectedSnos.clear();
+  document.getElementById('bulkBar').classList.remove('visible');
+  const chkAll = document.getElementById('chkAll');
+  if (chkAll) { chkAll.checked = false; chkAll.indeterminate = false; }
+}
+
+async function bulkApprove() {
+  const snos = [...selectedSnos];
+  if (snos.length === 0) return;
+  if (!confirm(`선택한 ${snos.length}건을 일괄 승인하시겠습니까?\n(매핑된 상품만 박스히어로에 등록됩니다)`)) return;
+
+  const progress = document.getElementById('bulkProgress');
+  const fill = document.getElementById('bulkFill');
+  const label = document.getElementById('bulkLabel');
+  progress.style.display = 'block';
+
+  let done = 0, success = 0, failed = 0, skipped = 0;
+  for (const sno of snos) {
+    label.textContent = `처리 중: ${sno} (${done + 1}/${snos.length})`;
+    fill.style.width = `${Math.round((done / snos.length) * 100)}%`;
+
+    const res = await fetch(`/api/receivings/${sno}/approve`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      success++;
+      if (data.unmapped_count > 0) skipped += data.unmapped_count;
+    } else {
+      failed++;
+      console.warn(`승인 실패 [${sno}]:`, data.error);
+    }
+    done++;
+  }
+
+  fill.style.width = '100%';
+  label.textContent = `완료: 성공 ${success}건, 실패 ${failed}건${skipped ? `, 미매핑 제외 ${skipped}건` : ''}`;
+
+  const msg = `✅ 일괄 승인 완료\n성공: ${success}건 / 실패: ${failed}건${skipped ? `\n⚠ 미매핑 상품 ${skipped}개 제외됨` : ''}`;
+  showToast(msg.split('\n')[0], failed > 0 ? 'error' : 'success');
+  if (skipped) showToast(`⚠ 미매핑 상품 ${skipped}개 제외됨`, 'info');
+
+  setTimeout(() => {
+    progress.style.display = 'none';
+    fill.style.width = '0%';
+    selectedSnos.clear();
+    loadReceivings();
+  }, 2000);
+}
+
+async function bulkIgnore() {
+  const snos = [...selectedSnos];
+  if (snos.length === 0) return;
+  if (!confirm(`선택한 ${snos.length}건을 일괄 무시하시겠습니까?`)) return;
+
+  const progress = document.getElementById('bulkProgress');
+  const fill = document.getElementById('bulkFill');
+  const label = document.getElementById('bulkLabel');
+  progress.style.display = 'block';
+
+  let done = 0;
+  for (const sno of snos) {
+    label.textContent = `처리 중: ${sno} (${done + 1}/${snos.length})`;
+    fill.style.width = `${Math.round((done / snos.length) * 100)}%`;
+    await fetch(`/api/receivings/${sno}/ignore`, { method: 'POST' });
+    done++;
+  }
+
+  fill.style.width = '100%';
+  showToast(`🚫 ${snos.length}건 무시됨`, 'info');
+  setTimeout(() => {
+    progress.style.display = 'none';
+    fill.style.width = '0%';
+    selectedSnos.clear();
+    loadReceivings();
+  }, 1000);
+}
+
+// ==================== 초기화 ====================
+loadReceivings();
+checkSyncStatus();
+setInterval(checkSyncStatus, 30000); // 30초마다 상태 체크
+</script>
+</body>
+</html>

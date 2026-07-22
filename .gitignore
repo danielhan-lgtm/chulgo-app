@@ -28,3 +28,26 @@ uvicorn*.log
 
 # 거래처 데이터 (개인정보 — 커밋 금지)
 backend/customers.json
+
+# 아워박스 로그인 세션 쿠키 (커밋 금지)
+ourbox_session.json
+.ourbox_login_profile/
+.ourbox_login.lock
+
+# node_modules (용량 — 커밋 금지)
+node_modules/
+frontend/node_modules/
+
+# OneDrive 데스크톱 충돌 복사본
+*-DESKTOP-*
+
+# DB 백업본 (업무 데이터 — 커밋 금지)
+*.db.bak*
+receiving.db.*
+
+# 디버그/스크래치 덤프
+fm_after.json
+fm_sample.json
+fm_review.txt
+fm_verify.txt
+*fm_debug.json

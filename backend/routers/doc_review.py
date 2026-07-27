@@ -24,20 +24,23 @@ router = APIRouter()
 
 
 # ── 정규화 유틸 ────────────────────────────────────────────────────────────
-def norm_center(name: str) -> str:
+def norm_center(name) -> str:
     """'창원1(18)' / '대구7(RC)' / '창원1' → '창원1'"""
-    if not name:
+    if name is None or (isinstance(name, float) and name != name):  # None/NaN
         return ""
     s = str(name).strip()
+    if s.lower() == "nan":  # pandas NaN이 문자열로 넘어온 경우
+        return ""
     s = re.sub(r"\s*\(.*?\)\s*$", "", s)   # 끝 괄호 제거
     s = re.sub(r"\s+", "", s)
     return s
 
 
-def norm_product(name: str) -> str:
-    if not name:
+def norm_product(name) -> str:
+    if name is None or (isinstance(name, float) and name != name):  # None/NaN
         return ""
-    return re.sub(r"\s+", " ", str(name)).strip()
+    s = re.sub(r"\s+", " ", str(name)).strip()
+    return "" if s.lower() == "nan" else s
 
 
 def pkey(name: str) -> str:
@@ -46,8 +49,27 @@ def pkey(name: str) -> str:
 
 
 def _to_int(v) -> int:
+    """'4,680'→4680, 4680.0/'4680.0'→4680, NaN/빈값→0.
+
+    엑셀에 빈 셀이 섞이면 pandas가 수량을 float(4680.0)으로 읽는데,
+    예전 구현은 마침표만 제거해 '46800'(10배)으로 만들었다 — 그 오류 방지.
+    """
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        try:
+            return int(round(v)) if v == v else 0  # NaN != NaN
+        except Exception:
+            return 0
+    s = str(v).replace(",", "").strip()
+    if not s:
+        return 0
     try:
-        return int(re.sub(r"[^\d\-]", "", str(v)) or 0)
+        return int(round(float(s)))
+    except Exception:
+        pass
+    try:
+        return int(re.sub(r"[^\d\-]", "", s) or 0)
     except Exception:
         return 0
 

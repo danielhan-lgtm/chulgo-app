@@ -14,8 +14,23 @@ router = APIRouter()
 
 
 def _to_int(v) -> int:
+    """'4,680'→4680, 4680.0/'4680.0'→4680, NaN/빈값→0 (마침표를 자릿수로 붙이는 오류 방지)."""
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        try:
+            return int(round(v)) if v == v else 0  # NaN != NaN
+        except Exception:
+            return 0
+    s = str(v).replace(",", "").strip()
+    if not s:
+        return 0
     try:
-        return int(re.sub(r"[^\d\-]", "", str(v)) or 0)
+        return int(round(float(s)))
+    except Exception:
+        pass
+    try:
+        return int(re.sub(r"[^\d\-]", "", s) or 0)
     except Exception:
         return 0
 

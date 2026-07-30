@@ -348,10 +348,12 @@ export interface KurlyItem {
   expiry: string
   perBox: number
   boxCount: number
+  orderCode?: string
 }
 
 export interface KurlyParseResult {
   orderCode: string
+  orderCodes?: string[]
   supplier: string
   items: KurlyItem[]
   parse_errors: string[]

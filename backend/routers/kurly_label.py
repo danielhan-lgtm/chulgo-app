@@ -69,6 +69,7 @@ def _find_col_map(header: list) -> dict:
 
 def parse_kurly_statement(data: bytes) -> dict:
     order_code = ""
+    order_codes: list[str] = []
     supplier = ""
     items: list[dict] = []
 
@@ -88,7 +89,16 @@ def parse_kurly_statement(data: bytes) -> dict:
         if mc:
             center = _norm(mc.group(1))
 
+        # 발주코드는 명세서(발주 건)마다 다르므로 페이지 단위로 추적해 품목에 매핑한다.
+        # 표가 다음 페이지로 이어지면 발주코드가 없는 페이지도 있어 직전 코드를 유지한다.
+        current_code = order_code
         for pg in pdf.pages:
+            page_text = (pg.extract_text() or "").replace("\x00", "")
+            mp = re.search(r"발주코드\s*[:：]\s*([A-Za-z0-9_\-]+)", page_text)
+            if mp:
+                current_code = mp.group(1).strip()
+            if current_code and current_code not in order_codes:
+                order_codes.append(current_code)
             for tbl in pg.extract_tables():
                 if not tbl or len(tbl) < 2:
                     continue
@@ -127,10 +137,12 @@ def parse_kurly_statement(data: bytes) -> dict:
                         "expiry": expiry,
                         "perBox": per_box,
                         "boxCount": box_count,
+                        "orderCode": current_code,
                     })
 
     return {
         "orderCode": order_code,
+        "orderCodes": order_codes,
         "supplier": supplier or "(주)시나몬랩",
         "date": md.group(1) if md else "",
         "center": center,
@@ -144,6 +156,7 @@ async def parse_docs(files: list[UploadFile] = File(...)):
         raise HTTPException(400, "마켓컬리 거래명세서 PDF를 업로드해주세요.")
 
     order_code = ""
+    order_codes: list[str] = []
     supplier = ""
     items: list[dict] = []
     errors: list[str] = []
@@ -155,6 +168,9 @@ async def parse_docs(files: list[UploadFile] = File(...)):
         try:
             d = parse_kurly_statement(data)
             order_code = order_code or d["orderCode"]
+            for oc in d.get("orderCodes") or []:
+                if oc and oc not in order_codes:
+                    order_codes.append(oc)
             supplier = supplier or d["supplier"]
             items.extend(d["items"])
         except Exception as e:  # noqa: BLE001
@@ -169,6 +185,7 @@ async def parse_docs(files: list[UploadFile] = File(...)):
 
     return {
         "orderCode": order_code,
+        "orderCodes": order_codes,
         "supplier": supplier or "(주)시나몬랩",
         "items": items,
         "parse_errors": errors,

@@ -7,7 +7,7 @@ import type { KurlyItem } from '../services/api'
 
 const SUPPLIER_DEFAULT = '(주)시나몬랩'
 
-const EMPTY_ITEM: KurlyItem = { name: '', code: '', total: 0, expiry: '', perBox: 0, boxCount: 0 }
+const EMPTY_ITEM: KurlyItem = { name: '', code: '', total: 0, expiry: '', perBox: 0, boxCount: 0, orderCode: '' }
 
 // 박스수 = 올림(총수량 ÷ 박스당입수)
 function calcBoxCount(total: number, perBox: number): number {
@@ -16,7 +16,8 @@ function calcBoxCount(total: number, perBox: number): number {
 }
 
 // pptxgenjs 로 마켓컬리 입고 라벨지(.pptx) 생성 — 박스 1개 = 라벨(슬라이드) 1장
-function buildKurlyPptx(orderCode: string, supplier: string, items: KurlyItem[]) {
+// 발주코드는 품목별(orderCode)이 우선, 없으면 기본 발주코드(fallbackOrderCode) 사용
+function buildKurlyPptx(fallbackOrderCode: string, supplier: string, items: KurlyItem[]) {
   const pptx = new pptxgen()
   pptx.layout = 'LAYOUT_WIDE' // 13.33 x 7.5"
 
@@ -24,12 +25,15 @@ function buildKurlyPptx(orderCode: string, supplier: string, items: KurlyItem[])
   const label = (t: string) => ({ text: t, options: { align: 'center' as const, bold: false } })
   const value = (t: string, bold = false) => ({ text: t, options: { align: 'left' as const, bold } })
 
+  const codes = [...new Set(items.map(it => (it.orderCode || '').trim() || fallbackOrderCode).filter(Boolean))]
+
   for (const it of items) {
+    const itemCode = (it.orderCode || '').trim() || fallbackOrderCode
     const boxTotal = Number(it.boxCount) || 0
     for (let i = 1; i <= boxTotal; i++) {
       const slide = pptx.addSlide()
       const rows = [
-        [label('발주코드'), value(orderCode, true)],
+        [label('발주코드'), value(itemCode, true)],
         [label('공급사명'), value(supplier || SUPPLIER_DEFAULT)],
         [label('상품명'), value(it.name)],
         [label('상품코드'), value(it.code)],
@@ -50,7 +54,8 @@ function buildKurlyPptx(orderCode: string, supplier: string, items: KurlyItem[])
       })
     }
   }
-  return pptx.writeFile({ fileName: `${orderCode || '마켓컬리'}_입고라벨지.pptx` })
+  const fileBase = codes.length > 1 ? `${codes[0]} 외 ${codes.length - 1}건` : codes[0] || '마켓컬리'
+  return pptx.writeFile({ fileName: `${fileBase}_입고라벨지.pptx` })
 }
 
 export default function KurlyLabel() {
@@ -80,6 +85,9 @@ export default function KurlyLabel() {
         message.warning(`일부 파일을 인식하지 못했습니다: ${data.parse_errors.join(' / ')}`)
       } else {
         message.success(`거래명세서 ${data.items.length}개 품목을 불러왔습니다.`)
+      }
+      if ((data.orderCodes?.length || 0) > 1) {
+        message.info(`발주코드 ${data.orderCodes!.length}건이 감지되었습니다. 라벨마다 품목별 발주코드가 적용됩니다.`)
       }
     } catch (e: any) {
       message.error('분석 실패: ' + (e.response?.data?.detail || e.message))
@@ -111,8 +119,8 @@ export default function KurlyLabel() {
       message.warning('박스수가 1개 이상인 품목이 없습니다.')
       return
     }
-    if (!orderCode.trim()) {
-      message.warning('발주코드를 입력하세요.')
+    if (!orderCode.trim() && valid.some(it => !(it.orderCode || '').trim())) {
+      message.warning('발주코드를 입력하세요. (품목별 발주코드가 비어있는 항목은 기본 발주코드가 사용됩니다)')
       return
     }
     setGenerating(true)
@@ -200,7 +208,7 @@ export default function KurlyLabel() {
             <div style={{ fontWeight: 700, marginBottom: 12 }}>📋 기본 정보</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
               <div>
-                <div style={{ fontSize: '0.78rem', color: '#6b7280', marginBottom: 4 }}>발주코드</div>
+                <div style={{ fontSize: '0.78rem', color: '#6b7280', marginBottom: 4 }}>발주코드 (기본값 — 품목별 발주코드가 비어있을 때 사용)</div>
                 <Input value={orderCode} onChange={e => setOrderCode(e.target.value)} placeholder="T20260630_IC2KG" size="small" />
               </div>
               <div>
@@ -223,6 +231,7 @@ export default function KurlyLabel() {
               <thead>
                 <tr style={{ background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
                   <th style={{ padding: '8px 10px', width: 36, color: '#6b7280', fontWeight: 600 }}>NO</th>
+                  <th style={{ padding: '8px 10px', width: 140, textAlign: 'left', color: '#6b7280', fontWeight: 600 }}>발주코드</th>
                   <th style={{ padding: '8px 10px', textAlign: 'left', color: '#6b7280', fontWeight: 600 }}>상품명</th>
                   <th style={{ padding: '8px 10px', width: 130, textAlign: 'left', color: '#6b7280', fontWeight: 600 }}>상품코드</th>
                   <th style={{ padding: '8px 10px', width: 75, color: '#6b7280', fontWeight: 600 }}>총수량</th>
@@ -236,6 +245,9 @@ export default function KurlyLabel() {
                 {items.map((it, idx) => (
                   <tr key={idx} style={{ borderBottom: '1px solid #f3f4f6' }}>
                     <td style={{ padding: '5px 10px', textAlign: 'center', color: '#374151' }}>{idx + 1}</td>
+                    <td style={{ padding: '5px 10px' }}>
+                      <input value={it.orderCode || ''} onChange={e => updateItem(idx, { orderCode: e.target.value })} placeholder={orderCode || '기본 발주코드 사용'} style={cellInput} />
+                    </td>
                     <td style={{ padding: '5px 10px' }}>
                       <input value={it.name} onChange={e => updateItem(idx, { name: e.target.value })} style={cellInput} />
                     </td>

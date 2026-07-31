@@ -142,11 +142,34 @@ def already_posted_today(token: str, channel_id: str, today: str) -> bool:
     return False
 
 
+def item_report_lines(rows: list) -> list:
+    """품목별 종합 리포트 — 거래처 구분 없이 품목 단위 총 출고량을 합산해
+    거래처별 상세 위에 표시. 여러 거래처로 나간 품목은 거래처 분해를 병기.
+    (backend/routers/slack_outbound.py 의 _item_report_lines 와 동일)"""
+    items = OrderedDict()
+    for r in rows:
+        key = r["sku"] or r["name"]
+        it = items.setdefault(key, {"name": r["name"], "sku": r["sku"], "qty": 0, "by_partner": OrderedDict()})
+        it["qty"] += int(r["qty"])
+        it["by_partner"][r["partner"]] = it["by_partner"].get(r["partner"], 0) + int(r["qty"])
+    total_qty = sum(it["qty"] for it in items.values())
+    lines = [f"📊 *품목별 종합* — {len(items)}종 · 총 {total_qty:,}개"]
+    for it in sorted(items.values(), key=lambda x: -x["qty"]):
+        sku = f" `{it['sku']}`" if it["sku"] else ""
+        bp = ""
+        if len(it["by_partner"]) > 1:
+            bp = " (" + " · ".join(f"{p} {q:,}" for p, q in sorted(it["by_partner"].items(), key=lambda kv: -kv[1])) + ")"
+        lines.append(f"   • {it['name']}{sku} — *{it['qty']:,}개*{bp}")
+    return lines
+
+
 def build_message(rows: list, today: str):
     by_p = OrderedDict()
     for r in rows:
         by_p.setdefault(r["partner"], []).append(r)
     lines = [f"📦 *{MARKER}* — 처리일 {today}"]
+    lines += item_report_lines(rows)
+    lines.append("")
     kinds = qty_sum = 0
     for p, its in by_p.items():
         lines.append(f"🏢 *{p}*")

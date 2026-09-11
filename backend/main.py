@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound
+from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report
 
 app = FastAPI(title="출고 라몬 API", version="2.0.0")
 
@@ -36,6 +36,11 @@ app.include_router(outbound.router, prefix="/api/outbound", tags=["outbound"])
 app.include_router(ob_orders.router, prefix="/api/ob-orders", tags=["ob-orders"])
 app.include_router(coupang_growth_load.router, prefix="/api/coupang-growth-load", tags=["coupang-growth-load"])
 app.include_router(slack_outbound.router, prefix="/api/slack-outbound", tags=["slack-outbound"])
+app.include_router(inventory.router, prefix="/api/inventory", tags=["inventory"])
+app.include_router(report.router, prefix="/api/exec-report", tags=["exec-report"])
+app.include_router(coupang_report.router, prefix="/api/coupang-report", tags=["coupang-report"])
+app.include_router(oliveyoung_report.router, prefix="/api/oliveyoung-report", tags=["oliveyoung-report"])
+app.include_router(kurly_report.router, prefix="/api/kurly-report", tags=["kurly-report"])
 
 
 @app.get("/")

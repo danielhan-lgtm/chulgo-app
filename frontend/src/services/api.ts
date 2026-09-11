@@ -197,8 +197,8 @@ export const saveMapping = (data: { ourbox_prod_cd: string; ourbox_prod_nm: stri
   api.post('/receiving/mappings', data).then(r => r.data)
 export const autoMap = () => api.post('/receiving/mappings/auto').then(r => r.data)
 export const deleteMapping = (prodCd: string) => api.delete(`/receiving/mappings/${encodeURIComponent(prodCd)}`).then(r => r.data)
-export const getBoxheroItemsForReceiving = () => api.get('/receiving/boxhero-items').then(r => r.data)
-export const getOurboxProductsForReceiving = () => api.get('/receiving/ourbox-products').then(r => r.data.data)
+export const getBoxheroItemsForReceiving = () => api.get('/receiving/boxhero-items', { timeout: 120000 }).then(r => r.data)
+export const getOurboxProductsForReceiving = () => api.get('/receiving/ourbox-products', { timeout: 180000 }).then(r => r.data.data)
 
 // ── 서류 검토 (여러 파일 한꺼번에 → 센터별 자동분류·교차검토, API 0원) ──────────
 export const reviewCoupangDocs = (files: File[]) => {
@@ -558,6 +558,10 @@ export const getOutboundForecast = (params: {
 }): Promise<OutboundForecastResult> =>
   api.get('/outbound/forecast', { params, timeout: 600000 }).then(r => r.data)
 
+// 마지막 조회 결과 스냅샷 (앱 재시작 후 복원용)
+export const getLastOutboundForecast = (): Promise<{ saved_at: string | null; result: OutboundForecastResult | null }> =>
+  api.get('/outbound/forecast/last').then(r => r.data)
+
 // 판매 목표치 업로드/조회/삭제
 export interface TargetStatus {
   loaded: boolean
@@ -618,6 +622,8 @@ export interface OBOrder {
   reg_dtm: string
   od_dtm: string
   colct_yn: string
+  gift_yn?: string             // 'Y' = MATE 사은품 이벤트가 추가한 라인
+  gift_orig_od_sno?: number    // 사은품의 원주문 라인 번호
 }
 export interface OBOverview {
   from_date: string
@@ -722,6 +728,18 @@ export const getReconcileMatch = (params: {
 
 export const getReconcileStock = (params: { token: string; location_ids?: string; use_mapping?: boolean }) =>
   api.get('/reconcile/stock', { params, timeout: 120000 }).then(r => r.data)
+
+// 수기 재고 (부자재 등 한쪽 시스템에만 있는 상품의 반대편 재고 수동 입력)
+export type ManualStockEntry = { name: string; side: 'bh' | 'ob'; qty: number; memo?: string; updated_at?: string }
+export const getManualStock = () =>
+  api.get('/reconcile/manual-stock', { timeout: 20000 }).then(r => r.data as { items: Record<string, ManualStockEntry> })
+export const setManualStock = (body: { key: string; name: string; side: 'bh' | 'ob'; qty: number; memo?: string }) =>
+  api.post('/reconcile/manual-stock', body, { timeout: 20000 }).then(r => r.data)
+export const deleteManualStock = (key: string) =>
+  api.delete('/reconcile/manual-stock', { params: { key }, timeout: 20000 }).then(r => r.data)
+// 재고 현황 드래그 매칭 → name_mapping 영구 저장
+export const linkStockItems = (body: { bh: { sku?: string; skus?: string[]; name: string }; ob: { name?: string; names?: string[] } }) =>
+  api.post('/reconcile/stock-link', body, { timeout: 20000 }).then(r => r.data)
 
 // 주간 재고 리포트
 export const createWeeklyReport = (params: { token: string; location_ids?: string; report_date?: string }) =>
@@ -915,6 +933,8 @@ export interface OrderPlanColumns {
 export interface RawBreakdownEntry {
   by_date: Record<string, number>
   by_channel: Record<string, number>
+  // 거래처×날짜 교차 분해 — 월별 캘린더 거래처 필터용 (구버전 데이터엔 없을 수 있음)
+  by_channel_date?: Record<string, Record<string, number>>
   total: number
   had_bundle?: boolean
   bundle_count?: number
@@ -1143,6 +1163,100 @@ export const getReceivingCompare = (
     channel: opts.channel ?? '',
   } }).then(r => r.data)
 
+// ── 재고 분석 (재고수량 · 회전율 · 부진재고) ──────────────────
+export interface InventoryItemRow {
+  key: string
+  name: string
+  bh_skus: string[]
+  ob_codes: string[]
+  bh_stock: number
+  ob_total: number | null
+  ob_available: number | null
+  ob_unusable: number | null
+  in_qty?: number | null        // 기간 입고량 (입고 조회 실패 시 null)
+  begin_stock?: number | null   // 역산 기초재고 = 현재고 + 기간출고 − 기간입고
+  avg_stock?: number | null     // 기간 평균재고 = (기초 + 현재고) ÷ 2 — 회전율 분모
+  out_qty: number
+  daily_avg: number
+  monthly_avg: number
+  turnover: number | null
+  deplete_months: number | null
+  last_out: string | null
+  days_since_out: number | null
+  status: 'ok' | 'low' | 'slow' | 'no_stock'
+  partners: { partner: string; qty: number; share: number }[]
+  lots: { code: string; expiration_date: string; total: number; available: number; unavail: number }[]
+}
+export interface InventoryPartnerRow {
+  partner: string
+  out_qty: number
+  share: number
+  daily_avg: number
+  monthly_avg: number
+  item_count: number
+  alloc_stock: number
+  turnover: number | null
+  items: { key: string; name: string; qty: number; stock: number }[]
+}
+export interface InventoryAnalysisResult {
+  from_date: string
+  to_date: string
+  days_span: number
+  slow_days: number
+  low_turnover: number
+  avg_basis?: 'average' | 'current'  // 회전율 분모 기준 (입고 조회 실패 시 'current' 폴백)
+  expand_sets?: boolean              // 세트→단품 분해 적용 여부
+  set_expanded_out?: number          // 단품으로 분해된 세트 출고 수량 (안내용)
+  ob_enabled: boolean
+  errors: string[]
+  excluded_partners: string[]
+  excluded_out_qty: number
+  items: InventoryItemRow[]
+  partners: InventoryPartnerRow[]
+  summary: {
+    item_count: number
+    total_bh_stock: number
+    total_avg_stock?: number
+    total_ob_total: number
+    total_ob_available: number
+    total_out: number
+    monthly_avg: number
+    overall_turnover: number | null
+    slow_count: number
+    low_count: number
+    partner_count: number
+    tx_count: number
+  }
+}
+export const getInventoryAnalysis = (params: {
+  token: string
+  from_date: string
+  to_date: string
+  location_ids?: string
+  slow_days?: number
+  low_turnover?: number
+  expand_sets?: boolean
+}): Promise<InventoryAnalysisResult> =>
+  api.get('/inventory/analysis', { params, timeout: 600000 }).then(r => r.data)
+
+// 마지막 분석 결과 스냅샷 (앱 재시작 후 복원용)
+export const getLastInventoryAnalysis = (): Promise<{ saved_at: string | null; result: InventoryAnalysisResult | null }> =>
+  api.get('/inventory/analysis/last').then(r => r.data)
+
+export const getExcludedPartners = (): Promise<{ partners: string[] }> =>
+  api.get('/inventory/excluded-partners').then(r => r.data)
+export const setExcludedPartners = (partners: string[]): Promise<{ ok: boolean; partners: string[] }> =>
+  api.post('/inventory/excluded-partners', { partners }).then(r => r.data)
+
+// ── 경영진 요약 보고서 (자동 생성 + 수기 수정본 저장) ─────────────
+export interface ExecReportSaved { text: string | null; updated_at: string | null }
+export const getExecReport = (page: string): Promise<ExecReportSaved> =>
+  api.get(`/exec-report/${page}`).then(r => r.data)
+export const saveExecReport = (page: string, text: string): Promise<ExecReportSaved> =>
+  api.put(`/exec-report/${page}`, { text }).then(r => r.data)
+export const resetExecReport = (page: string): Promise<{ ok: boolean }> =>
+  api.delete(`/exec-report/${page}`).then(r => r.data)
+
 // ── Helpers ──────────────────────────────────────────────────
 export function base64ToBlob(b64: string, mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'): Blob {
   const bin = atob(b64)
@@ -1159,5 +1273,85 @@ export function downloadBlob(blob: Blob, filename: string) {
   a.click()
   URL.revokeObjectURL(url)
 }
+
+// ── 쿠팡 발주 보고 ───────────────────────────────────────────
+export interface CpItem { label: string; qty: number; order_qty?: number; short_vs_order?: number; conf: number; conf_avail: boolean; recv: number | null; amt: number; names: string[]; skus: string[]; deliverable?: number | null; shortage?: number | null }
+export interface CpGroup { date: string; md: string; qty: number; order_qty?: number; short_vs_order?: number; conf: number; conf_avail: boolean; recv: number | null; amt: number; supply: number; po_count: number; items: CpItem[]; status: 'pending' | 'past'; need?: number; deliverable?: number; shortage?: number; fulfil_rate?: number; has_unknown?: boolean }
+export interface CpLabelQty { label: string; qty: number }
+export interface CpStockRow { label: string; skus: string[]; stock: number | null; basis: 'ob' | 'bh' | null; bh_stock: number | null; ob_available: number | null; ob_total: number | null; ob_unavailable: number | null; pending: number; gap: number | null; status: 'ok' | 'short' | 'out' | 'none' | 'unmapped' }
+export interface CpTrendRow {
+  label: string; names: string[]; sales_series: number[]; stock_series: number[]
+  sales_7d: number; avg_7d: number; avg_prev_7d: number | null; trend_pct: number | null
+  stock_last: number | null; stock_first: number | null; stock_delta: number | null; days_of_supply: number | null
+  forecast_weekly: number[] | null; forecast_next: number | null
+  // 월별(올리브영) 전용
+  amount_series?: number[]; sales_store?: number; sales_online?: number; sales_amount?: number
+  stock_center?: number; stock_store?: number; cost?: number; price?: number; promo?: string
+}
+export interface CpIncoming { id: string; label: string; qty: number; date: string; md?: string; memo: string; applied?: boolean; unknown?: boolean }
+export interface CpUploads {
+  mode?: 'daily' | 'monthly'; months?: string[]
+  rocket_days: number; rocket_range: [string, string] | null
+  forecast: { filename: string; uploaded_at: string; weeks: { from: string; to: string }[] } | null
+  files: { filename: string; uploaded_at: string; type: string; period?: string }[]
+}
+export interface CoupangReportSummary {
+  channel: 'coupang' | 'oliveyoung' | 'kurly'; channel_name: string; has_conf: boolean; conf_word?: string; amt_includes_vat?: boolean; has_amt?: boolean; has_recv?: boolean; recv_word: string; upload_mode: 'daily' | 'monthly' | 'none'
+  as_of: string; as_of_md: string; month: string; month_label: string
+  last_ingested_at: string; bh_connected: boolean; bh_stock_cached_at: string | null
+  orders: { po_count: number; qty: number; order_qty?: number; short_vs_order?: number; conf: number; amt: number; supply: number; conf_avail: boolean; conf_diff: number; groups: CpGroup[]; core: { label: string; qty: number; conf: number }[] }
+  delivery: {
+    groups: CpGroup[]; recv_month: number; recv_by_label: CpLabelQty[]
+    ship_total: number; ship_today: number; ship_supply: number; ship_priced_qty: number; recv_supply: number; unbilled_supply: number; billed_supply: number
+    ship_from?: string; bh_ship_total?: number; bh_ship_supply?: number; delivered_by_label?: CpLabelQty[]; unbilled_by_group?: { md: string; date: string; qty: number; supply: number }[]
+    ship_by_label: (CpLabelQty & { supply: number })[]; ship_today_by_label: CpLabelQty[]
+    ship_by_date: { date: string; md: string; qty: number; supply: number; items: CpLabelQty[] }[]
+  }
+  stock: CpStockRow[]
+  stock_basis: 'ob' | 'bh'
+  ob_connected: boolean
+  ob_error: string
+  fulfil: { deliverable: number; shortage: number; need: number; rate: number; leftover: CpLabelQty[]; short_by_label: CpLabelQty[]; incoming: CpIncoming[]; incoming_total: number }
+  trend: { mode: 'daily' | 'monthly'; days: string[]; months?: string[]; latest?: string; elapsed_days?: number; period_label?: string; total_sales?: number; total_amount?: number; total_sales_prev?: number | null; weeks: { from: string; to: string }[]; rows: CpTrendRow[]; has_rocket: boolean; has_forecast: boolean }
+  uploads: CpUploads
+  notes: string
+  all_groups: { date: string; md: string; qty: number; amt: number; supply: number; status: string }[]
+  text: string
+  text_detail: string
+}
+export type ChannelReportBase = '/coupang-report' | '/oliveyoung-report' | '/kurly-report'
+export const getCoupangReport = (asOf?: string, month?: string, refreshBh = false, base: ChannelReportBase = '/coupang-report'): Promise<CoupangReportSummary> =>
+  api.get(`${base}/summary`, { params: { as_of: asOf || '', month: month || '', refresh_bh: refreshBh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
+export const uploadCoupangReportFiles = (files: File[], base: ChannelReportBase = '/coupang-report', period?: string): Promise<{ added: { filename: string; type: string }[]; errors: string[]; uploads: CpUploads }> => {
+  const fd = new FormData()
+  files.forEach(f => fd.append('files', f, f.name))
+  if (period) fd.append('period', period)
+  return api.post(`${base}/upload`, fd, { timeout: 120000 }).then(r => r.data)
+}
+export const clearCoupangReportUploads = (base: ChannelReportBase = '/coupang-report'): Promise<{ ok: boolean }> =>
+  api.post(`${base}/upload/clear`, {}).then(r => r.data)
+export const saveCoupangReportNotes = (notes: string, base: ChannelReportBase = '/coupang-report'): Promise<{ notes: string; updated_at: string }> =>
+  api.put(`${base}/notes`, { notes }).then(r => r.data)
+export const getCoupangReportAliases = (base: ChannelReportBase = '/coupang-report'): Promise<{ defaults: Record<string, string>; overrides: Record<string, string> }> =>
+  api.get(`${base}/aliases`).then(r => r.data)
+export const saveCoupangReportAliases = (aliases: Record<string, string>, base: ChannelReportBase = '/coupang-report'): Promise<{ ok: boolean }> =>
+  api.put(`${base}/aliases`, { aliases }).then(r => r.data)
+export const saveCoupangIncoming = (row: { id?: string; label: string; qty: number; date: string; memo?: string }, base: ChannelReportBase = '/coupang-report'): Promise<{ incoming: CpIncoming[] }> =>
+  api.post(`${base}/incoming`, row).then(r => r.data)
+export const deleteCoupangIncoming = (id: string, base: ChannelReportBase = '/coupang-report'): Promise<{ incoming: CpIncoming[] }> =>
+  api.delete(`${base}/incoming/${id}`).then(r => r.data)
+
+// ── 발주 캘린더 저장소 백업/복원 ─────────────────────────────
+export interface PlanBackup { name: string; ts: string; reason: string; size: number; mtime: number; source: 'local' | 'mirror'; files: number | null; rows: number | null }
+export interface PlanBackupInfo {
+  current: { files: number; rows: number; path: string; mtime: number | null }
+  backups: PlanBackup[]
+  mirrors: { dir: string; exists: boolean; mtime: number | null }[]
+  backup_dir: string
+}
+export const listPlanBackups = (): Promise<PlanBackupInfo> => api.get('/order-plan/plan/backups').then(r => r.data)
+export const backupPlanNow = (): Promise<{ ok: boolean; path: string | null }> => api.post('/order-plan/plan/backups/now', {}).then(r => r.data)
+export const restorePlanBackup = (name: string): Promise<OrderPlanResult & { restored_from: string }> =>
+  api.post('/order-plan/plan/backups/restore', { name }).then(r => r.data)
 
 export default api

@@ -178,30 +178,78 @@ def _clean_pdf_text(s) -> str:
     return s
 
 
-def _is_kurly_pdf(pdf_bytes: bytes) -> bool:
-    """컬리 PDF는 '발주코드'·'입고일'·'마스터코드'·'총수량'·'Kurly' 같은 라벨이 있음."""
+_OCR_CACHE: dict = {}
+
+
+def _kurly_ocr(pdf_bytes: bytes, filename: str = "") -> dict:
+    """이미지(스캔형) 컬리 거래명세서 → kurly_label의 winocr 파서 재사용. 데이터 해시로 캐시."""
+    import hashlib
+    key = hashlib.md5(pdf_bytes).hexdigest()
+    if key in _OCR_CACHE:
+        return _OCR_CACHE[key]
+    try:
+        from routers.kurly_label import _ocr_parse_kurly
+        # winocr는 내부에서 asyncio.run을 쓰므로, FastAPI async 엔드포인트(이벤트 루프 실행 중)에서는
+        # 별도 스레드에서 돌려야 한다.
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+        if in_loop:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                res = ex.submit(_ocr_parse_kurly, pdf_bytes, filename or "").result()
+        else:
+            res = _ocr_parse_kurly(pdf_bytes, filename or "")
+    except Exception:
+        res = {}
+    if len(_OCR_CACHE) > 50:
+        _OCR_CACHE.clear()
+    _OCR_CACHE[key] = res
+    return res
+
+
+def _pdf_text(pdf_bytes: bytes) -> str:
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "".join((p.extract_text() or "") for p in pdf.pages)
-        text = text.replace("\x00", " ")
-        hits = sum(1 for kw in ("발주코드", "입고일", "마스터코드", "총수량", "Kurly", "컬리") if kw in text)
-        return hits >= 2
+        return text.replace("\x00", " ")
     except Exception:
-        return False
+        return ""
 
 
-def _parse_kurly(pdf_bytes: bytes) -> tuple:
-    """컬리 거래명세서 PDF → ([{name, qty, barcode}], delivery_date | None)."""
+def _is_kurly_pdf(pdf_bytes: bytes, filename: str = "") -> bool:
+    """컬리 PDF는 '발주코드'·'입고일'·'마스터코드'·'총수량'·'Kurly' 같은 라벨이 있음.
+    텍스트 레이어가 없는 이미지 PDF(2026-08 신규 양식)는 OCR로 품목이 읽히면 컬리로 인식."""
+    text = _pdf_text(pdf_bytes)
+    hits = sum(1 for kw in ("발주코드", "입고일", "마스터코드", "총수량", "Kurly", "컬리") if kw in text)
+    if hits >= 2:
+        return True
+    if not text.strip():
+        return bool((_kurly_ocr(pdf_bytes, filename) or {}).get("items"))
+    return False
+
+
+def _parse_kurly(pdf_bytes: bytes, filename: str = "") -> tuple:
+    """컬리 거래명세서 PDF → ([{name, qty, barcode}], delivery_date | None, po_no | "").
+    텍스트 PDF는 pdfplumber, 이미지 PDF는 OCR 폴백(kurly_label._ocr_parse_kurly)."""
     import pdfplumber
     items = []
     delivery_date = None
+    po_no = ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
         full_text = full_text.replace("\x00", " ")
         m = re.search(r"입고일\s*[:：]?\s*(\d{4})[\-/.]\s*(\d{1,2})[\-/.]\s*(\d{1,2})", full_text)
         if m:
             delivery_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        # 발주코드 — 입고일이 변경된 재발행 명세서를 같은 발주로 식별하는 키
+        mo = re.search(r"발주코드\s*[:：]?\s*([A-Za-z0-9_\-]+)", full_text)
+        if mo:
+            po_no = mo.group(1)
 
         for page in pdf.pages:
             for tbl in (page.extract_tables() or []):
@@ -228,7 +276,14 @@ def _parse_kurly(pdf_bytes: bytes) -> tuple:
                         continue
                     barcode = _clean_pdf_text(row[barcode_idx]) if barcode_idx is not None and barcode_idx < len(row) else ""
                     items.append({"name": name, "qty": qty, "barcode": barcode})
-    return items, delivery_date
+    if not items:
+        ocr = _kurly_ocr(pdf_bytes, filename) or {}
+        if ocr.get("items"):
+            items = [{"name": it["name"], "qty": int(it["total"]), "barcode": "", "code": it.get("code", "")}
+                     for it in ocr["items"] if int(it.get("total") or 0) > 0]
+            delivery_date = delivery_date or (ocr.get("date") or None)
+            po_no = po_no or ocr.get("orderCode") or ""
+    return items, delivery_date, po_no
 
 
 def _is_coupang_format(df_raw: pd.DataFrame) -> bool:
@@ -288,6 +343,9 @@ def _parse_coupang(df_raw: pd.DataFrame) -> tuple:
         # ('업체납품가능수량'과 혼동 주의, 구양식 대비 '확정수량'도 fallback)
         recv_idx = next((k for k, c in enumerate(header)
                          if "입고수량" in c and "가능" not in c), None)
+        # 확정수량 — 쿠팡이 확정한 '업체납품가능수량' (발주수량과 다를 수 있음, 보고서용)
+        conf_idx = next((k for k, c in enumerate(header)
+                         if "납품가능수량" in c or "확정수량" in c), None)
         if recv_idx is None:
             recv_idx = next((k for k, c in enumerate(header)
                              if "확정" in c and "수량" in c and "발주" not in c), None)
@@ -332,7 +390,15 @@ def _parse_coupang(df_raw: pd.DataFrame) -> tuple:
                             recv = int(float(rv))
                         except (TypeError, ValueError):
                             recv = None
-                items.append({"name": str(name_v).strip(), "qty": q, "recv": recv,
+                conf = None
+                if conf_idx is not None and conf_idx < len(row):
+                    cv = row.iat[conf_idx]
+                    if pd.notna(cv):
+                        try:
+                            conf = int(float(str(cv).replace(",", "")))
+                        except (TypeError, ValueError):
+                            conf = None
+                items.append({"name": str(name_v).strip(), "qty": q, "recv": recv, "conf": conf,
                               "amt": _amt_at(row, amt_idx), "recv_amt": _amt_at(row, recv_amt_idx)})
     return items, delivery_date
 
@@ -454,8 +520,8 @@ async def detect_columns(order_file: UploadFile = File(...)):
     # PDF (컬리 거래명세서) 자동 인식
     is_pdf = filename.lower().endswith(".pdf") or data[:4] == b"%PDF"
     if is_pdf:
-        if _is_kurly_pdf(data):
-            items, delivery_date = _parse_kurly(data)
+        if _is_kurly_pdf(data, filename):
+            items, delivery_date, _ = _parse_kurly(data, filename)
             return {
                 "format": "kurly",
                 "columns": [],
@@ -664,9 +730,13 @@ async def aggregate_plan(
         rb = entry["raw_breakdown"].setdefault(original_raw, {
             "by_date": {}, "by_channel": {}, "total": 0,
             "had_bundle": False, "bundle_count": 1,
+            # 거래처×날짜 교차 분해 — 프론트 월별 캘린더의 거래처 필터용
+            "by_channel_date": {},
         })
         rb["by_date"][date_str] = rb["by_date"].get(date_str, 0) + effective_qty
         rb["by_channel"][channel] = rb["by_channel"].get(channel, 0) + effective_qty
+        cd = rb["by_channel_date"].setdefault(channel, {})
+        cd[date_str] = cd.get(date_str, 0) + effective_qty
         rb["total"] += effective_qty
         if bundle_count > 1:
             rb["had_bundle"] = True
@@ -706,7 +776,7 @@ async def aggregate_plan(
                 file_qty += int(it["qty"])
         elif fmt == "kurly":
             try:
-                items, delivery_date = _parse_kurly(data)
+                items, delivery_date, _ = _parse_kurly(data, fname)
             except Exception as e:
                 errors.append(f"{fname}: PDF 읽기 오류 {e}")
                 continue
@@ -834,7 +904,149 @@ _PLAN_STORE_PATH = os.path.join(
 # v5: 발주금액·입고금액 파싱 추가
 # v6: 일반 양식 단가 기반 금액 계산 (올리브영 원단가×납품수량 등)
 # v7: 원가금액을 발주금액으로 오인하던 것 수정 (원가금액 = 납품 기준 → 입고금액)
-_PARSER_VER = 7
+# v8: 컬리 행에 발주번호(발주코드) 포함 — 입고일 변경 재발행 시 자동 대체
+# v9: 쿠팡 확정수량(업체납품가능수량) 파싱 추가 — 쿠팡 발주 보고서용
+# v10: 일반 양식(올리브영 납품확인서 등) '납품예정수량'/'확정수량' 컬럼 → conf (실제 납품 대상 수량)
+_PARSER_VER = 10
+
+
+# ─────────────────────────────────────────────────────────────────
+# 영구 보존 장치 — 저장할 때마다 스냅샷 + OneDrive 미러 + 손상/유실 시 자동 복원
+#   1) 로컬 스냅샷: backend/data/backups/order_plan/order_plan_store_<시각>_<사유>.json
+#      (최근 30일은 전부, 그 이전은 하루 1개 보존, 최소 20개는 항상 유지)
+#   2) 클라우드 미러: OneDrive/문서/출고변환_백업/ 에 최신본 + 일자별 사본 (PC 손실 대비)
+#   3) 로드 시 파일이 없거나 깨졌으면 가장 최근 스냅샷(로컬 → OneDrive)에서 자동 복원
+#   4) 빈 저장소 덮어쓰기 방지: 파일 수가 0으로 줄어드는 저장은 사유가 clear가 아니면 거부
+# ─────────────────────────────────────────────────────────────────
+_BACKUP_DIR = os.path.join(os.path.dirname(_PLAN_STORE_PATH), "backups", "order_plan")
+_MIRROR_DIRS = [
+    os.path.join(os.path.expanduser("~"), "OneDrive", "문서", "출고변환_백업"),
+]
+_BACKUP_KEEP_ALL_DAYS = 30
+_BACKUP_MIN_KEEP = 20
+_BACKUP_NAME_RE = re.compile(r"order_plan_store_(\d{8}_\d{6})(?:_([^.]+))?\.json$")
+
+
+def _store_summary(data: dict) -> tuple:
+    files = (data or {}).get("files", {}) or {}
+    return len(files), sum(len(f.get("rows", [])) for f in files.values())
+
+
+def _list_backups() -> list:
+    """스냅샷 목록 (최신순) — [{name, path, ts, reason, size, mtime, source}]"""
+    out = []
+    seen = set()
+    for src, d in [("local", _BACKUP_DIR)] + [("mirror", m) for m in _MIRROR_DIRS]:
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            m = _BACKUP_NAME_RE.match(fn)
+            if not m or fn in seen:
+                continue
+            seen.add(fn)
+            path = os.path.join(d, fn)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out.append({"name": fn, "path": path, "ts": m.group(1), "reason": m.group(2) or "",
+                        "size": st.st_size, "mtime": st.st_mtime, "source": src})
+    out.sort(key=lambda x: (x["ts"], x["mtime"]), reverse=True)
+    return out
+
+
+def _rotate_backups() -> None:
+    """최근 30일은 전부, 그 이전은 하루 1개(그날 마지막)만 남긴다. 최소 20개는 항상 보존."""
+    from datetime import datetime as _dt, timedelta as _td
+    items = [b for b in _list_backups() if b["source"] == "local"]
+    if len(items) <= _BACKUP_MIN_KEEP:
+        return
+    cutoff = (_dt.now() - _td(days=_BACKUP_KEEP_ALL_DAYS)).strftime("%Y%m%d")
+    keep_days: set = set()
+    for b in list(items):  # 최신순 → 그 날의 첫 항목(=가장 늦은 시각)만 남김
+        day = b["ts"][:8]
+        if day >= cutoff:
+            continue
+        if day in keep_days and len(items) > _BACKUP_MIN_KEEP:
+            try:
+                os.remove(b["path"])
+                items.remove(b)
+            except OSError:
+                pass
+        else:
+            keep_days.add(day)
+
+
+def _mirror_latest() -> None:
+    import shutil
+    from datetime import datetime as _dt
+    day = _dt.now().strftime("%Y%m%d")
+    for md in _MIRROR_DIRS:
+        try:
+            os.makedirs(md, exist_ok=True)
+            shutil.copy2(_PLAN_STORE_PATH, os.path.join(md, "order_plan_store.json"))
+            shutil.copy2(_PLAN_STORE_PATH, os.path.join(md, f"order_plan_store_{day}_000000_daily.json"))
+        except OSError:
+            pass
+
+
+def _backup_plan_store(reason: str = "save") -> Optional[str]:
+    """현재 저장소 파일을 스냅샷으로 복사 + OneDrive 미러. 반환: 스냅샷 경로(없으면 None)."""
+    import shutil
+    from datetime import datetime as _dt
+    if not os.path.exists(_PLAN_STORE_PATH):
+        return None
+    try:
+        with open(_PLAN_STORE_PATH, "r", encoding="utf-8") as f:
+            cur = json.load(f)
+        if not (isinstance(cur, dict) and isinstance(cur.get("files"), dict)):
+            return None
+    except Exception:
+        return None  # 깨진 파일은 스냅샷 대상이 아님 (정상 스냅샷을 덮지 않음)
+    reason = re.sub(r"[^0-9A-Za-z가-힣_-]", "", reason or "save")[:24] or "save"
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    dest = None
+    try:
+        os.makedirs(_BACKUP_DIR, exist_ok=True)
+        dest = os.path.join(_BACKUP_DIR, f"order_plan_store_{ts}_{reason}.json")
+        shutil.copy2(_PLAN_STORE_PATH, dest)
+        _rotate_backups()
+    except OSError:
+        dest = None
+    _mirror_latest()
+    return dest
+
+
+def _restore_from_backup(name: str = "") -> Optional[dict]:
+    """스냅샷에서 저장소 복원. name 미지정 시 가장 최근 정상(비어있지 않은) 스냅샷 (로컬 → 미러)."""
+    import shutil
+    cands = _list_backups()
+    if name:
+        cands = [b for b in cands if b["name"] == name]
+    else:
+        # 미러의 '최신본'(마지막 저장 직후 사본)이 스냅샷(저장 직전본)보다 최신이므로 먼저 시도
+        for md in _MIRROR_DIRS:
+            lp = os.path.join(md, "order_plan_store.json")
+            if os.path.exists(lp):
+                cands.insert(0, {"name": "order_plan_store.json", "path": lp, "source": "mirror-latest"})
+    for b in cands:
+        try:
+            with open(b["path"], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("files"), dict) and (name or data["files"]):
+                if os.path.exists(_PLAN_STORE_PATH):
+                    _backup_plan_store("before-restore")
+                os.makedirs(os.path.dirname(_PLAN_STORE_PATH), exist_ok=True)
+                shutil.copy2(b["path"], _PLAN_STORE_PATH)
+                try:
+                    state.add_log("warning", "발주 캘린더 저장소 복원",
+                                  f"{b['name']} ({b['source']})에서 복원", source="order_plan")
+                except Exception:
+                    pass
+                return data
+        except Exception:
+            continue
+    return None
 
 
 def _load_plan_store() -> dict:
@@ -844,25 +1056,50 @@ def _load_plan_store() -> dict:
             if isinstance(data, dict) and isinstance(data.get("files"), dict):
                 return data
     except FileNotFoundError:
-        pass
+        restored = _restore_from_backup()
+        if restored is not None:
+            return restored
     except json.JSONDecodeError:
-        # 파일이 있는데 깨진 경우 — 덮어쓰기로 데이터가 사라지지 않게 손상본 보존
+        # 파일이 있는데 깨진 경우 — 손상본을 보존해 두고 최근 스냅샷에서 자동 복원
         try:
             from datetime import datetime as _dt
             os.replace(_PLAN_STORE_PATH,
                        _PLAN_STORE_PATH + ".corrupt-" + _dt.now().strftime("%Y%m%d%H%M%S"))
         except OSError:
             pass
+        restored = _restore_from_backup()
+        if restored is not None:
+            return restored
     return {"files": {}}
 
 
-def _save_plan_store(data: dict) -> None:
-    """임시 파일에 쓴 뒤 교체 (원자적) — 저장 도중 프로세스가 죽어도 기존 파일 보존."""
+def _save_plan_store(data: dict, reason: str = "save") -> None:
+    """원자적 저장 — 저장 직전 현재본을 스냅샷(+OneDrive 미러)으로 남기고 임시 파일에 쓴 뒤 교체.
+    파일 수가 0으로 줄어드는 저장은 사유가 'clear'가 아니면 거부 (빈 저장소 덮어쓰기 사고 방지)."""
+    new_files, _ = _store_summary(data)
+    if new_files == 0 and reason != "clear" and os.path.exists(_PLAN_STORE_PATH):
+        try:
+            with open(_PLAN_STORE_PATH, "r", encoding="utf-8") as f:
+                old_files, _r = _store_summary(json.load(f))
+        except Exception:
+            old_files = 0
+        if old_files > 0:
+            raise HTTPException(409, f"발주 저장소가 비워지는 저장은 차단됨 (기존 {old_files}개 파일). "
+                                     "전체 초기화는 발주 캘린더의 '전체 초기화' 버튼으로만 가능합니다.")
+    _backup_plan_store(reason)
     os.makedirs(os.path.dirname(_PLAN_STORE_PATH), exist_ok=True)
     tmp = _PLAN_STORE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, _PLAN_STORE_PATH)
+    _mirror_latest()  # 미러 최신본 = 현재본
+
+
+# 서버 기동 시 1회 스냅샷 (그날 기동 기록 + 미러 갱신)
+try:
+    _backup_plan_store("startup")
+except Exception:
+    pass
 
 
 def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
@@ -904,11 +1141,11 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
             po_no = m2.group(1) if m2 else ""
         for it in items:
             rows.append({"name": str(it["name"]).strip(), "qty": int(it["qty"]), "date": delivery_date,
-                         "barcode": "", "recv": it.get("recv"), "po": po_no,
+                         "barcode": "", "recv": it.get("recv"), "conf": it.get("conf"), "po": po_no,
                          "amt": it.get("amt"), "recv_amt": it.get("recv_amt")})
     elif fmt == "kurly":
         try:
-            items, delivery_date = _parse_kurly(data)
+            items, delivery_date, po_no = _parse_kurly(data, fname)
         except Exception as e:
             return [], channel, fmt, 0, [f"{fname}: PDF 읽기 오류 {e}"]
         if not delivery_date:
@@ -917,7 +1154,7 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
             return [], channel, fmt, 0, [f"{fname}: 입고일 없음 — 매핑에서 날짜 지정 필요"]
         for it in items:
             rows.append({"name": str(it["name"]).strip(), "qty": int(it["qty"]), "date": delivery_date,
-                         "barcode": it.get("barcode", ""), "recv": None})
+                         "barcode": it.get("barcode", ""), "recv": None, "po": po_no})
     else:
         date_col = m.get("date_col"); name_col = m.get("name_col"); qty_col = m.get("qty_col")
         recv_col = m.get("recv_col") or ""   # 확정 입고 수량 컬럼 (선택)
@@ -932,6 +1169,10 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
             return [], channel, fmt, 0, [f"{fname}: 컬럼 없음 {missing}"]
         if recv_col and recv_col not in df.columns:
             recv_col = ""
+        # 납품예정(확정) 수량 컬럼 — 올리브영 납품확인서 '납품예정수량' 등. 발주수량과 다를 수 있어 별도 저장
+        conf_col = next((c for c in df.columns
+                         if any(k in str(c).replace("\n", "").replace(" ", "") for k in ("납품예정수량", "확정수량"))
+                         and c not in (qty_col, recv_col)), "")
         # 금액 컬럼 자동 감지 — 발주 기준이 명확한 컬럼만 발주금액으로 사용.
         # (올리브영 '원가금액'은 납품수량 기준 금액이라 발주금액으로 쓰면 안 됨 → 단가×수량으로 계산)
         amt_col = next((c for c in df.columns
@@ -993,8 +1234,16 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
                 amt = int(round(price * qty))
             if recv_amt is None and price is not None and recv is not None:
                 recv_amt = int(round(price * recv))
+            conf = None
+            if conf_col:
+                cv = row.get(conf_col)
+                if cv is not None and not (isinstance(cv, float) and pd.isna(cv)):
+                    try:
+                        conf = int(float(str(cv).replace(",", "")))
+                    except (TypeError, ValueError):
+                        conf = None
             rows.append({"name": str(raw_name).strip(), "qty": qty, "date": date_str,
-                         "barcode": "", "recv": recv, "amt": amt, "recv_amt": recv_amt})
+                         "barcode": "", "recv": recv, "conf": conf, "amt": amt, "recv_amt": recv_amt})
     return rows, channel, fmt, skipped, []
 
 
@@ -1261,7 +1510,7 @@ async def ingest_plan(
             "content_hash": content_hash, "rows_hash": rows_hash, "parser_ver": _PARSER_VER,
         }
         added.append(fname)
-    _save_plan_store(store)
+    _save_plan_store(store, reason="ingest")
     result = _build_plan_result(threshold, use_master, split_bundles)
     result["errors"] = errors
     result["added"] = added
@@ -1300,15 +1549,60 @@ def remove_plan_file(payload: PlanRemoveIn, threshold: int = 70, use_master: int
     store = _load_plan_store()
     if payload.filename in store.get("files", {}):
         del store["files"][payload.filename]
-        _save_plan_store(store)
+        _save_plan_store(store, reason="remove")
     return _build_plan_result(threshold, use_master, split_bundles)
 
 
 @router.post("/plan/clear")
 def clear_plan():
     """누적 발주 전체 초기화."""
-    _save_plan_store({"files": {}})
+    _save_plan_store({"files": {}}, reason="clear")
     return {"ok": True}
+
+
+@router.get("/plan/backups")
+def list_plan_backups():
+    """스냅샷 목록 + 현재 저장소 요약 + 미러 상태."""
+    cur = _load_plan_store()
+    files, rows = _store_summary(cur)
+    backs = _list_backups()
+    for b in backs:
+        try:
+            with open(b["path"], "r", encoding="utf-8") as f:
+                d = json.load(f)
+            b["files"], b["rows"] = _store_summary(d)
+        except Exception:
+            b["files"], b["rows"] = None, None
+        b.pop("path", None)
+    mirrors = []
+    for md in _MIRROR_DIRS:
+        p = os.path.join(md, "order_plan_store.json")
+        mirrors.append({"dir": md, "exists": os.path.exists(p),
+                        "mtime": (os.path.getmtime(p) if os.path.exists(p) else None)})
+    return {"current": {"files": files, "rows": rows, "path": _PLAN_STORE_PATH,
+                        "mtime": (os.path.getmtime(_PLAN_STORE_PATH) if os.path.exists(_PLAN_STORE_PATH) else None)},
+            "backups": backs, "mirrors": mirrors, "backup_dir": _BACKUP_DIR}
+
+
+@router.post("/plan/backups/now")
+def backup_plan_now():
+    dest = _backup_plan_store("manual")
+    return {"ok": dest is not None, "path": dest}
+
+
+class PlanRestoreIn(BaseModel):
+    name: str
+
+
+@router.post("/plan/backups/restore")
+def restore_plan_backup(payload: PlanRestoreIn, threshold: int = 70, use_master: int = 1, split_bundles: int = 1):
+    """지정 스냅샷으로 저장소를 되돌린다 (되돌리기 직전 현재본도 스냅샷으로 남김)."""
+    data = _restore_from_backup(payload.name)
+    if data is None:
+        raise HTTPException(404, "해당 스냅샷을 찾을 수 없거나 읽을 수 없습니다")
+    result = _build_plan_result(threshold, use_master, split_bundles)
+    result["restored_from"] = payload.name
+    return result
 
 
 class PlanClearDateIn(BaseModel):
@@ -1341,7 +1635,7 @@ def clear_plan_date(payload: PlanClearDateIn, threshold: int = 70, use_master: i
         else:
             del store["files"][fname]
             emptied_files.append(fname)
-    _save_plan_store(store)
+    _save_plan_store(store, reason="clear-date")
     result = _build_plan_result(threshold, use_master, split_bundles)
     result["cleared_date"] = target
     result["removed_rows"] = removed_rows
@@ -1393,7 +1687,7 @@ def coupang_sync(payload: CoupangSyncIn, threshold: int = 70, use_master: int = 
         "rows_count": len(rows), "qty": sum(int(r["qty"]) for r in rows),
         "skipped": 0, "ingested_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    _save_plan_store(store)
+    _save_plan_store(store, reason="coupang-sync")
     result = _build_plan_result(threshold, use_master, split_bundles)
     result["added"] = [vfname]
     result["synced_rows"] = len(rows)

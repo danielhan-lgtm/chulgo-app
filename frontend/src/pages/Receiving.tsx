@@ -193,22 +193,23 @@ export default function Receiving({ config }: Props) {
 
   // ── 매핑 탭 로드 ──────────────────────────────────────────────────────────
   async function loadMappingPage() {
+    // 세 요청을 독립적으로 로드: 하나가 실패해도 나머지는 표시 (박스히어로 API 간헐 지연 대응)
     setMappingLoading(true)
     try {
-      const [maps, items] = await Promise.all([getMappings(), getBoxheroItemsForReceiving()])
-      setMappings(maps)
-      setBhItems(items)
+      setMappings(await getMappings())
     } catch (e: any) {
-      message.error('매핑 로드 실패: ' + (e.response?.data?.detail || e.message))
+      message.error('저장된 매핑 로드 실패: ' + (e.response?.data?.detail || e.message))
     } finally {
       setMappingLoading(false)
     }
-    // 아워박스 상품은 스크래핑 기반이라 느릴 수 있어 별도 로드 (실패해도 매핑/박스히어로는 표시)
-    try {
-      setOurboxProds(await getOurboxProductsForReceiving())
-    } catch (e: any) {
-      message.warning('아워박스 상품 로드 실패: ' + (e.response?.data?.detail || e.message))
-    }
+    const bhP = getBoxheroItemsForReceiving()
+      .then(items => setBhItems(items))
+      .catch((e: any) => message.warning('박스히어로 상품 로드 실패: ' + (e.response?.data?.detail || e.message)))
+    // 아워박스 상품은 스크래핑 기반이라 느릴 수 있음(~1분, 이후 서버 캐시)
+    const obP = getOurboxProductsForReceiving()
+      .then(prods => setOurboxProds(prods))
+      .catch((e: any) => message.warning('아워박스 상품 로드 실패: ' + (e.response?.data?.detail || e.message)))
+    await Promise.allSettled([bhP, obP])
   }
 
   function switchTab(key: TabKey) {

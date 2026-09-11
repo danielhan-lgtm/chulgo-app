@@ -29,14 +29,31 @@ def delete_transaction(token: str, tx_id: int) -> dict:
     return r.json() if r.content else {}
 
 
+def _get_with_retry(url: str, token: str, params: dict, tries: int = 3, timeout: int = 20):
+    """BoxHero API가 간헐적으로 지연/5xx를 내므로 타임아웃+재시도."""
+    import time
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=_headers(token), params=params, timeout=timeout)
+            if r.status_code >= 500 or r.status_code == 429:
+                raise requests.HTTPError(f"BoxHero {r.status_code}: {r.text[:200]}", response=r)
+            r.raise_for_status()
+            return r
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(1.5 * (i + 1))
+    raise last
+
+
 def fetch_all_items_list(token: str) -> list:
     items, cursor = [], None
     while True:
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
-        r = requests.get(f"{API_BASE}/items", headers=_headers(token), params=params)
-        r.raise_for_status()
+        r = _get_with_retry(f"{API_BASE}/items", token, params)
         data = r.json()
         items.extend(data.get("items", []))
         if not data.get("has_more"):

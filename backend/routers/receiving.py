@@ -234,21 +234,50 @@ def delete_mapping(prod_cd: str):
 
 # ─── 아워박스 / 박스히어로 상품 목록 ─────────────────────────────────────────
 
+# 아워박스 스크래핑(~60s)·박스히어로 API(간헐 지연)가 느려서 결과를 잠시 캐시.
+# ?refresh=1 로 강제 갱신.
+_list_cache: dict = {}   # key -> (ts, data)
+_LIST_TTL = 600
+
+
+def _cached(key: str, ttl: int, loader, refresh: bool = False):
+    import time
+    now = time.time()
+    hit = _list_cache.get(key)
+    if hit and not refresh and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        data = loader()
+    except Exception:
+        if hit:  # 갱신 실패 시 이전 값이라도 반환
+            return hit[1]
+        raise
+    _list_cache[key] = (now, data)
+    return data
+
+
 @router.get("/ourbox-products")
-def ourbox_products():
+def ourbox_products(refresh: bool = False):
     try:
         import ourbox_scraper
         cfg = _load_cfg()
-        prods = ourbox_scraper.fetch_all_ourbox_products(cfg.get("ourbox_id", ""), cfg.get("ourbox_pw", ""))
+        prods = _cached(
+            "ourbox_products", _LIST_TTL,
+            lambda: ourbox_scraper.fetch_all_ourbox_products(cfg.get("ourbox_id", ""), cfg.get("ourbox_pw", "")),
+            refresh,
+        )
         return {"data": prods, "total": len(prods)}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @router.get("/boxhero-items")
-def boxhero_items():
+def boxhero_items(refresh: bool = False):
     cfg = _load_cfg()
     token = cfg.get("api_token", "")
     if not token:
         raise HTTPException(400, "BoxHero API 토큰이 설정되지 않았습니다.")
-    return bh.fetch_all_items_list(token)
+    try:
+        return _cached("boxhero_items", _LIST_TTL, lambda: bh.fetch_all_items_list(token), refresh)
+    except Exception as e:
+        raise HTTPException(502, f"박스히어로 상품 조회 실패: {e}")

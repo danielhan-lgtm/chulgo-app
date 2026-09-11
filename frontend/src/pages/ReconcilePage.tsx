@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { Button, DatePicker, Radio, Table, Tabs, Tag, Alert, Spin, Row, Col, Select, Switch, Tooltip, Drawer, Empty, Modal, Badge, Slider, Input, message, Dropdown } from 'antd'
+import { Button, DatePicker, Radio, Table, Tabs, Tag, Alert, Spin, Row, Col, Select, Switch, Tooltip, Drawer, Empty, Modal, Badge, Slider, Input, InputNumber, message, Dropdown } from 'antd'
 import { SearchOutlined, WarningOutlined, RobotOutlined, CopyOutlined, ApartmentOutlined, TagsOutlined, SwapOutlined, ExportOutlined } from '@ant-design/icons'
 import type { AppConfig, ReconcileResult, ReconcileRow, ReconcileSummary } from '../types'
-import { getReconcile, analyzeReconcile, getLocations, getReconcileDetail, getReconcileMissing, getReconcileFullMatch, getReconcileQtyGap, getReconcileStock, getReconcileItemSearch, getSmartCompare, getMatchedPairs, createWeeklyReport, listWeeklyReports, getWeeklyReport, getStockDiffChange, getChannelFlow, getItemOutDecompose, getStockSnapshots, captureStockSnapshot, setReconcileStatus, clearReconcileStatus, getStockDiffTrace } from '../services/api'
+import { getReconcile, analyzeReconcile, getLocations, getReconcileDetail, getReconcileMissing, getReconcileFullMatch, getReconcileQtyGap, getReconcileStock, getReconcileItemSearch, getSmartCompare, getMatchedPairs, createWeeklyReport, listWeeklyReports, getWeeklyReport, getStockDiffChange, getChannelFlow, getItemOutDecompose, getStockSnapshots, captureStockSnapshot, setReconcileStatus, clearReconcileStatus, getStockDiffTrace, setManualStock, deleteManualStock, linkStockItems } from '../services/api'
 import type { StockDiffTrace } from '../services/api'
 import type { OutDecomp, StockSnap, ReconcileCleanupStatus } from '../services/api'
 import dayjs from 'dayjs'
@@ -568,6 +568,9 @@ export default function ReconcilePage({ config }: Props) {
   type StockFlow = { bh:{in:number;out:number;adjustment:number}; ob:{in:number;out:number;adjustment:number}; from?:string; to?:string }
   type StockRow = {
     name:string; sku:string; ob_code:string; ob_codes?:string[]; bh_skus?:string[]; bh_names?:string[]; ob_names?:string[]
+    key?:string                                    // 백엔드 병합 키 (수기 재고 저장용)
+    only_side?:'bh'|'ob'|null                      // 'bh'=BH에만 재고, 'ob'=OB에만 재고
+    manual?:{side:'bh'|'ob';qty:number;memo?:string;updated_at?:string}|null  // 적용된 수기 재고
     bh_stock:number|null; ob_stock_total:number|null; ob_stock_available:number|null
     ob_unusable?:number; diff:number|null; diff_vs_total?:number|null; diff_vs_available?:number|null; residual?:number|null; causes?:StockCause[]
     flow?:StockFlow  // 주간 리포트에서 미리 계산된 거래 분해
@@ -575,8 +578,77 @@ export default function ReconcilePage({ config }: Props) {
   }
   const [stockData, setStockData] = useState<{
     total: number; ok_count: number; diff_count: number; need_trace_count?: number
+    only_bh?: number; only_ob?: number
     rows: StockRow[]
   } | null>(null)
+
+  // 수기 재고 입력 모달 (부자재 등 한쪽에만 있는 상품)
+  const [manualRow, setManualRow] = useState<StockRow | null>(null)
+  const [manualQty, setManualQty] = useState<number | null>(null)
+  const [manualMemo, setManualMemo] = useState('')
+  const [manualSaving, setManualSaving] = useState(false)
+  function openManualInput(r: StockRow) {
+    setManualRow(r)
+    setManualQty(r.manual?.qty ?? (r.only_side === 'bh' ? r.bh_stock : r.ob_stock_total) ?? 0)
+    setManualMemo(r.manual?.memo || '')
+  }
+  async function saveManualStock() {
+    if (!manualRow?.key || manualQty === null) return
+    // side = 재고가 '없는' 쪽 (그쪽 수량을 수기로 채움)
+    const side: 'bh'|'ob' = manualRow.manual?.side ?? (manualRow.only_side === 'bh' ? 'ob' : 'bh')
+    setManualSaving(true)
+    try {
+      await setManualStock({ key: manualRow.key, name: manualRow.name, side, qty: manualQty, memo: manualMemo })
+      message.success('수기 재고가 저장되었습니다')
+      setManualRow(null)
+      await handleStock()
+    } catch { message.error('수기 재고 저장 실패') }
+    finally { setManualSaving(false) }
+  }
+  async function removeManualStock(r: StockRow) {
+    if (!r.key) return
+    try {
+      await deleteManualStock(r.key)
+      message.success('수기 재고가 삭제되었습니다')
+      await handleStock()
+    } catch { message.error('수기 재고 삭제 실패') }
+  }
+
+  // 드래그로 BH ↔ OB 품목 매칭 (name_mapping 영구 저장)
+  const [stockDragKey, setStockDragKey] = useState<string | null>(null)
+  function handleStockDrop(target: StockRow) {
+    if (!stockDragKey || !stockData) return
+    const src = stockData.rows.find(r => (r.key || r.name) === stockDragKey)
+    setStockDragKey(null)
+    if (!src || src === target) return
+    // 한쪽은 BH 데이터, 다른 쪽은 OB 데이터가 있어야 매칭 가능
+    const bhRow = src.bh_stock !== null ? src : (target.bh_stock !== null ? target : null)
+    const obRow = src.ob_stock_total !== null ? src : (target.ob_stock_total !== null ? target : null)
+    if (!bhRow || !obRow || bhRow === obRow) {
+      message.warning('BH 품목과 OB 품목을 서로 연결해야 합니다 (같은 쪽끼리는 매칭 불가)')
+      return
+    }
+    const bhSkus = bhRow.bh_skus?.length ? bhRow.bh_skus : (bhRow.sku ? [bhRow.sku] : [])
+    const obNames = obRow.ob_names?.length ? obRow.ob_names : [obRow.name]
+    if (!bhSkus.length) { message.warning('BH SKU가 없어 매칭할 수 없습니다'); return }
+    Modal.confirm({
+      title: '품목 매칭 저장',
+      content: <div style={{fontSize:'0.84rem'}}>
+        <div><Tag color="blue">BH</Tag>{bhRow.name}</div>
+        <div style={{textAlign:'center',color:'#9ca3af',margin:'2px 0'}}>↕ 연결</div>
+        <div><Tag color="red">OB</Tag>{obRow.name}</div>
+        <div style={{marginTop:8,color:'#6b7280',fontSize:'0.76rem'}}>매핑으로 영구 저장되어 이후 모든 대사·비교에서 같은 상품으로 합산됩니다.</div>
+      </div>,
+      okText: '매칭 저장', cancelText: '취소',
+      onOk: async () => {
+        try {
+          await linkStockItems({ bh: { skus: bhSkus, name: bhRow.name }, ob: { names: obNames } })
+          message.success('매칭이 저장되었습니다')
+          await handleStock()
+        } catch { message.error('매칭 저장 실패') }
+      },
+    })
+  }
 
   async function handleStock() {
     if (!config.api_token) return
@@ -657,7 +729,7 @@ export default function ReconcilePage({ config }: Props) {
   const [stockTracePairs, setStockTracePairs] = useState<{bh_qty:number;ob_qty:number;bh_date:string;ob_date:string;bh_name:string;ob_name:string;qty_diff:number}[]>([])
   // 재고현황 필터: 불용 외 차이(잔여)만 보기
   const [stockResidualOnly, setStockResidualOnly] = useState(false)
-  const [stockCardFilter, setStockCardFilter] = useState<null|'ok'|'diff'|'trace'>(null)  // 상단 카드 클릭 필터
+  const [stockCardFilter, setStockCardFilter] = useState<null|'ok'|'diff'|'trace'|'only'>(null)  // 상단 카드 클릭 필터
   const [stockCauseFilter, setStockCauseFilter] = useState<string[]>([])                   // 원인 태그 필터
   const [stockDirFilter, setStockDirFilter] = useState<null|'plus'|'minus'>(null)          // 차이 방향 필터
   // 재고현황 상품명 검색
@@ -3190,6 +3262,28 @@ export default function ReconcilePage({ config }: Props) {
         )}
       </Modal>
 
+      {/* 수기 재고 입력 모달 (부자재 등 한쪽 시스템에만 있는 상품) */}
+      <Modal open={!!manualRow} onCancel={()=>setManualRow(null)} width={420}
+        title={<span>✍ 수기 재고 입력</span>}
+        okText="저장" cancelText="취소" confirmLoading={manualSaving}
+        onOk={saveManualStock} okButtonProps={{disabled:manualQty===null}}>
+        {manualRow && (
+          <div style={{display:'flex',flexDirection:'column',gap:10}}>
+            <div style={{fontWeight:600}}>{manualRow.name}</div>
+            <Alert type="info" showIcon style={{fontSize:'0.76rem'}}
+              message={`현재 ${(manualRow.manual?.side ?? (manualRow.only_side==='bh'?'ob':'bh'))==='bh'?'박스히어로(BH)':'아워박스(OB)'}에 재고가 없습니다. 입력한 수량이 그쪽 재고로 사용되어 비교됩니다. (해당 시스템에 실재고가 등록되면 실데이터가 우선)`} />
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <span style={{fontSize:'0.8rem',color:'#374151',width:60}}>수량</span>
+              <InputNumber min={0} value={manualQty} onChange={v=>setManualQty(v)} style={{flex:1}} />
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <span style={{fontSize:'0.8rem',color:'#374151',width:60}}>메모</span>
+              <Input value={manualMemo} onChange={e=>setManualMemo(e.target.value)} placeholder="예: 부자재 — BH 미관리" style={{flex:1}} />
+            </div>
+          </div>
+        )}
+      </Modal>
+
       {/* 재고 현황 모달 */}
       <Modal open={stockOpen} onCancel={()=>setStockOpen(false)} width={1180} footer={null}
         title={
@@ -3212,14 +3306,15 @@ export default function ReconcilePage({ config }: Props) {
           <>
             <Row gutter={12} style={{marginBottom:14}}>
               {[
-                {label:'전체 상품', val:stockData.total, color:'#374151', bg:'#f3f4f6', filter:null as null|'ok'|'diff'|'trace'},
+                {label:'전체 상품', val:stockData.total, color:'#374151', bg:'#f3f4f6', filter:null as null|'ok'|'diff'|'trace'|'only'},
                 {label:'재고 일치', val:stockData.ok_count, color:'#065f46', bg:'#d1fae5', filter:'ok' as const},
                 {label:'재고 차이', val:stockData.diff_count, color:'#991b1b', bg:'#fee2e2', filter:'diff' as const},
                 {label:'거래추적 필요', val:stockData.need_trace_count ?? 0, color:'#7c2d12', bg:'#ffedd5', filter:'trace' as const},
+                {label:'한쪽만 재고', val:(stockData.only_bh ?? 0)+(stockData.only_ob ?? 0), color:'#9a3412', bg:'#fef3c7', filter:'only' as const},
               ].map(m=>{
                 const active = stockCardFilter === m.filter
                 return (
-                  <Col span={6} key={m.label}>
+                  <Col flex={1} key={m.label}>
                     <div
                       onClick={()=>setStockCardFilter(m.filter)}
                       style={{background:m.bg,borderRadius:8,padding:'8px 12px',textAlign:'center',cursor:'pointer',
@@ -3233,6 +3328,18 @@ export default function ReconcilePage({ config }: Props) {
                 )
               })}
             </Row>
+            {((stockData.only_bh ?? 0)+(stockData.only_ob ?? 0)) > 0 && (
+              <Alert type="warning" showIcon style={{marginBottom:10}}
+                message={
+                  <span style={{fontSize:'0.8rem'}}>
+                    <b>한쪽 시스템에만 재고가 있는 상품 {(stockData.only_bh ?? 0)+(stockData.only_ob ?? 0)}건</b>
+                    {' '}— BH만 {stockData.only_bh ?? 0}건 · OB만 {stockData.only_ob ?? 0}건.
+                    {' '}같은 상품인데 이름이 달라 매칭이 안 됐다면 <b>행을 드래그해 상대 품목 위에 놓으면</b> 매핑이 영구 저장됩니다.
+                    부자재처럼 한쪽에서만 관리하는 상품이면 <b>✍ 수기 재고</b>를 입력해 비교 대상으로 처리하세요.
+                    <Button size="small" type="link" style={{padding:'0 4px'}} onClick={()=>setStockCardFilter('only')}>해당 상품만 보기 →</Button>
+                  </span>
+                } />
+            )}
             <div style={{fontSize:'0.74rem',color:'#6b7280',marginBottom:8,display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
               <span><b>차이 = BH재고 − OB총재고</b>(가용+가용외). 가용외(할당·보류)는 OB 내부 상태라 비교 기준에서 빠져, 할당 타이밍에 따른 출렁임 없이 진짜 정합오차만 잡힙니다. <span style={{color:'#9ca3af'}}>참고(−가용)</span>은 기존 엑셀 기준(BH−OB가용). 행 클릭 시 거래 분석.</span>
               <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:6}}>
@@ -3286,6 +3393,7 @@ export default function ReconcilePage({ config }: Props) {
                 if (stockCardFilter==='ok') rows = rows.filter(r=>r.diff===0)
                 else if (stockCardFilter==='diff') rows = rows.filter(r=>r.diff!==null && r.diff!==undefined && r.diff!==0)
                 else if (stockCardFilter==='trace') rows = rows.filter(r=>r.residual!==null && r.residual!==undefined && r.residual!==0)
+                else if (stockCardFilter==='only') rows = rows.filter(r=>r.only_side)
                 // 원인 태그 필터 (하나라도 해당하면 표시)
                 if (stockCauseFilter.length>0) rows = rows.filter(r=>{
                   const types=(r.causes||[]).map(c=>c.type)
@@ -3310,7 +3418,19 @@ export default function ReconcilePage({ config }: Props) {
               })()}
               rowKey="name"
               pagination={{pageSize:20,showSizeChanger:true,showTotal:t=>`총 ${t}개 상품`}}
-              onRow={(r:unknown)=>({onClick:()=>handleStockRowClick(r as StockRow), style:{cursor:'pointer'}})}
+              onRow={(r:unknown)=>{
+                const row = r as StockRow
+                const rk = row.key || row.name
+                return {
+                  onClick:()=>handleStockRowClick(row),
+                  style:{cursor:'pointer', outline: stockDragKey && stockDragKey!==rk ? '1px dashed #93c5fd' : undefined},
+                  draggable: true,
+                  onDragStart:(e:React.DragEvent)=>{ e.dataTransfer.effectAllowed='link'; setStockDragKey(rk) },
+                  onDragOver:(e:React.DragEvent)=>{ if(stockDragKey && stockDragKey!==rk) e.preventDefault() },
+                  onDrop:(e:React.DragEvent)=>{ e.preventDefault(); handleStockDrop(row) },
+                  onDragEnd:()=>setStockDragKey(null),
+                }
+              }}
               columns={[
                 {title:'상품명', dataIndex:'name', ellipsis:{showTitle:false}, width:260, showSorterTooltip:false,
                   sorter:(a:unknown,b:unknown)=>((a as StockRow).name||'').localeCompare((b as StockRow).name||'','ko'),
@@ -3373,12 +3493,34 @@ export default function ReconcilePage({ config }: Props) {
                     return <div style={{display:'flex',gap:3,flexWrap:'wrap'}}>
                       {cs.map((c,i)=>(
                         <Tooltip key={i} title={c.desc}>
-                          <Tag color={c.type==='가용외'?'gold':c.type==='매핑다중'?'purple':'default'} style={{margin:0,fontSize:'0.68rem',cursor:'help'}}>
+                          <Tag color={c.type==='가용외'?'gold':c.type==='매핑다중'?'purple':c.type==='수기재고'?'cyan':'default'} style={{margin:0,fontSize:'0.68rem',cursor:'help'}}>
                             {c.type}{c.qty?` ${c.qty.toLocaleString()}`:''}
                           </Tag>
                         </Tooltip>
                       ))}
                     </div>
+                  }},
+                {title:'수기', key:'manual', width:88, align:'center' as const,
+                  render:(_:unknown,r:unknown)=>{
+                    const row=r as StockRow
+                    if(row.manual) return (
+                      <span onClick={e=>e.stopPropagation()} style={{display:'inline-flex',gap:2,alignItems:'center'}}>
+                        <Tooltip title={`수기 재고 ${row.manual.qty.toLocaleString()}개 (${row.manual.side==='bh'?'BH':'OB'}쪽, ${row.manual.updated_at||''})${row.manual.memo?` — ${row.manual.memo}`:''} · 클릭해서 수정`}>
+                          <Tag color="cyan" style={{margin:0,fontSize:'0.66rem',cursor:'pointer'}} onClick={()=>openManualInput(row)}>✍ {row.manual.qty.toLocaleString()}</Tag>
+                        </Tooltip>
+                        <Tooltip title="수기 재고 삭제">
+                          <span style={{cursor:'pointer',color:'#9ca3af',fontSize:'0.7rem'}} onClick={()=>removeManualStock(row)}>✕</span>
+                        </Tooltip>
+                      </span>
+                    )
+                    if(row.only_side) return (
+                      <span onClick={e=>e.stopPropagation()}>
+                        <Tooltip title={`${row.only_side==='bh'?'OB':'BH'}에 재고가 없는 상품 — 부자재 등 한쪽에서만 관리하면 반대편 재고를 수기로 입력해 비교 처리`}>
+                          <Button size="small" style={{fontSize:'0.66rem',height:20,padding:'0 6px'}} onClick={()=>openManualInput(row)}>✍ 입력</Button>
+                        </Tooltip>
+                      </span>
+                    )
+                    return <span style={{color:'#e5e7eb'}}>—</span>
                   }},
               ]}
               rowClassName={(r:unknown)=>{

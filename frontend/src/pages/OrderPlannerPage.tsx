@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { PlanBackupInfo } from '../services/api'
 import {
   Button, Upload, Select, Table, Tag, message, Spin, Alert, Slider, Switch, Tooltip, Empty,
   Modal, Input, List, Popconfirm,
@@ -15,6 +16,7 @@ import {
   detectOrderPlanColumns, downloadBlob,
   listOrderPlanUserMappings, upsertOrderPlanUserMapping, deleteOrderPlanUserMapping,
   ingestOrderPlan, getOrderPlan, listPlanFiles, removePlanFile, clearOrderPlan, clearOrderPlanDate,
+  listPlanBackups, backupPlanNow, restorePlanBackup,
   getReceivingCompare,
 } from '../services/api'
 
@@ -80,6 +82,7 @@ export default function OrderPlannerPage() {
   // 누적 발주 저장소 — 서버에 파일별 누적, 진입 시 로드
   const [planFiles, setPlanFiles] = useState<PlanFile[]>([])
   const [dashCollapsed, setDashCollapsed] = useState(false)
+  const [calCollapsed, setCalCollapsed] = useState(false)
   // 발주 대비 확정 입고 비교
   const [recvCompare, setRecvCompare] = useState<ReceivingCompare | null>(null)
   const [recvLoading, setRecvLoading] = useState(false)
@@ -757,6 +760,28 @@ export default function OrderPlannerPage() {
         <p className="page-desc">컬리·올리브영·쿠팡 등 여러 발주서를 한꺼번에 올리면 품목별로 어느 날짜에 몇 개가 필요한지 한눈에 보여줍니다.</p>
       </div>
 
+      <BackupStatusBar onRestored={async () => { const data = await getOrderPlan({ threshold, useMaster, splitBundles }); setResult(data.item_count > 0 ? data : null); refreshPlanFiles(); refreshRecvCompare() }} />
+
+      {/* 월별 발주 캘린더 — 달력 형태로 일자별 발주수량을 한눈에 */}
+      {dashboard && dashboard.daily.length > 0 && (
+        <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: 16, marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: calCollapsed ? 0 : 12 }}>
+            <span style={{ fontWeight: 700, color: '#111827' }}>
+              🗓️ 월별 발주 캘린더 <span style={{ fontWeight: 400, color: '#6b7280', fontSize: '0.8rem' }}>· 날짜 칸을 클릭하면 품목별 세부내역</span>
+            </span>
+            <Button size="small" type="text" onClick={() => setCalCollapsed(c => !c)}>{calCollapsed ? '펼치기 ▾' : '접기 ▴'}</Button>
+          </div>
+          {!calCollapsed && (
+            <MonthlyCalendarView
+              daily={dashboard.daily}
+              items={adjustedItems}
+              channels={dashboard.by_channel.map(c => c.channel)}
+              recvOptions={{ threshold, useMaster, splitBundles }}
+            />
+          )}
+        </div>
+      )}
+
       {/* 통계 대시보드 — 상단 자동 표시 (누적 데이터 기준) */}
       {dashboard && dashboard.item_count > 0 && (
         <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: 16, marginBottom: 16 }}>
@@ -1131,6 +1156,255 @@ export default function OrderPlannerPage() {
         onRemove={removeUserMapping}
       />
 
+    </div>
+  )
+}
+
+// 품목의 날짜별 수량 — 거래처 필터 적용 시 raw_breakdown의 거래처×날짜 교차값 사용
+// (구버전 데이터로 by_channel_date가 없으면, 해당 거래처 단독 raw만 by_date로 대체)
+function itemQtyByDate(it: OrderPlanItem, channel: string): Record<string, number> {
+  if (!channel) return it.by_date
+  const out: Record<string, number> = {}
+  for (const rb of Object.values(it.raw_breakdown || {})) {
+    const cd = rb.by_channel_date?.[channel]
+    if (cd) {
+      for (const [d, q] of Object.entries(cd)) out[d] = (out[d] || 0) + q
+    } else if (rb.by_channel[channel] > 0) {
+      const chs = Object.keys(rb.by_channel)
+      if (chs.length === 1) {
+        for (const [d, q] of Object.entries(rb.by_date)) out[d] = (out[d] || 0) + q
+      }
+    }
+  }
+  return out
+}
+
+// 월별 달력 그리드 — 발주가 있는 날짜에 수량 표시, 클릭 시 품목 세부내역
+function MonthlyCalendarView({ daily, items, channels, recvOptions }: {
+  daily: { date: string; qty: number }[]; items: OrderPlanItem[]; channels: string[]
+  recvOptions: { threshold: number; useMaster: boolean; splitBundles: boolean }
+}) {
+  const fmt = (n: number) => n.toLocaleString()
+  const [channel, setChannel] = useState('')   // '' = 전체 거래처
+  // 거래처 선택 시 SKU별 발주 대비 입고 — 거래처별로 캐시
+  const [recvCache, setRecvCache] = useState<Record<string, ReceivingCompare | null>>({})
+  const [recvLoading, setRecvLoading] = useState(false)
+  useEffect(() => {
+    if (!channel || recvCache[channel] !== undefined) return
+    let live = true
+    setRecvLoading(true)
+    getReceivingCompare({ ...recvOptions, channel })
+      .then(d => { if (live) setRecvCache(p => ({ ...p, [channel]: d })) })
+      .catch(() => { if (live) setRecvCache(p => ({ ...p, [channel]: null })) })
+      .finally(() => { if (live) setRecvLoading(false) })
+    return () => { live = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel])
+  const qtyByDate = useMemo(() => {
+    if (!channel) {
+      const m: Record<string, number> = {}
+      for (const d of daily) m[d.date] = d.qty
+      return m
+    }
+    const m: Record<string, number> = {}
+    for (const it of items) {
+      for (const [d, q] of Object.entries(itemQtyByDate(it, channel))) m[d] = (m[d] || 0) + q
+    }
+    return m
+  }, [daily, items, channel])
+  // 발주가 있는 월 목록 (오름차순)
+  const months = useMemo(
+    () => Array.from(new Set(Object.keys(qtyByDate).filter(d => qtyByDate[d] > 0).map(d => d.slice(0, 7)))).sort(),
+    [qtyByDate],
+  )
+  const [monthIdx, setMonthIdx] = useState(() => Math.max(0, months.length - 1))
+  useEffect(() => {
+    setMonthIdx(i => Math.min(Math.max(0, months.length - 1), i))
+  }, [months.length])
+  const [openDate, setOpenDate] = useState<string | null>(null)
+  const detail = useMemo(() => {
+    if (!openDate) return []
+    const rows: { name: string; sku: string; matched: boolean; qty: number }[] = []
+    for (const it of items) {
+      const q = itemQtyByDate(it, channel)[openDate] || 0
+      if (q > 0) rows.push({ name: it.name, sku: it.sku, matched: it.matched, qty: q })
+    }
+    return rows.sort((a, b) => b.qty - a.qty)
+  }, [openDate, items, channel])
+  const monthForRecv = months[Math.min(monthIdx, months.length - 1)] || ''
+  // 거래처 선택 시 표시 월 기준 SKU별 발주/입고 집계
+  const skuRecvRows = useMemo(() => {
+    const data = channel ? recvCache[channel] : null
+    if (!data) return []
+    const rows: { sku: string; name: string; ordered: number; received: number; rate: number; hasRecv: boolean }[] = []
+    for (const it of data.items) {
+      const inMonth = (m: Record<string, number> | undefined) =>
+        Object.entries(m || {}).reduce((s, [d, q]) => s + (d.slice(0, 7) === monthForRecv ? q : 0), 0)
+      const ordered = inMonth(it.ordered_by_date)
+      const received = inMonth(it.received_by_date)
+      if (ordered <= 0 && received <= 0) continue
+      rows.push({
+        sku: it.sku, name: it.name, ordered, received,
+        rate: ordered ? Math.round((received / ordered) * 1000) / 10 : 0,
+        hasRecv: it.status !== 'nodata',
+      })
+    }
+    return rows.sort((a, b) => b.ordered - a.ordered)
+  }, [channel, recvCache, monthForRecv])
+  const month = months[Math.min(monthIdx, months.length - 1)] || ''
+  if (!month) return null
+
+  const [yy, mm] = month.split('-').map(Number)
+  const firstDow = new Date(yy, mm - 1, 1).getDay()          // 0=일
+  const daysInMonth = new Date(yy, mm, 0).getDate()
+  const monthMax = Math.max(1, ...Array.from({ length: daysInMonth }, (_, i) => {
+    const key = `${month}-${String(i + 1).padStart(2, '0')}`
+    return qtyByDate[key] || 0
+  }))
+  const monthTotal = Array.from({ length: daysInMonth }, (_, i) =>
+    qtyByDate[`${month}-${String(i + 1).padStart(2, '0')}`] || 0).reduce((s, q) => s + q, 0)
+
+  // 셀 배열 — 앞 공백 + 날짜
+  const cells: (number | null)[] = [
+    ...Array.from({ length: firstDow }, () => null),
+    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
+  ]
+  while (cells.length % 7 !== 0) cells.push(null)
+
+  return (
+    <div style={{ fontSize: '0.82rem' }}>
+      {/* 월 이동 + 거래처 필터 */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 10 }}>
+        <Button size="small" disabled={monthIdx <= 0} onClick={() => { setMonthIdx(i => i - 1); setOpenDate(null) }}>◀</Button>
+        <span style={{ fontWeight: 800, fontSize: '1rem', color: '#111827', minWidth: 110, textAlign: 'center' }}>
+          {yy}년 {mm}월
+        </span>
+        <Button size="small" disabled={monthIdx >= months.length - 1} onClick={() => { setMonthIdx(i => i + 1); setOpenDate(null) }}>▶</Button>
+        <span style={{ color: '#6b7280' }}>월 합계 <b style={{ color: '#065f46' }}>{fmt(monthTotal)}</b>개{channel ? ` · ${channel}` : ''}</span>
+        <Select
+          size="small" allowClear placeholder="전체 거래처" style={{ minWidth: 120 }}
+          value={channel || undefined}
+          onChange={(v) => { setChannel(v || ''); setOpenDate(null) }}
+          options={channels.map(ch => ({ value: ch, label: ch }))}
+        />
+      </div>
+
+      {/* 요일 헤더 */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, marginBottom: 4 }}>
+        {['일', '월', '화', '수', '목', '금', '토'].map((d, i) => (
+          <div key={d} style={{ textAlign: 'center', fontWeight: 700, padding: '2px 0',
+            color: i === 0 ? '#dc2626' : i === 6 ? '#2563eb' : '#6b7280' }}>{d}</div>
+        ))}
+      </div>
+
+      {/* 날짜 칸 */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4 }}>
+        {cells.map((day, i) => {
+          if (day === null) return <div key={i} />
+          const key = `${month}-${String(day).padStart(2, '0')}`
+          const qty = qtyByDate[key] || 0
+          const isOpen = openDate === key
+          const intensity = qty > 0 ? 0.15 + 0.6 * (qty / monthMax) : 0
+          const dow = (firstDow + day - 1) % 7
+          return (
+            <div
+              key={i}
+              onClick={() => qty > 0 && setOpenDate(isOpen ? null : key)}
+              style={{
+                minHeight: 52, borderRadius: 8, padding: '4px 6px',
+                border: isOpen ? '2px solid #10b981' : '1px solid #eef2f7',
+                background: qty > 0 ? `rgba(16, 185, 129, ${intensity})` : '#fafafa',
+                cursor: qty > 0 ? 'pointer' : 'default',
+              }}
+            >
+              <div style={{ fontSize: '0.72rem', fontWeight: 600,
+                color: dow === 0 ? '#dc2626' : dow === 6 ? '#2563eb' : '#6b7280' }}>{day}</div>
+              {qty > 0 && (
+                <div style={{ fontWeight: 800, color: '#065f46', fontSize: '0.8rem', textAlign: 'right' }}>{fmt(qty)}</div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* 선택한 날짜의 품목 세부내역 */}
+      {openDate && (
+        <div style={{ marginTop: 10, background: '#fafafa', border: '1px solid #eef2f7', borderRadius: 8, padding: '8px 12px' }}>
+          <div style={{ fontWeight: 700, color: '#065f46', marginBottom: 6 }}>
+            {formatDateShort(openDate)} · {fmt(qtyByDate[openDate] || 0)}개
+          </div>
+          {detail.length === 0 ? (
+            <div style={{ color: '#9ca3af', fontSize: '0.76rem' }}>세부내역 없음</div>
+          ) : detail.map((row, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 0', fontSize: '0.78rem', borderTop: i ? '1px solid #f3f4f6' : undefined }}>
+              <span style={{ flex: 1, color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {row.sku && <span style={{ color: '#9ca3af', marginRight: 6 }}>{row.sku}</span>}
+                {row.name}
+                {!row.matched && <Tag color="red" style={{ marginLeft: 6, fontSize: '0.62rem' }}>미매칭</Tag>}
+              </span>
+              <span style={{ width: 70, textAlign: 'right', fontWeight: 600, color: '#065f46' }}>{fmt(row.qty)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 거래처 선택 시 — 이 달의 SKU별 발주 대비 입고 */}
+      {channel && (
+        <div style={{ marginTop: 12, background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontWeight: 700, color: '#374151', marginBottom: 8 }}>
+            📦 {yy}년 {mm}월 · {channel} SKU별 발주 대비 입고
+            <span style={{ fontWeight: 400, color: '#9ca3af', fontSize: '0.76rem' }}> · 발주서 확정수량 기준</span>
+          </div>
+          {recvLoading ? <Spin size="small" /> : skuRecvRows.length === 0 ? (
+            <div style={{ color: '#9ca3af', fontSize: '0.78rem' }}>이 달의 입고 비교 데이터 없음</div>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid #e5e7eb', color: '#6b7280' }}>
+                    <th style={{ ...th, padding: '4px 8px' }}>SKU / 품목</th>
+                    <th style={{ ...th, padding: '4px 8px', textAlign: 'right' }}>발주량</th>
+                    <th style={{ ...th, padding: '4px 8px', textAlign: 'right' }}>입고량</th>
+                    <th style={{ ...th, padding: '4px 8px', textAlign: 'right' }}>차이</th>
+                    <th style={{ ...th, padding: '4px 8px', textAlign: 'right' }}>입고율</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {skuRecvRows.map((r, i) => {
+                    const diff = r.received - r.ordered
+                    const rateColor = !r.hasRecv ? '#9ca3af' : r.rate >= 100 ? '#059669' : r.rate > 0 ? '#d97706' : '#dc2626'
+                    return (
+                      <tr key={i} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                        <td style={{ padding: '4px 8px', color: '#111827' }}>
+                          {r.sku && <span style={{ color: '#9ca3af', marginRight: 6 }}>{r.sku}</span>}
+                          {r.name}
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 600 }}>{fmt(r.ordered)}</td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 600, color: '#0369a1' }}>
+                          {r.hasRecv ? fmt(r.received) : '-'}
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', color: diff < 0 ? '#dc2626' : '#059669' }}>
+                          {r.hasRecv ? fmt(diff) : '-'}
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', fontWeight: 700, color: rateColor }}>
+                          {r.hasRecv ? `${r.rate}%` : '확정정보없음'}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                  <tr style={{ borderTop: '1px solid #e5e7eb', fontWeight: 700 }}>
+                    <td style={{ padding: '4px 8px' }}>합계</td>
+                    <td style={{ padding: '4px 8px', textAlign: 'right' }}>{fmt(skuRecvRows.reduce((s, r) => s + r.ordered, 0))}</td>
+                    <td style={{ padding: '4px 8px', textAlign: 'right', color: '#0369a1' }}>{fmt(skuRecvRows.reduce((s, r) => s + r.received, 0))}</td>
+                    <td style={{ padding: '4px 8px', textAlign: 'right' }}>{fmt(skuRecvRows.reduce((s, r) => s + r.received - r.ordered, 0))}</td>
+                    <td />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -2148,5 +2422,63 @@ function UserMappingsManagerModal({
         />
       )}
     </Modal>
+  )
+}
+
+
+/** 저장소 보존 상태 — 저장할 때마다 자동 스냅샷 + OneDrive 미러. 스냅샷 목록 조회/즉시 백업/되돌리기. */
+function BackupStatusBar({ onRestored }: { onRestored: () => void }) {
+  const [info, setInfo] = useState<PlanBackupInfo | null>(null)
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  async function refresh() {
+    try { setInfo(await listPlanBackups()) } catch { /* 백엔드 미기동 */ }
+  }
+  useEffect(() => { refresh() }, [])
+  if (!info) return null
+  const fmt = (t: number | null) => t ? new Date(t * 1000).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'
+  const mirror = info.mirrors[0]
+  const latest = info.backups[0]
+  return (
+    <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #e5e7eb', padding: '10px 16px', marginBottom: 16, fontSize: '0.8rem', color: '#374151' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 700 }}>🛡️ 데이터 보존</span>
+        <span>누적 <b>{info.current.files}</b>개 파일 · {info.current.rows.toLocaleString()}행 · 마지막 저장 {fmt(info.current.mtime)}</span>
+        <span>스냅샷 <b>{info.backups.filter(b => b.source === 'local').length}</b>개{latest ? ` · 최근 ${fmt(latest.mtime)}` : ''}</span>
+        <span style={{ color: mirror?.exists ? '#059669' : '#dc2626' }}>{mirror?.exists ? `☁ OneDrive 미러 ${fmt(mirror.mtime)}` : '☁ OneDrive 미러 없음'}</span>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <Button size="small" loading={busy} onClick={async () => { setBusy(true); try { await backupPlanNow(); message.success('스냅샷 저장'); await refresh() } finally { setBusy(false) } }}>지금 백업</Button>
+          <Button size="small" onClick={() => { setOpen(o => !o); refresh() }}>{open ? '닫기' : '스냅샷 목록 / 되돌리기'}</Button>
+        </span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 10, maxHeight: 260, overflow: 'auto' }}>
+          <div style={{ color: '#6b7280', marginBottom: 6 }}>
+            저장할 때마다 직전 상태가 스냅샷으로 남고(최근 30일 전부, 이전은 하루 1개), 최신본은 OneDrive/문서/출고변환_백업 에 미러됩니다.
+            파일이 사라지거나 깨지면 서버가 자동으로 가장 최근 정상본에서 복원합니다. 되돌리기 직전 상태도 스냅샷으로 남습니다.
+          </div>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr style={{ color: '#6b7280', textAlign: 'left' }}><th style={{ padding: 4 }}>시각</th><th>사유</th><th>위치</th><th style={{ textAlign: 'right' }}>파일</th><th style={{ textAlign: 'right' }}>행</th><th /></tr></thead>
+            <tbody>
+              {info.backups.map(b => (
+                <tr key={b.name} style={{ borderTop: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: 4 }}>{b.ts ? `${b.ts.slice(4, 6)}/${b.ts.slice(6, 8)} ${b.ts.slice(9, 11)}:${b.ts.slice(11, 13)}` : '-'}</td>
+                  <td>{b.reason || '-'}</td>
+                  <td>{b.source === 'local' ? '로컬' : 'OneDrive'}</td>
+                  <td style={{ textAlign: 'right' }}>{b.files ?? '-'}</td>
+                  <td style={{ textAlign: 'right' }}>{b.rows?.toLocaleString() ?? '-'}</td>
+                  <td style={{ textAlign: 'right' }}>
+                    <Popconfirm title={`이 스냅샷(${b.files}개 파일)으로 되돌릴까요? 현재 상태는 스냅샷으로 보존됩니다.`} okText="되돌리기" cancelText="취소"
+                      onConfirm={async () => { try { await restorePlanBackup(b.name); message.success('복원 완료'); await refresh(); onRestored() } catch { message.error('복원 실패') } }}>
+                      <Button size="small" type="link" danger>되돌리기</Button>
+                    </Popconfirm>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   )
 }

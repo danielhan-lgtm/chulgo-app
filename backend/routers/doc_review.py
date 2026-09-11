@@ -220,6 +220,8 @@ def parse_부착리스트(data: bytes) -> dict:
             "center_raw": raw,
             "date": mm.group(2) if mm else None,
             "pallet": f"{mp.group(1)}-{mp.group(2)}" if mp else None,
+            # '팔레트 4-1' → 첫 숫자가 총 팔레트 수
+            "pallet_total": int(mp.group(1)) if mp else None,
         }
 
     milkrun = re.search(r"밀크런\s*번호\s*[:：]\s*(\d+)", txt)
@@ -227,12 +229,15 @@ def parse_부착리스트(data: bytes) -> dict:
     date = re.search(r"입고예정일자\s*[:：]\s*([\d\-]+)", txt)
     pallet = re.search(r"팔레트\s*수량\s*[:：]\s*([\d\s\-]+)", txt)
     raw = center.group(1).strip() if center else None
+    # '팔레트 수량 : 5 - 1' → 첫 숫자가 총 팔레트 수
+    pallet_nums = re.findall(r"\d+", pallet.group(1)) if pallet else []
     return {
         "milkrun": milkrun.group(1) if milkrun else None,
         "center": norm_center(raw) if raw else None,
         "center_raw": raw,
         "date": date.group(1) if date else None,
         "pallet": pallet.group(1).strip() if pallet else None,
+        "pallet_total": int(pallet_nums[0]) if pallet_nums else None,
     }
 
 
@@ -240,6 +245,7 @@ def parse_적재리스트(data: bytes) -> dict:
     prs = Presentation(io.BytesIO(data))
     center = milkrun = date = None
     boxtotal = None
+    declared_plt = []   # 슬라이드 머리글 '4-1 / 박스수량...' 의 첫 숫자 = 총 팔레트 수
     rows = []
     for slide in prs.slides:
         for shape in slide.shapes:
@@ -257,6 +263,9 @@ def parse_적재리스트(data: bytes) -> dict:
                 m = re.search(r"박스수량\.?\s*\(\s*([\d,]+)\s*BOX", t)
                 if m:
                     boxtotal = (boxtotal or 0) + int(m.group(1).replace(",", ""))
+                m = re.search(r"(\d+)\s*-\s*\d+\s*/\s*박스수량", t)
+                if m:
+                    declared_plt.append(int(m.group(1)))
             if shape.has_table:
                 tbl = shape.table
                 for r in list(tbl.rows)[1:]:
@@ -270,8 +279,10 @@ def parse_적재리스트(data: bytes) -> dict:
                         "box": _to_int(cells[3]),
                         "qty": _to_int(cells[4]),
                     })
+    # 팔레트 수: 머리글 표기(총-번호)가 있으면 그 값, 없으면 슬라이드 수(1장=1팔레트)
+    pallet_total = max(declared_plt) if declared_plt else (len(prs.slides) or None)
     return {"center": center, "milkrun": milkrun, "date": date,
-            "boxtotal": boxtotal, "rows": rows}
+            "boxtotal": boxtotal, "pallet_total": pallet_total, "rows": rows}
 
 
 def _parse_거래명세서_국문(data: bytes) -> dict:
@@ -491,6 +502,26 @@ def build_group(center: str, 명세: dict, 부착: dict, 적재: dict, req: list
         checks.append({"label": "입고예정일 일치", "status": "error", "detail": " ≠ ".join(dset)})
         statuses.append("error")
 
+    # 팔레트 수량 일치 (부착 ↔ 적재)
+    plt부착 = 부착.get("pallet_total") if 부착 else None
+    plt적재 = 적재.get("pallet_total") if 적재 else None
+    pset = {x for x in [plt부착, plt적재] if x}
+    if len(pset) == 1:
+        src = []
+        if plt부착:
+            src.append("부착")
+        if plt적재:
+            src.append("적재")
+        checks.append({"label": "팔레트 수량 일치", "status": "ok",
+                       "detail": f"{next(iter(pset))} PLT ({'·'.join(src)})"})
+    elif len(pset) == 0:
+        checks.append({"label": "팔레트 수량 일치", "status": "warn", "detail": "정보 없음"})
+        statuses.append("warn")
+    else:
+        checks.append({"label": "팔레트 수량 일치", "status": "error",
+                       "detail": f"부착 {plt부착} ≠ 적재 {plt적재}"})
+        statuses.append("error")
+
     # ── SKU 통합 대조 ──
     # 적재리스트 기준(상품번호+상품명 보유): sku -> [qty, box, name]
     agg적재 = defaultdict(lambda: [0, 0, ""])
@@ -644,6 +675,15 @@ def build_group(center: str, 명세: dict, 부착: dict, 적재: dict, req: list
                                "detail": f"접수 {recv_box} / 서류 {cmp_box}"})
                 if bst != "ok":
                     statuses.append(bst)
+            # 접수 팔레트수 일치 (부착/적재 팔레트 수 기준)
+            recv_plt = entry.get("pallets") or 0
+            doc_plt = plt부착 or plt적재 or 0
+            if recv_plt and doc_plt:
+                pst = "ok" if recv_plt == doc_plt else "error"
+                checks.append({"label": "접수 팔레트수 일치", "status": pst,
+                               "detail": f"접수 {recv_plt} / 서류 {doc_plt}"})
+                if pst != "ok":
+                    statuses.append(pst)
             # 발주번호(PO) 일치 (거래명세서 PO ↔ 접수 발주번호)
             recv_pos = set(entry.get("pos") or [])
             stmt_pos = set(명세["pos"].keys()) if 명세 else set()

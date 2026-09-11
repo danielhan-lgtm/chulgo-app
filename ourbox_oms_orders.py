@@ -30,6 +30,7 @@ STAGES = list(STAGE_LABELS.keys())
 def oms_session(ourbox_id: str, ourbox_pw: str):
     """로그인된 OMS 페이지를 제공하는 컨텍스트 매니저."""
     from playwright.sync_api import sync_playwright
+    from ourbox_scraper import _save_session
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context()
@@ -37,6 +38,11 @@ def oms_session(ourbox_id: str, ourbox_pw: str):
             page = _login_and_get_page(ctx, ourbox_id, ourbox_pw)
             yield page
         finally:
+            # 사용 중 서버가 세션ID를 회전시켰을 수 있음 — 최신 쿠키로 세션파일 갱신
+            try:
+                _save_session(ctx)
+            except Exception:
+                pass
             browser.close()
 
 
@@ -198,6 +204,9 @@ def normalize_order(row: dict) -> dict:
         "reg_dtm": row.get("reg_dtm"),
         "od_dtm": row.get("od_dtm"),
         "colct_yn": row.get("colct_yn"),
+        # 사은품: MATE 사은품 이벤트가 추가한 라인은 gift_yn='Y' + 원주문 라인 번호
+        "gift_yn": row.get("gift_yn"),
+        "gift_orig_od_sno": row.get("gift_orig_od_sno"),
     }
 
 
@@ -330,6 +339,74 @@ def assign_default_sender(page, od_snos) -> dict:
             "sender_sno": default.get("sender_sno"), "result": res}
 
 
+# ── 사은품 적용 (쓰기) ─────────────────────────────────────────────
+
+def list_active_gift_events(page) -> list:
+    """진행 중(use_yn=Y) 사은품 이벤트 목록. [{gift_gv_sno, gift_gv_nm, sach_nm, ...}]"""
+    d = _get_json(page, "/om/prod/gift/ajax/selGiftList.do?page=1&size=200")
+    rows = (d.get("data") or []) if isinstance(d, dict) else []
+    return [r for r in rows if r.get("use_yn") == "Y" and r.get("gift_progress") == "진행 중"]
+
+
+def apply_gifts(page, rows) -> dict:
+    """주문서처리(20) 주문에 진행 중 사은품 이벤트 적용 (insGiftOrder.do).
+
+    UI '사은품 적용' 팝업 재현: 진행 중 이벤트 전체를 후보로 넣고 mode='select'로
+    대상 주문(od_sno + box_pack_no)에만 적용 — 이벤트별 조건(판매처/상품/기간/금액)
+    매칭은 서버가 판단하므로 조건 불일치 주문엔 지급되지 않는다.
+    ⚠️ 이 호출 없이 단계를 전진시키면 gift_check_yn=Y여도 사은품 라인이 영영 안 붙는다.
+    """
+    rows = [r for r in rows if str(r.get("gift_yn") or "") != "Y"]  # 사은품 라인 자체엔 재적용 금지
+    events = list_active_gift_events(page)
+    if not events or not rows:
+        return {"ok": True, "skipped": True, "events": len(events), "orders": len(rows)}
+    gv_snos = [e["gift_gv_sno"] for e in events]
+    od_snos = sorted({int(r["od_sno"]) for r in rows})
+    box_packs = sorted({str(r.get("box_pack_no")) for r in rows if r.get("box_pack_no")})
+    page.goto(OURBOX_BASE + "/om/order/putOrder/putOrderList.do", wait_until="networkidle", timeout=20000)
+    res = page.evaluate(
+        """async ({gvSnos, odSnos, boxPacks}) => {
+            // 1) 이벤트별 지급 사은품 + 재고 조회 (팝업 selBtn 로직 재현)
+            const r1 = await fetch('/om/prod/gift/ajax/selGiftProdWithStockQty.do', {
+                method:'POST', headers:{'Content-Type':'application/json; charset=utf-8','AJAX':'true'},
+                body: JSON.stringify(gvSnos)});
+            const t1 = await r1.text();
+            let d1; try{d1=JSON.parse(t1);}catch(e){return {status:r1.status, body:t1.slice(0,300)};}
+            let result = (d1 && d1.data !== undefined)
+                ? (typeof d1.data === 'string' ? JSON.parse(d1.data) : d1.data) : d1;
+            const list = (result && result.list) || [];
+            const giftProdArr = list.map(row => ({
+                giftGvSno:   row.gift_gv_sno  || row.GIFT_GV_SNO,
+                prodCd:      row.gift_prod_cd || row.GIFT_PROD_CD || '',
+                stockQty:    Number(row.gift_stock_qty != null ? row.gift_stock_qty : 0),
+                altProdCd:   (row.alt_prod_cd || row.ALT_PROD_CD || null),
+                altStockQty: Number(row.alt_stock_qty != null ? row.alt_stock_qty : 0)
+            }));
+            // 2) 적용 (giftApplyForm.serialize() 재현 — hidden값은 JSON 문자열)
+            const p = new URLSearchParams();
+            p.append('gift_apply_tp', 'all');
+            p.append('giftGvSnoArr', JSON.stringify(gvSnos));
+            p.append('giftProdArr', JSON.stringify(giftProdArr));
+            p.append('odSnolist', JSON.stringify(odSnos));
+            p.append('boxPacklist', JSON.stringify(boxPacks));
+            p.append('mode', 'select');
+            p.append('intlYn', 'N');
+            p.append('giftUrlArr', '');
+            const r2 = await fetch('/om/order/putOrder/ajax/insGiftOrder.do', {
+                method:'POST',
+                headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','AJAX':'true'},
+                body: p.toString()});
+            const t2 = await r2.text(); let b; try{b=JSON.parse(t2);}catch(e){b=t2.slice(0,400);}
+            return {status:r2.status, body:b, gift_prod_count:list.length};
+        }""",
+        {"gvSnos": gv_snos, "odSnos": od_snos, "boxPacks": box_packs},
+    )
+    body = res.get("body")
+    ok = isinstance(body, dict) and bool(body.get("result"))
+    return {"ok": ok, "events": len(events), "orders": len(od_snos),
+            "event_names": [e.get("gift_gv_nm") for e in events], "result": res}
+
+
 # ── 주문 수집 (쓰기) ───────────────────────────────────────────────
 
 COLCT_POPUP = "/om/sach/colct/colctListView.do?kind=order"
@@ -401,11 +478,14 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=("cafe24", "
                                            "box_count": res.get("box_count"), "ok": ok,
                                            "msg": (res.get("body") or {}).get("message", "")})
                     continue
-                # 주문서처리(20)→출고준비(30) 전 발송인 없는 건에 기본 발송인 자동 지정
+                # 주문서처리(20)→출고준비(30) 전 발송인 지정 + 사은품 적용
                 if stage == "putOrder":
                     sres = assign_default_sender(page, osnos)
                     out["sender"].append({"pass": p, "count": len(osnos),
                                           "sender_nm": sres.get("sender_nm"), "ok": sres.get("ok")})
+                    gres = apply_gifts(page, rows)
+                    out.setdefault("gifts", []).append({"pass": p, **{k: gres.get(k) for k in
+                                                        ("ok", "skipped", "events", "orders", "event_names")}})
                 res = advance_orders(page, osnos, code, "next")
                 ok = isinstance(res.get("body"), dict) and bool(res["body"].get("result"))
                 if ok:

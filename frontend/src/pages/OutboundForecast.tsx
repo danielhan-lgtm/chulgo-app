@@ -1,15 +1,17 @@
 import { useState, useEffect } from 'react'
-import { Button, DatePicker, Radio, Table, Tag, Alert, Spin, Input, InputNumber, Tooltip, Upload, Modal, Switch, message } from 'antd'
+import { Button, DatePicker, Radio, Table, Tag, Alert, Spin, Input, InputNumber, Tooltip, Upload, Modal, Switch, message, Select } from 'antd'
 import { SearchOutlined, DownloadOutlined, UploadOutlined, ApiOutlined, AimOutlined, AppstoreAddOutlined, DeleteOutlined, EditOutlined } from '@ant-design/icons'
 import type { AppConfig } from '../types'
 import {
-  getOutboundForecast, getOutboundTargets, uploadOutboundTargets, deleteOutboundTargets,
+  getOutboundForecast, getLastOutboundForecast, getOutboundTargets, uploadOutboundTargets, deleteOutboundTargets,
   getPartnerTeamMap, savePartnerTeamMap,
   getSetBoms, createSetBom, deleteSetBom,
   setTargetOverride,
 } from '../services/api'
 import type { OutboundForecastResult, OutboundItemRow, OutboundPartnerRow, OutboundTargetRow, TargetStatus, SetBom } from '../services/api'
 import TrendChart from '../components/TrendChart'
+import BarList from '../components/BarList'
+import ExecReport from '../components/ExecReport'
 import dayjs from 'dayjs'
 
 interface Props { config: AppConfig }
@@ -32,6 +34,12 @@ function achColor(pct: number | null) {
 function sumVals(o: Record<string, number>) { return Object.values(o).reduce((s, v) => s + v, 0) }
 
 function fmt(n: number) { return n ? n.toLocaleString() : '' }
+
+// 차트 막대 위 수치 라벨용 축약 표기 (12,345 → 1.2만)
+function fmtCompact(n: number) {
+  if (n >= 10000) return `${(n / 10000).toFixed(1)}만`
+  return n.toLocaleString()
+}
 
 function bucketLabel(key: string, period: string) {
   if (period === 'month') return key            // YYYY-MM
@@ -59,10 +67,14 @@ export default function OutboundForecast({ config }: Props) {
   const [expandSets, setExpandSets] = useState(false)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<OutboundForecastResult | null>(null)
+  const [restoredAt, setRestoredAt] = useState<string | null>(null)  // 스냅샷 복원 시각 (새 조회 시 해제)
   const [search, setSearch] = useState('')
+  const [productFilter, setProductFilter] = useState<string[]>([])  // 목표 대비: 특정 제품만 보기 (다중선택)
   const [error, setError] = useState('')
   const [selectedKey, setSelectedKey] = useState<string | null>(null)  // 차트 대상 (null=전체합계)
   const [teamFilter, setTeamFilter] = useState<string>('')  // 목표 대비 팀 필터 ('' = 전체)
+  const [baseMonth, setBaseMonth] = useState(dayjs().format('YYYY-MM'))  // 목표 대비 기준월 (지난달 기준으로도 조회 가능)
+  const [demandBasis, setDemandBasis] = useState<'target' | 'max'>('target')  // 필요입고 수요 기준: 목표만 vs 목표·추세 최대
   const [shareProduct, setShareProduct] = useState<string | null>(null)  // 거래처 점유율 모달 대상 제품명
   const [shareMonth, setShareMonth] = useState<string | null>(null)  // 점유율 모달 대상 월 (null=전체 기간)
   const [editProduct, setEditProduct] = useState<string | null>(null)  // 목표 수정 모달 대상 제품명
@@ -92,6 +104,21 @@ export default function OutboundForecast({ config }: Props) {
   const [savingBom, setSavingBom] = useState(false)
 
   useEffect(() => { getOutboundTargets().then(setTargetStatus).catch(() => {}) }, [])
+
+  // 앱을 껐다 켜도 마지막 조회 결과 유지 — 서버 스냅샷 복원
+  useEffect(() => {
+    getLastOutboundForecast().then(snap => {
+      const r = snap.result
+      if (!r) return
+      setResult(prev => prev ?? r)
+      setRestoredAt(snap.saved_at)
+      setFromDate(r.from_date)
+      setToDate(r.to_date)
+      setPeriod(r.period)
+      setForecastMonths(r.forecast_months)
+      if (typeof r.expand_sets === 'boolean') setExpandSets(r.expand_sets)
+    }).catch(() => {})
+  }, [])
 
   async function openSetModal() {
     try { setSetBoms(await getSetBoms()) } catch { /* ignore */ }
@@ -247,6 +274,7 @@ export default function OutboundForecast({ config }: Props) {
         expand_sets: expandOverride ?? expandSets,
       })
       setResult(data)
+      setRestoredAt(null)
       setSelectedKey(null)
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || String(e)
@@ -385,10 +413,13 @@ export default function OutboundForecast({ config }: Props) {
   // ── 목표 대비 ────────────────────────────────────────────────
   const targets = result?.targets
   const targetMonths = targets?.months || []
-  const nowMonth = dayjs().format('YYYY-MM')
-  const prevMonth = dayjs().subtract(1, 'month').format('YYYY-MM')
-  const mon3ago = dayjs().subtract(3, 'month').format('YYYY-MM')   // 3개월 전 (3개월 추세 비교 기준)
-  const yoyMonth = dayjs().subtract(1, 'year').format('YYYY-MM')   // 전년 동월
+  // 기준월: 달성률·증감·필요입고 계산의 '현재' 기준. 월이 바뀐 직후에도
+  // 지난달 기준으로 대시보드를 볼 수 있게 선택 가능 (기본 = 실제 이번달)
+  const realNowMonth = dayjs().format('YYYY-MM')
+  const nowMonth = baseMonth
+  const prevMonth = dayjs(baseMonth + '-01').subtract(1, 'month').format('YYYY-MM')
+  const mon3ago = dayjs(baseMonth + '-01').subtract(3, 'month').format('YYYY-MM')   // 3개월 전 (3개월 추세 비교 기준)
+  const yoyMonth = dayjs(baseMonth + '-01').subtract(1, 'year').format('YYYY-MM')   // 전년 동월
   // 증감 표시 (성장/후퇴): 현재값 cur vs 기준값 base
   function growthTag(cur: number, base: number, fromM: string, toM: string) {
     if (base <= 0) return cur > 0
@@ -433,6 +464,12 @@ export default function OutboundForecast({ config }: Props) {
   const targetRows = (targets?.rows || [])
     .filter(r => !teamFilter || r.team === teamFilter)
     .filter(r => !search || r.name.includes(search) || r.team.includes(search) || r.brand.includes(search))
+    .filter(r => !productFilter.length || productFilter.includes(r.name))
+
+  // 제품 다중선택 옵션 (전체 목표 제품, 필터와 무관)
+  const productOptions = Array.from(new Set((targets?.rows || []).map(r => r.name)))
+    .sort().map(n => ({ label: n, value: n }))
+  const brandOptions = Array.from(new Set((targets?.rows || []).map(r => r.brand).filter(Boolean))).sort()
 
   // 전체 모드: 같은 제품의 팀별 행을 1행으로 병합 (목표·실적 합산, 재고는 제품 공유라 1회만)
   function mergeByProduct(rows: OutboundTargetRow[]): MergedRow[] {
@@ -474,7 +511,9 @@ export default function OutboundForecast({ config }: Props) {
     const pam = Object.keys(r.actual_by_month).filter(m => m <= nowMonth)
     const avgActual = pam.length ? Math.round(pam.reduce((s, m) => s + (r.actual_by_month[m] || 0), 0) / pam.length) : 0
     // 미래 월 수요 = max(목표, 과거 월평균 실적)  → 목표·추세 둘 다 반영
-    const demandOf = (m: string) => Math.max(r.target_by_month[m] || 0, avgActual)
+    const demandOf = (m: string) => demandBasis === 'target'
+      ? (r.target_by_month[m] || 0)                              // 목표 기준: 목표량만큼만 충당
+      : Math.max(r.target_by_month[m] || 0, avgActual)           // 추세 반영: 목표·과거 월평균 중 큰 값
     const req: Record<string, number> = {}            // 월별 필요 추가 입고
     const demandByMonth: Record<string, number> = {}  // 월별 적용 수요
     const balByMonth: Record<string, number> = {}     // 보충 없이 현재고로 버틸 때 월말 잔여
@@ -523,6 +562,65 @@ export default function OutboundForecast({ config }: Props) {
       pastTgt: pastTM.reduce((s, m) => s + (tgt[m] || 0), 0),
     }
   }
+
+  // ── 경영진 요약 보고서 자동 생성 (조회 결과 기준) ─────────────────
+  function buildExecAutoText(): string {
+    if (!result) return ''
+    const s = result.summary
+    const L: string[] = []
+    L.push(`■ 출고 예측 요약 (${dayjs().format('YYYY-MM-DD')} 작성 · 조회기간 ${result.from_date} ~ ${result.to_date}, ${result.days_span}일)`)
+    L.push(`• 기간 총 출고 ${s.grand_total.toLocaleString()}개 — 일평균 ${s.daily_avg.toLocaleString()}개 · 월평균 ${s.monthly_avg.toLocaleString()}개 (품목 ${s.item_count}개 · 거래처 ${s.partner_count}곳)`)
+    L.push(`• 현 추세 유지 시 향후 ${result.forecast_months}개월 예상 출고 ${s.forecast_total.toLocaleString()}개`)
+    if (s.deplete_soon > 0) L.push(`• ${result.forecast_months}개월 내 재고 소진 임박 품목 ${s.deplete_soon}개 — 입고 계획 점검 필요`)
+
+    if (targets?.enabled && (targets.teams?.length ?? 0) > 0) {
+      L.push('')
+      L.push(`■ 팀별 목표 달성 (${nowMonth.slice(5)}월 기준)`)
+      for (const t of targets.teams || []) {
+        const a = teamAgg[t]
+        if (!a) continue
+        const tn = a.tgt[nowMonth] || 0, an = a.act[nowMonth] || 0
+        const pctNow = tn > 0 ? Math.round(an / tn * 100) : null
+        const pctCum = a.pastTgt > 0 ? Math.round(a.pastAct / a.pastTgt * 100) : null
+        const prev = a.act[prevMonth] || 0
+        const mom = prev > 0 ? Math.round((an - prev) / prev * 100) : null
+        const yb = a.act[yoyMonth] || 0
+        const yoy = yb > 0 ? Math.round((an - yb) / yb * 100) : null
+        const parts = [
+          `이번달 ${pctNow == null ? '—' : pctNow + '%'} (${an.toLocaleString()}/${tn.toLocaleString()})`,
+          `누적 ${pctCum == null ? '—' : pctCum + '%'}`,
+        ]
+        if (mom != null) parts.push(`전월 대비 ${mom >= 0 ? '+' : ''}${mom}%`)
+        if (yoy != null) parts.push(`전년 동월 ${yoy >= 0 ? '+' : ''}${yoy}%`)
+        L.push(`• ${targets.team_labels?.[t] || t}: ${parts.join(' · ')}`)
+      }
+
+      if (futTM.length > 0) {
+        // 재고 리스크는 제품 단위(팀 병합)로 집계 — 재고는 팀 공유이므로 중복 계산 방지
+        const merged = mergeByProduct(targets.rows || [])
+        const shorts = merged
+          .map(r => ({ name: r.name, ci: coverInfo(r) }))
+          .filter(x => x.ci.shortMonth)
+          .sort((a, b) => a.ci.shortMonth.localeCompare(b.ci.shortMonth))
+        const totalReq = merged.reduce((sum, r) => sum + coverInfo(r).totalReq, 0)
+        L.push('')
+        L.push('■ 재고 리스크')
+        if (shorts.length > 0) {
+          const head = shorts.slice(0, 5).map(x => `${x.name}(${x.ci.shortMonth.slice(5)}월)`).join(', ')
+          L.push(`• 보충 입고가 없으면 재고 쇼트 예상 ${shorts.length}개 품목: ${head}${shorts.length > 5 ? ` 외 ${shorts.length - 5}개` : ''}`)
+        } else {
+          L.push('• 현재 재고로 미래 목표 수요 충당 가능 (재고 쇼트 예상 없음)')
+        }
+        if (totalReq > 0) L.push(`• 미래 목표 달성을 위해 추가 입고 필요 총 ${totalReq.toLocaleString()}개`)
+      }
+    }
+
+    L.push('')
+    L.push('■ 종합 의견')
+    L.push('• (필요 시 \'수정\'을 눌러 코멘트를 남기세요)')
+    return L.join('\n')
+  }
+  const execAutoText = buildExecAutoText()
 
   const teamSummaryColumns = [
     {
@@ -608,10 +706,19 @@ export default function OutboundForecast({ config }: Props) {
     return {
       title: (
         <span style={{ fontSize: '0.74rem', color: m === nowMonth ? '#2563eb' : isFuture ? '#7c3aed' : '#374151', fontWeight: m === nowMonth ? 700 : 500 }}>
-          {m === nowMonth ? `${m.slice(5)}월(현재)` : `${m.slice(5)}월`}{isFuture && <><br /><span style={{ fontSize: '0.6rem', fontWeight: 400 }}>필요입고</span></>}
+          {m === nowMonth ? `${m.slice(5)}월(기준)` : `${m.slice(5)}월`}{isFuture && <><br /><span style={{ fontSize: '0.6rem', fontWeight: 400 }}>필요입고</span></>}
         </span>
       ),
       key: m, width: 96, align: 'center' as const,
+      // 정렬: 과거/현재월 = 달성률(목표 없으면 출고량 우선), 미래월 = 필요입고량
+      sorter: (a: OutboundTargetRow, b: OutboundTargetRow) => {
+        if (isFuture) return (coverInfo(a).req[m] ?? 0) - (coverInfo(b).req[m] ?? 0)
+        const g = (r: OutboundTargetRow) => {
+          const t = r.target_by_month[m] || 0, ac = r.actual_by_month[m] || 0
+          return t > 0 ? ac / t : ac > 0 ? 999 + ac : -1
+        }
+        return g(a) - g(b)
+      },
       onCell: (record: OutboundTargetRow) => isFuture
         ? { style: { background: '#faf5ff' } }
         : {
@@ -684,10 +791,14 @@ export default function OutboundForecast({ config }: Props) {
     },
     {
       title: '브랜드', dataIndex: 'brand', key: 'brand', width: 96, fixed: 'left' as const, ellipsis: true,
+      sorter: (a: OutboundTargetRow, b: OutboundTargetRow) => (a.brand || '').localeCompare(b.brand || ''),
+      filters: brandOptions.map(b => ({ text: b, value: b })),
+      onFilter: (v: unknown, r: OutboundTargetRow) => r.brand === v,
       render: (v: string) => <span style={{ fontSize: '0.78rem', color: '#6b7280' }}>{v}</span>,
     },
     {
       title: '공통상품명', dataIndex: 'name', key: 'name', width: 260, fixed: 'left' as const,
+      sorter: (a: OutboundTargetRow, b: OutboundTargetRow) => a.name.localeCompare(b.name),
       render: (v: string, r: OutboundTargetRow) => (
         <span style={{ fontSize: '0.82rem' }}>
           {v}{' '}
@@ -708,7 +819,7 @@ export default function OutboundForecast({ config }: Props) {
     },
     ...targetMonthColumns,
     {
-      title: <Tooltip title="보충 입고가 없을 때, 현재 재고로 미래 월 수요(=목표·과거 월평균 중 큰 값)를 충당하다 재고가 바닥나는 예상 월"><span style={{ fontSize: '0.74rem' }}>재고 쇼트 예상</span></Tooltip>,
+      title: <Tooltip title={`보충 입고가 없을 때, 현재 재고로 미래 월 수요(=${demandBasis === 'target' ? '목표량' : '목표·과거 월평균 중 큰 값'})를 충당하다 재고가 바닥나는 예상 월`}><span style={{ fontSize: '0.74rem' }}>재고 쇼트 예상</span></Tooltip>,
       key: 'short', width: 120, align: 'center' as const, fixed: 'right' as const,
       sorter: (a: OutboundTargetRow, b: OutboundTargetRow) =>
         (coverInfo(a).shortMonth || '9999') < (coverInfo(b).shortMonth || '9999') ? -1 : 1,
@@ -727,7 +838,7 @@ export default function OutboundForecast({ config }: Props) {
       },
     },
     {
-      title: <Tooltip title="미래 수요(목표·과거 월평균 중 큰 값)를 모두 충당하려면 추가로 필요한 총 입고량 (현재 재고 차감 후)"><span style={{ fontSize: '0.74rem' }}>추가입고 필요</span></Tooltip>,
+      title: <Tooltip title={`미래 수요(${demandBasis === 'target' ? '목표량' : '목표·과거 월평균 중 큰 값'})를 모두 충당하려면 추가로 필요한 총 입고량 (현재 재고 차감 후)`}><span style={{ fontSize: '0.74rem' }}>추가입고 필요</span></Tooltip>,
       key: 'cover', width: 130, align: 'center' as const, fixed: 'right' as const,
       sorter: (a: OutboundTargetRow, b: OutboundTargetRow) => coverInfo(a).totalReq - coverInfo(b).totalReq,
       render: (_: unknown, r: OutboundTargetRow) => {
@@ -891,6 +1002,9 @@ export default function OutboundForecast({ config }: Props) {
         <p className="page-desc">박스히어로 거래처별·품목별 {periodLabel}단위 출고 추세 + 재고 소진 예측</p>
       </div>
 
+      {/* 경영진 요약 보고서 (자동 생성 + 수기 수정 가능) */}
+      <ExecReport pageKey="outbound" autoText={execAutoText} />
+
       {/* 컨트롤 */}
       <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e5e7eb', padding: '16px 20px', marginBottom: 16, display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div>
@@ -973,6 +1087,10 @@ export default function OutboundForecast({ config }: Props) {
           message="박스히어로 토큰이 필요합니다. 설정에서 먼저 연동해 주세요." />
       )}
       {error && <Alert type="error" message={error} style={{ marginBottom: 12 }} />}
+      {restoredAt && result && (
+        <Alert type="info" showIcon style={{ marginBottom: 12 }}
+          message={<span style={{ fontSize: '0.82rem' }}>💾 마지막 조회 결과입니다 (저장: {restoredAt}) — 최신 데이터가 필요하면 다시 조회하세요.</span>} />
+      )}
 
       {loading && (
         <div style={{ textAlign: 'center', padding: 60 }}>
@@ -1074,7 +1192,26 @@ export default function OutboundForecast({ config }: Props) {
 
       {result && !loading && groupBy === 'target' && targets?.enabled && (
         <>
-          {/* 팀별 종합 달성률 카드 (현재월 + 누적) */}
+          {/* 기준월 선택 — 월이 바뀐 직후에도 지난달 기준으로 대시보드 조회 */}
+          <div style={{ background: '#fff', borderRadius: 10, border: '1px solid #e5e7eb', padding: '8px 16px', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.78rem', color: '#374151', fontWeight: 700 }}>📅 기준월</span>
+            <DatePicker
+              picker="month" size="small" allowClear={false}
+              value={dayjs(baseMonth + '-01')}
+              onChange={d => d && setBaseMonth(d.format('YYYY-MM'))}
+            />
+            {baseMonth !== realNowMonth && (
+              <>
+                <Tag color="orange" style={{ fontSize: '0.66rem' }}>{baseMonth.slice(5)}월 기준으로 보는 중</Tag>
+                <Button size="small" type="link" style={{ padding: 0 }} onClick={() => setBaseMonth(realNowMonth)}>이번달로 돌아가기</Button>
+              </>
+            )}
+            <span style={{ fontSize: '0.7rem', color: '#9ca3af', marginLeft: 'auto' }}>
+              달성률·전월대비·필요입고가 이 달을 '현재'로 놓고 계산됩니다
+            </span>
+          </div>
+
+          {/* 팀별 종합 달성률 카드 (기준월 + 누적) */}
           <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
             {(targets.teams || []).map(team => {
               const a = teamAgg[team]
@@ -1123,6 +1260,77 @@ export default function OutboundForecast({ config }: Props) {
             </div>
           )}
 
+          {/* 차트 대시보드: 월별 목표 vs 실적 · 추가입고 필요 · 재고 쇼트 (현재 팀/제품 필터 반영) */}
+          {(() => {
+            const monthStats = targetMonths.map(m => {
+              const isFuture = m > nowMonth
+              const tgt = displayRows.reduce((s, r) => s + (r.target_by_month[m] || 0), 0)
+              const act = isFuture ? 0 : displayRows.reduce((s, r) => s + (r.actual_by_month[m] || 0), 0)
+              const req = isFuture ? displayRows.reduce((s, r) => s + (coverInfo(r).req[m] || 0), 0) : 0
+              return { m, isFuture, tgt, act, req, pct: !isFuture && tgt > 0 ? Math.round(act / tgt * 100) : null }
+            })
+            const chartMax = Math.max(...monthStats.flatMap(x => [x.tgt, x.act, x.req]), 1)
+            const h = (v: number) => Math.max(v > 0 ? 3 : 0, Math.round((v / chartMax) * 110))
+            // 종합 달성률 (현재까지 도래한 목표월 기준) 상위/하위 랭킹
+            const achRanked = displayRows
+              .map(r => ({ r, act: pastActual(r), tgt: pastTargetSum(r) }))
+              .filter(x => x.tgt > 0)
+              .map(x => ({ ...x, pct: Math.round(x.act / x.tgt * 100) }))
+            const achTop = [...achRanked].sort((a, b) => b.pct - a.pct).slice(0, 10)
+              .map(x => ({ label: x.r.name, value: x.pct, sub: `${fmtCompact(x.act)}/${fmtCompact(x.tgt)}` }))
+            const achBottom = [...achRanked].sort((a, b) => a.pct - b.pct).slice(0, 10)
+              .map(x => ({ label: x.r.name, value: x.pct, sub: `${fmtCompact(x.act)}/${fmtCompact(x.tgt)}` }))
+            return (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: 12, marginBottom: 14 }}>
+                {/* 월별 목표 vs 실적 vs 필요입고 (세로 막대) */}
+                <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e5e7eb', padding: '14px 18px' }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: 4 }}>
+                    월별 목표 vs 실적 <span style={{ color: '#9ca3af', fontWeight: 400, fontSize: '0.72rem' }}>({teamFilter ? (targets.team_labels?.[teamFilter] || teamFilter) : '전체'}{productFilter.length ? ` · 선택 제품 ${productFilter.length}개` : ''})</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 12, fontSize: '0.7rem', color: '#6b7280', marginBottom: 8 }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 9, height: 9, borderRadius: 2, background: '#d1d5db' }} />목표</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 9, height: 9, borderRadius: 2, background: '#10b981' }} />실적</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 9, height: 9, borderRadius: 2, background: '#7c3aed' }} />필요입고(미래)</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 158, overflowX: 'auto', paddingBottom: 2 }}>
+                    {monthStats.map(x => (
+                      <Tooltip key={x.m} title={x.isFuture
+                        ? `${x.m} — 목표 ${x.tgt.toLocaleString()} · 필요입고 ${x.req.toLocaleString()}`
+                        : `${x.m} — 실적 ${x.act.toLocaleString()} / 목표 ${x.tgt.toLocaleString()}${x.pct != null ? ` (${x.pct}%)` : ''}`}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, minWidth: 52, cursor: 'default' }}>
+                          <div style={{ fontSize: '0.68rem', fontWeight: 700, color: x.isFuture ? '#7c3aed' : achColor(x.pct), height: 15 }}>
+                            {x.isFuture ? (x.req > 0 ? `+${fmtCompact(x.req)}` : '충당') : (x.pct != null ? `${x.pct}%` : '')}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height: 112 }}>
+                            <div style={{ width: 16, height: h(x.tgt), background: '#d1d5db', borderRadius: '4px 4px 0 0' }} />
+                            {x.isFuture
+                              ? <div style={{ width: 16, height: h(x.req), background: '#7c3aed', borderRadius: '4px 4px 0 0' }} />
+                              : <div style={{ width: 16, height: h(x.act), background: '#10b981', borderRadius: '4px 4px 0 0' }} />}
+                          </div>
+                          <div style={{ fontSize: '0.7rem', color: x.m === nowMonth ? '#2563eb' : '#6b7280', fontWeight: x.m === nowMonth ? 700 : 400 }}>
+                            {x.m.slice(5)}월{x.m === nowMonth ? '*' : ''}
+                          </div>
+                        </div>
+                      </Tooltip>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 달성률 상위권 TOP 10 */}
+                <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e5e7eb', padding: '14px 18px' }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: 10 }}>달성률 상위권 TOP 10 <span style={{ color: '#9ca3af', fontWeight: 400, fontSize: '0.72rem' }}>(종합 달성률 · 값 옆 = 출고/목표)</span></div>
+                  <BarList rows={achTop} color="#10b981" unit="%" />
+                </div>
+
+                {/* 달성률 하위권 TOP 10 */}
+                <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #e5e7eb', padding: '14px 18px' }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.85rem', marginBottom: 10 }}>달성률 하위권 TOP 10 <span style={{ color: '#9ca3af', fontWeight: 400, fontSize: '0.72rem' }}>(종합 달성률 · 값 옆 = 출고/목표)</span></div>
+                  <BarList rows={achBottom} color="#ef4444" unit="%" />
+                </div>
+              </div>
+            )
+          })()}
+
           {(targets.unmapped_partners?.length ?? 0) > 0 && (
             <Alert
               type="warning" showIcon style={{ marginBottom: 12 }}
@@ -1157,14 +1365,28 @@ export default function OutboundForecast({ config }: Props) {
                   <Tag color="purple" style={{ fontSize: '0.68rem' }}>세트 분해 {targets.set_expanded_qty!.toLocaleString()}개</Tag>
                 </Tooltip>
               )}
+              <Tooltip title="필요입고 계산 기준 — 목표 기준: 목표량만 충당하면 되는 양 · 추세 반영: 목표와 최근 판매 추세(과거 월평균) 중 큰 쪽을 충당하는 양">
+                <Radio.Group size="small" value={demandBasis} onChange={e => setDemandBasis(e.target.value)}>
+                  <Radio.Button value="target">목표 기준</Radio.Button>
+                  <Radio.Button value="max">추세 반영</Radio.Button>
+                </Radio.Group>
+              </Tooltip>
+              <Select
+                mode="multiple" size="small" allowClear showSearch
+                placeholder="제품 선택 (일부만 보기)"
+                value={productFilter} onChange={setProductFilter}
+                options={productOptions}
+                maxTagCount={2}
+                style={{ minWidth: 240, maxWidth: 420, marginLeft: 'auto' }}
+              />
               <Input.Search
-                size="small" placeholder="상품명 검색"
+                size="small" placeholder="상품명·브랜드·팀 검색" allowClear
                 value={search} onChange={e => setSearch(e.target.value)}
-                style={{ width: 180, marginLeft: 'auto' }}
+                style={{ width: 180 }}
               />
             </div>
             <div style={{ fontSize: '0.72rem', color: '#9ca3af', marginBottom: 8 }}>
-              {teamFilter ? '팀별' : '전체 = 제품 1행(달성 칸은 BD·BE 분리 표시)'} · 지난·이번달 = 출고/목표·달성률 · <span style={{ color: '#7c3aed' }}>보라(미래) = 필요한 추가 입고량</span>(현재고로 충당되면 '충당') · <span style={{ color: '#7c3aed' }}>수요* = 목표·과거 월평균 중 큰 값</span> · <b>행 클릭=전체기간 점유율 · 월 칸 클릭=그 달 점유율</b>
+              {teamFilter ? '팀별' : '전체 = 제품 1행(달성 칸은 BD·BE 분리 표시)'} · 지난·이번달 = 출고/목표·달성률 · <span style={{ color: '#7c3aed' }}>보라(미래) = 목표 대비 필요한 추가 입고량</span>(현재고로 충당되면 '충당') · <span style={{ color: '#7c3aed' }}>{demandBasis === 'target' ? '수요 = 월별 목표량 (목표 기준)' : '수요* = 목표·과거 월평균 중 큰 값 (추세 반영)'}</span> · <b>행 클릭=전체기간 점유율 · 월 칸 클릭=그 달 점유율</b>
             </div>
             <Table
               dataSource={displayRows}

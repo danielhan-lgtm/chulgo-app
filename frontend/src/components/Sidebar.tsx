@@ -5,7 +5,7 @@ import {
   MessageOutlined, MailOutlined, SettingOutlined, InboxOutlined,
   ImportOutlined, AuditOutlined, FileTextOutlined, DiffOutlined, BarChartOutlined, LinkOutlined,
   CalendarOutlined, DeleteOutlined, FilePptOutlined, TagsOutlined, LineChartOutlined,
-  ShopOutlined, GiftOutlined,
+  ShopOutlined, GiftOutlined, FundOutlined, SolutionOutlined,
 } from '@ant-design/icons'
 import type { Page } from '../types'
 import { uploadMaster } from '../services/api'
@@ -26,6 +26,10 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
       { key: 'dashboard', icon: <DashboardOutlined />, label: '대시보드' },
       { key: 'channel', icon: <BarChartOutlined />, label: '채널별 현황' },
       { key: 'outbound', icon: <LineChartOutlined />, label: '출고 예측' },
+      { key: 'execreport', icon: <SolutionOutlined />, label: '임원 보고서' },
+      { key: 'coupangreport', icon: <ShoppingOutlined />, label: '쿠팡 발주 보고' },
+      { key: 'oliveyoungreport', icon: <ShopOutlined />, label: '올리브영 발주 보고' },
+      { key: 'kurlyreport', icon: <GiftOutlined />, label: '컬리 발주 보고' },
     ],
   },
   {
@@ -58,6 +62,7 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
   {
     title: '재고 관리',
     items: [
+      { key: 'inventory', icon: <FundOutlined />, label: '재고 분석' },
       { key: 'reconcile', icon: <DiffOutlined />, label: '재고 대사' },
       { key: 'mapping', icon: <LinkOutlined />, label: '상품 매핑' },
       { key: 'disposal', icon: <DeleteOutlined />, label: '폐기 리포트' },

@@ -3,7 +3,7 @@ import { Button, Upload, message, Spin, Input, Alert, Select, Checkbox, Tooltip 
 import { DownloadOutlined, DeleteOutlined, PlusOutlined, FilePptOutlined, SettingOutlined, PushpinOutlined } from '@ant-design/icons'
 import { parseCoupangLoad, generateCoupangLoad, getCoupangLoadSettings, saveCoupangLoadSettings } from '../services/api'
 import type { CoupangLoadRow, CoupangLoadSettings } from '../services/api'
-import { DEFAULT_PALLET_CAP, distributeByCapacity, effectiveCap } from '../lib/pallet'
+import { DEFAULT_PALLET_CAP, distributeByCapacity, effectiveCap, isSingleSkuCenter } from '../lib/pallet'
 
 interface Header {
   supplier: string
@@ -125,8 +125,10 @@ export default function CoupangLoadList() {
       else if (mode === 'fixed') target = Math.max(1, settings?.pallet_total_fixed || 1)
       // 목표 팔레트 수가 있으면 박스를 고르게 나누되, 파레트당 최대 박스는 넘지 않게
       const totalBoxSum = baseRows.reduce((s, r) => s + (Number(r.box) || 0), 0)
-      const cap = effectiveCap(totalBoxSum, palletCap, target)
-      const { rows: distRows, count } = distributeByCapacity(baseRows, cap)
+      // RC 센터: 1팔레트 1SKU 규칙 — 목표 팔레트 수보다 규칙이 우선(용량 cap 그대로 사용)
+      const singleSku = isSingleSkuCenter(data.center || '')
+      const cap = singleSku ? palletCap : effectiveCap(totalBoxSum, palletCap, target)
+      const { rows: distRows, count } = distributeByCapacity(baseRows, cap, singleSku)
       setRows(distRows)
       setHeader({
         supplier: data.supplier || '',
@@ -134,7 +136,7 @@ export default function CoupangLoadList() {
         date: data.date || '',
         milkrun: data.milkrun || '',
         pallet: data.pallet || '1-1',
-        pallet_total: Math.max(count, target),
+        pallet_total: singleSku ? count : Math.max(count, target),
       })
       setHasAttach(data.has_부착)
       setWarnings(data.warnings || [])
@@ -192,11 +194,17 @@ export default function CoupangLoadList() {
     setAttachPalletTotal(1)
   }
 
+  const singleSkuMode = isSingleSkuCenter(header.center)
+
   function handleAutoDistribute() {
-    const { rows: distRows, count } = distributeByCapacity(rows, palletCap)
+    const { rows: distRows, count } = distributeByCapacity(rows, palletCap, singleSkuMode)
     setRows(distRows)
     setHeader(h => ({ ...h, pallet_total: count }))
-    message.success(`팔레트당 최대 ${palletCap}박스 기준으로 ${count}개 팔레트에 분배했습니다.`)
+    message.success(
+      singleSkuMode
+        ? `RC 센터 규칙(1팔레트 1SKU) + 팔레트당 최대 ${palletCap}박스 기준으로 ${count}개 팔레트에 분배했습니다.`
+        : `팔레트당 최대 ${palletCap}박스 기준으로 ${count}개 팔레트에 분배했습니다.`,
+    )
   }
 
   const labelStyle = { fontSize: '0.78rem', color: '#6b7280', marginBottom: 4 }
@@ -402,6 +410,11 @@ export default function CoupangLoadList() {
             </div>
             <div style={{ marginTop: 12, fontSize: '0.8rem', color: '#374151' }}>
               📊 <b>{slideCount}장</b>의 슬라이드가 생성됩니다 (팔레트 {slideCount}개)
+              {singleSkuMode && (
+                <span style={{ color: '#b91c1c', fontWeight: 600 }}>
+                  {' '}🚫 RC 센터 — 1팔레트에 1SKU만 적재(혼적 금지) 규칙이 적용됩니다.
+                </span>
+              )}
               {hasAttach && attachPalletTotal !== slideCount && (
                 <span style={{ color: '#b45309' }}>
                   {' '}⚠️ 부착리스트 기준은 {attachPalletTotal}개입니다 — 용량(팔레트당 {palletCap}박스)으로 계산한 값과 다릅니다. 확인하세요.

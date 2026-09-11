@@ -251,6 +251,9 @@ def generate_invoice(body: GenerateRequest):
         if not os.path.exists(tpl):
             raise HTTPException(status_code=500, detail=f"거래명세서 양식 파일을 찾을 수 없습니다: {tpl}")
 
+        if not body.items:
+            raise HTTPException(status_code=400, detail="품목이 없습니다. 최소 1개 이상의 품목을 입력해주세요.")
+
         # 7개씩 청크 분할 (7개 초과 시 여러 시트 생성)
         PAGE_SIZE = 7
         chunks = [body.items[i:i + PAGE_SIZE] for i in range(0, len(body.items), PAGE_SIZE)]

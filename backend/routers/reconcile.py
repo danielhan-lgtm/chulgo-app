@@ -3487,6 +3487,93 @@ def product_match(
     }
 
 
+# ── 수기 재고 (부자재 등 한쪽 시스템에만 있는 상품의 반대편 재고를 수동 입력) ──
+_MANUAL_STOCK_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "manual_stock.json")
+
+
+def _load_manual_stock() -> dict:
+    """key(정규화 상품명) -> {name, side('bh'|'ob'), qty, memo, updated_at}"""
+    try:
+        if os.path.exists(_MANUAL_STOCK_PATH):
+            with open(_MANUAL_STOCK_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+    except Exception:
+        pass
+    return {}
+
+
+def _save_manual_stock(d: dict) -> None:
+    os.makedirs(os.path.dirname(_MANUAL_STOCK_PATH), exist_ok=True)
+    with open(_MANUAL_STOCK_PATH, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+@router.get("/manual-stock")
+def get_manual_stock():
+    return {"items": _load_manual_stock()}
+
+
+@router.post("/manual-stock")
+def set_manual_stock(body: dict):
+    """수기 재고 등록/수정. body: {key, name, side: 'bh'|'ob', qty, memo?}
+    side = 재고가 '없는' 쪽 (그쪽 수량을 수동으로 채움)."""
+    key = str(body.get("key") or "").strip()
+    side = str(body.get("side") or "").strip()
+    if not key:
+        raise HTTPException(400, "key 필요")
+    if side not in ("bh", "ob"):
+        raise HTTPException(400, "side는 'bh' 또는 'ob'")
+    try:
+        qty = int(body.get("qty"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "qty 숫자 필요")
+    d = _load_manual_stock()
+    d[key] = {
+        "name": str(body.get("name") or key),
+        "side": side,
+        "qty": qty,
+        "memo": str(body.get("memo") or ""),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    _save_manual_stock(d)
+    return {"ok": True, "items": d}
+
+
+@router.delete("/manual-stock")
+def delete_manual_stock(key: str = Query(...)):
+    d = _load_manual_stock()
+    if key in d:
+        del d[key]
+        _save_manual_stock(d)
+    return {"ok": True, "items": d}
+
+
+@router.post("/stock-link")
+def link_stock_items(body: dict):
+    """재고 현황에서 BH 품목 ↔ OB 품목 드래그 연결 → name_mapping 영구 저장.
+    body: {bh: {sku?, skus?, name}, ob: {name?, names?}}"""
+    import receiving_db as _db
+    bh = body.get("bh") or {}
+    ob = body.get("ob") or {}
+    bh_skus = [str(s).strip() for s in (bh.get("skus") or []) if str(s).strip()]
+    if not bh_skus and str(bh.get("sku") or "").strip():
+        bh_skus = [str(bh.get("sku")).strip()]
+    bh_name = str(bh.get("name") or "").strip()
+    ob_names = [str(n).strip() for n in (ob.get("names") or []) if str(n).strip()]
+    if not ob_names and str(ob.get("name") or "").strip():
+        ob_names = [str(ob.get("name")).strip()]
+    if not bh_skus:
+        raise HTTPException(400, "BH SKU가 없어 매핑할 수 없습니다")
+    if not ob_names:
+        raise HTTPException(400, "OB 상품명이 없어 매핑할 수 없습니다")
+    for sku in bh_skus:
+        for on in ob_names:
+            _db.upsert_name_mapping(on, sku, bh_name, 100.0, "stock-drag", 1)
+    return {"ok": True, "pairs": len(bh_skus) * len(ob_names)}
+
+
 @router.get("/stock")
 def get_stock(
     token: str = Query(...),
@@ -3639,11 +3726,24 @@ def get_stock(
         if ob.get("name"): m["ob_names"].add(ob["name"])
 
     # ── 행 구성 + 차이 원인 자동 분해 ────────────────────────────────
+    manual_stock = _load_manual_stock()  # 부자재 등 한쪽에만 있는 상품의 반대편 수기 재고
     rows = []
     for gk, m in merged.items():
         bh_q = m["bh_stock"]
         ob_total = m["ob_total"]
         ob_avail = m["ob_avail"]
+
+        # 수기 재고 적용: 실데이터가 없는 쪽만 채움 (실데이터가 생기면 그쪽이 우선)
+        manual = manual_stock.get(gk)
+        manual_applied = None
+        if manual:
+            if manual.get("side") == "bh" and bh_q is None:
+                bh_q = int(manual.get("qty") or 0)
+                manual_applied = manual
+            elif manual.get("side") == "ob" and ob_total is None:
+                ob_total = int(manual.get("qty") or 0)
+                ob_avail = ob_total
+                manual_applied = manual
         # OurBox unavailable_stock 직접 사용 (가용외 = 출고할당·작업중·불용 등). total-available 계산 아님
         unusable = m["ob_unav"] if m["ob_unav"] is not None else ((ob_total - ob_avail) if (ob_total is not None and ob_avail is not None) else 0)
         # 차이 = BH재고 - OB총재고 (가용외 포함). 가용외는 OB 내부 상태(할당/보류)라 비교 기준에서 제외 →
@@ -3664,8 +3764,23 @@ def get_stock(
             if unusable and unusable > 0:
                 causes.append({"type": "가용외", "qty": None,
                                "desc": f"OB 가용외 {unusable:,}개 (출고 할당·작업중·불용 등). 총재고 비교라 차이엔 영향 없음(참고)"})
+        if manual_applied:
+            causes.append({"type": "수기재고", "qty": manual_applied.get("qty"),
+                           "desc": f"{'BH' if manual_applied.get('side')=='bh' else 'OB'} 쪽 재고를 수기 입력 "
+                                   f"({manual_applied.get('qty'):,}개, {manual_applied.get('updated_at','')})"
+                                   + (f" — {manual_applied.get('memo')}" if manual_applied.get('memo') else "")})
+
+        # 한쪽에만 재고가 있는 미매칭 상품 (수기 재고 적용 후 기준)
+        only_side = None
+        if bh_q is not None and ob_total is None:
+            only_side = "bh"
+        elif bh_q is None and ob_total is not None:
+            only_side = "ob"
 
         rows.append({
+            "key": gk,
+            "only_side": only_side,           # 'bh'=BH에만 재고, 'ob'=OB에만 재고, None=양쪽
+            "manual": manual_applied,          # 적용된 수기 재고 {side, qty, memo, updated_at}
             "name": m["name"] or gk,
             "sku": m["sku"],
             "ob_code": m["ob_code"],
@@ -3687,8 +3802,8 @@ def get_stock(
     rows.sort(key=lambda x: -(abs(x["diff"]) if x["diff"] is not None else 0))
     ok = [r for r in rows if r["diff"] == 0]
     diff_rows = [r for r in rows if r["diff"] is not None and r["diff"] != 0]
-    only_bh = [r for r in rows if r["bh_stock"] is not None and r["ob_stock_total"] is None]
-    only_ob = [r for r in rows if r["bh_stock"] is None and r["ob_stock_total"] is not None]
+    only_bh = [r for r in rows if r.get("only_side") == "bh"]
+    only_ob = [r for r in rows if r.get("only_side") == "ob"]
     # 잔여(불용/매핑으로 설명 안 됨)가 0이 아닌 행 = 진짜 거래 추적 필요
     need_trace = [r for r in rows if r.get("residual") not in (None, 0)]
 

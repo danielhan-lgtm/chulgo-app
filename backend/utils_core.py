@@ -548,9 +548,27 @@ def fetch_slack_orders(token: str, channel_id: str) -> tuple:
     orders = []
     debug = ""
     try:
-        result = client.conversations_history(channel=channel_id, limit=100)
-        all_msgs = result.get("messages", [])
-        debug = f"총 {len(all_msgs)}개 메시지 조회됨"
+        # 최근 180일까지 페이지네이션으로 전부 조회 (예전 미처리건도 보이도록; 최대 5000건 안전장치)
+        lookback_days = 180
+        max_msgs = 5000
+        oldest_ts = (datetime.datetime.now() - datetime.timedelta(days=lookback_days)).timestamp()
+        all_msgs = []
+        cursor = None
+        truncated = False
+        while True:
+            result = client.conversations_history(
+                channel=channel_id, limit=200, oldest=str(oldest_ts), cursor=cursor
+            )
+            all_msgs.extend(result.get("messages", []))
+            cursor = (result.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+            if len(all_msgs) >= max_msgs:
+                truncated = True
+                break
+        debug = f"총 {len(all_msgs)}개 메시지 조회됨 (최근 {lookback_days}일)"
+        if truncated:
+            debug += f" — {max_msgs}건 상한 도달, 더 오래된 메시지는 잘렸을 수 있음"
         for msg in all_msgs:
             text = _replace_user_mentions(client, msg.get("text", ""))
             excel_files = [

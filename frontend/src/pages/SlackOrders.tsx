@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Button, Select, message, Spin, Alert, Row, Col, Upload, Switch } from 'antd'
+import { Button, Select, message, Spin, Alert, Row, Col, Upload, Switch, Checkbox } from 'antd'
 import { ReloadOutlined, RobotOutlined } from '@ant-design/icons'
 import type { AppConfig, Location, SlackOrder, Page } from '../types'
 import {
@@ -122,6 +122,9 @@ export default function SlackOrders({ config, channels, locations }: Props) {
   const [notifyOn, setNotifyOn] = useState<boolean>(!!config.slack_outbound_notify)
   const [notifyChannel, setNotifyChannel] = useState<string>(config.slack_outbound_channel || '물류_출고')
   const [notifyTime, setNotifyTime] = useState<string>(config.bh_notify_time || '18:00')
+  // 다중 선택 → 상태 일괄 변경
+  const [selectedTs, setSelectedTs] = useState<Set<string>>(new Set())
+  const [bulkEmoji, setBulkEmoji] = useState<string | null>(null)  // 일괄 처리 중인 이모지
 
   const channelNames = Object.keys(channels)
   const channelId = selectedChannel ? channels[selectedChannel] : ''
@@ -148,6 +151,7 @@ export default function SlackOrders({ config, channels, locations }: Props) {
       setOrders(res.orders || [])
       setDebug(res.debug || '')
       setSelectedIdx(0)
+      setSelectedTs(new Set())
     } catch (e: any) {
       message.error('메시지 로드 실패: ' + (e.response?.data?.detail || e.message))
     } finally {
@@ -189,6 +193,30 @@ export default function SlackOrders({ config, channels, locations }: Props) {
         message.error('채널 참여 실패: ' + detail)
       }
     }
+  }
+
+  // 선택된 메시지들에 상태 이모지 일괄 적용 (이미 있는 메시지는 건너뜀 — 토글이라 빼지 않도록)
+  async function handleBulkReaction(emoji: string) {
+    if (!config.slack_token || selectedTs.size === 0) return
+    const targets = orders.filter(o => selectedTs.has(o.ts) && !o.reactions.some(r => r.name === emoji))
+    const skipped = selectedTs.size - targets.length
+    if (targets.length === 0) {
+      message.info('선택한 메시지 모두 이미 해당 상태입니다')
+      return
+    }
+    setBulkEmoji(emoji)
+    let ok = 0, fail = 0
+    for (const o of targets) {
+      try {
+        await toggleSlackReaction(config.slack_token, channelId, o.ts, emoji)
+        ok++
+      } catch { fail++ }
+    }
+    setBulkEmoji(null)
+    if (fail) message.warning(`${ok}건 적용 · ${fail}건 실패${skipped ? ` · ${skipped}건은 이미 적용됨` : ''}`)
+    else message.success(`${ok}건 적용 완료${skipped ? ` (${skipped}건은 이미 적용됨)` : ''}`)
+    setSelectedTs(new Set())
+    await handleRefresh()
   }
 
   async function handleReaction(emoji: string) {
@@ -365,6 +393,37 @@ export default function SlackOrders({ config, channels, locations }: Props) {
         <Row gutter={[12, 12]}>
           {/* Order list */}
           <Col span={8} style={{ maxHeight: 'calc(100vh - 260px)', overflowY: 'auto' }}>
+            {/* 다중 선택 툴바 */}
+            {visibleOrders.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8, padding: '6px 10px', background: selectedTs.size ? '#eff6ff' : '#f9fafb', border: `1px solid ${selectedTs.size ? '#bfdbfe' : '#e5e7eb'}`, borderRadius: 8 }}>
+                <Checkbox
+                  checked={visibleOrders.length > 0 && visibleOrders.every(({ o }) => selectedTs.has(o.ts))}
+                  indeterminate={visibleOrders.some(({ o }) => selectedTs.has(o.ts)) && !visibleOrders.every(({ o }) => selectedTs.has(o.ts))}
+                  onChange={e => {
+                    const next = new Set(selectedTs)
+                    if (e.target.checked) visibleOrders.forEach(({ o }) => next.add(o.ts))
+                    else visibleOrders.forEach(({ o }) => next.delete(o.ts))
+                    setSelectedTs(next)
+                  }}
+                >
+                  <span style={{ fontSize: '0.76rem', color: '#374151' }}>전체{statusFilter ? ` (${statusFilter})` : ''}</span>
+                </Checkbox>
+                {selectedTs.size > 0 && (
+                  <>
+                    <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#1d4ed8' }}>{selectedTs.size}건 선택</span>
+                    {[
+                      { emoji: 'hourglass_flowing_sand', label: '⏳ 처리중' },
+                      { emoji: 'white_check_mark', label: '✅ 완료' },
+                      { emoji: 'x', label: '❌ 반려' },
+                    ].map(b => (
+                      <Button key={b.emoji} size="small" loading={bulkEmoji === b.emoji} disabled={!!bulkEmoji && bulkEmoji !== b.emoji}
+                        onClick={() => handleBulkReaction(b.emoji)}>{b.label}</Button>
+                    ))}
+                    <Button size="small" type="text" disabled={!!bulkEmoji} onClick={() => setSelectedTs(new Set())} style={{ color: '#9ca3af' }}>선택 해제</Button>
+                  </>
+                )}
+              </div>
+            )}
             {visibleOrders.length === 0 && (
               <div style={{ color: '#9ca3af', fontSize: '0.82rem', textAlign: 'center', padding: 20 }}>
                 해당 상태의 메시지가 없습니다
@@ -385,7 +444,19 @@ export default function SlackOrders({ config, channels, locations }: Props) {
                   }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                    <span style={{ fontSize: '0.68rem', color: '#9ca3af' }}>{o.dt} {o.files.length > 0 ? '📎' : ''}</span>
+                    <span style={{ fontSize: '0.68rem', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span onClick={e => e.stopPropagation()} style={{ display: 'inline-flex' }}>
+                        <Checkbox
+                          checked={selectedTs.has(o.ts)}
+                          onChange={e => {
+                            const next = new Set(selectedTs)
+                            if (e.target.checked) next.add(o.ts); else next.delete(o.ts)
+                            setSelectedTs(next)
+                          }}
+                        />
+                      </span>
+                      {o.dt} {o.files.length > 0 ? '📎' : ''}
+                    </span>
                     {status ? (
                       <span style={{ background: status.bg, color: status.color, borderRadius: 4, padding: '1px 8px', fontSize: '0.7rem', fontWeight: 700 }}>● {status.label}</span>
                     ) : o.reactions.length > 0 ? (

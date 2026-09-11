@@ -12,8 +12,9 @@ export interface PalletDistRow {
 //  · 현재 팔레트가 cap 박스에 도달하면 다음 팔레트로 넘어감
 //  · 같은 SKU(한 행)는 가급적 한 팔레트에 통째로 — 현재 팔레트에 안 들어가면 새 팔레트로 통째 이동
 //  · 단, 한 품목의 박스 수가 cap 자체를 넘으면 어쩔 수 없이 경계에서 쪼갬(수량은 박스당 개입수로 비례)
+//  · singleSku=true(예: RC 센터)면 한 팔레트에 한 SKU만 — 품목마다 새 팔레트, 혼적 금지
 // 반환: { rows, count } (count = 사용된 팔레트 수)
-export function distributeByCapacity<T extends PalletDistRow>(src: T[], cap: number): { rows: T[]; count: number } {
+export function distributeByCapacity<T extends PalletDistRow>(src: T[], cap: number, singleSku = false): { rows: T[]; count: number } {
   const C = Math.max(1, Math.floor(cap) || DEFAULT_PALLET_CAP)
   const out: T[] = []
   let pallet = 1
@@ -26,6 +27,7 @@ export function distributeByCapacity<T extends PalletDistRow>(src: T[], cap: num
       continue
     }
     const perBox = qty / box
+    if (singleSku && used > 0) { pallet++; used = 0 }   // 1팔레트 1SKU: 이전 품목이 실린 팔레트에는 섞지 않음
     if (box <= C) {
       // 통째로 넣을 수 있는 SKU → 현재 팔레트에 안 맞으면 새 팔레트로 통째 이동
       if (used > 0 && used + box > C) { pallet++; used = 0 }
@@ -56,4 +58,9 @@ export function distributeByCapacity<T extends PalletDistRow>(src: T[], cap: num
 export function effectiveCap(totalBox: number, cap: number, target: number): number {
   if (target <= 0) return cap
   return Math.min(cap, Math.max(1, Math.ceil(totalBox / target)))
+}
+
+// 센터명에 'RC'가 포함되면 1팔레트 1SKU 규칙 적용 대상 (예: '고양RC', '안성 RC(01)')
+export function isSingleSkuCenter(center: string): boolean {
+  return /RC/i.test(String(center || ''))
 }

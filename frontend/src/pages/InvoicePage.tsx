@@ -86,8 +86,13 @@ export default function InvoicePage() {
   }
 
   async function handleSaveCustomer() {
+    let values: Omit<Customer, 'id'>
     try {
-      const values = await form.validateFields()
+      values = await form.validateFields()
+    } catch {
+      return   // 입력값 검증 실패 — 폼에 인라인 메시지가 표시됨
+    }
+    try {
       if (editingCustomer) {
         await updateCustomer(editingCustomer.id, values)
         message.success('거래처 수정 완료')
@@ -98,8 +103,12 @@ export default function InvoicePage() {
       setShowForm(false)
       setEditingCustomer(null)
       loadCustomers()
-    } catch {
-      // validation error — form shows inline messages
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } }; message?: string }
+      message.error(
+        `거래처 저장 실패: ${err?.response?.data?.detail ?? err?.message ?? '백엔드 서버 연결을 확인해주세요.'}`,
+        8,
+      )
     }
   }
 
@@ -469,7 +478,7 @@ export default function InvoicePage() {
               <span style={{ color: '#6b7280', fontSize: '0.78rem' }}>← 위 거래건을 클릭하세요</span>
             )}
           </div>
-          <Button size="small" icon={<PlusOutlined />} onClick={addEmptyItem} disabled={items.length >= 7}>
+          <Button size="small" icon={<PlusOutlined />} onClick={addEmptyItem}>
             행 추가
           </Button>
         </div>

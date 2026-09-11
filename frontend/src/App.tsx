@@ -21,11 +21,21 @@ import CoupangLoadList from './pages/CoupangLoadList'
 import CoupangGrowthLoad from './pages/CoupangGrowthLoad'
 import KurlyLabel from './pages/KurlyLabel'
 import OutboundForecast from './pages/OutboundForecast'
+import InventoryAnalysis from './pages/InventoryAnalysis'
+import ExecutiveReport from './pages/ExecutiveReport'
+import CoupangReport from './pages/CoupangReport'
+import OliveyoungReport from './pages/OliveyoungReport'
+import KurlyReport from './pages/KurlyReport'
 import type { Page, AppConfig, Location } from './types'
 import { getConfig, getMasterStatus, getLocations, slackConnect, getGmailStatus } from './services/api'
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard')
+  // 방문한 페이지는 언마운트하지 않고 숨김 처리 → 시트 이동해도 조회 결과·입력값 유지
+  const [visited, setVisited] = useState<Page[]>(['dashboard'])
+  useEffect(() => {
+    setVisited(prev => prev.includes(page) ? prev : [...prev, page])
+  }, [page])
   const [config, setConfig] = useState<AppConfig>({})
   const [locations, setLocations] = useState<Location[]>([])
   const [channels, setChannels] = useState<Record<string, string>>({})
@@ -117,7 +127,7 @@ export default function App() {
     onNavigate: setPage,
   }
 
-  function renderPage() {
+  function renderPage(page: Page) {
     switch (page) {
       case 'dashboard': return <Dashboard config={config} />
       case 'general': return <GeneralConverter config={config} locations={locations} onNavigate={setPage} />
@@ -131,6 +141,11 @@ export default function App() {
       case 'reconcile': return <ReconcilePage config={config} />
       case 'channel': return <ChannelPage config={config} />
       case 'outbound': return <OutboundForecast config={config} />
+      case 'inventory': return <InventoryAnalysis config={config} locations={locations} />
+      case 'execreport': return <ExecutiveReport />
+      case 'coupangreport': return <CoupangReport />
+      case 'oliveyoungreport': return <OliveyoungReport />
+      case 'kurlyreport': return <KurlyReport />
       case 'mapping': return <MappingPage config={config} />
       case 'orderplan': return <OrderPlannerPage />
       case 'disposal': return <DisposalReport />
@@ -171,7 +186,11 @@ export default function App() {
           masterLoaded={masterLoaded}
         />
         <div className="page-content">
-          {renderPage()}
+          {visited.map(p => (
+            <div key={p} style={{ display: p === page ? undefined : 'none' }}>
+              {renderPage(p)}
+            </div>
+          ))}
         </div>
       </div>
     </ConfigProvider>

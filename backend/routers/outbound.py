@@ -42,6 +42,33 @@ def _save_targets(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ── 마지막 조회 결과 스냅샷 (앱을 껐다 켜도 마지막 예측 유지) ─────────────────
+_LAST_FORECAST_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "outbound_last_forecast.json")
+
+
+def _save_last_forecast(result: dict) -> None:
+    """조회 성공 시 결과 전체를 스냅샷으로 저장. 실패해도 조회 응답에는 영향 없음."""
+    try:
+        os.makedirs(os.path.dirname(_LAST_FORECAST_PATH), exist_ok=True)
+        with open(_LAST_FORECAST_PATH, "w", encoding="utf-8") as f:
+            json.dump({"saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "result": result},
+                      f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+@router.get("/forecast/last")
+def get_last_forecast():
+    """마지막 조회 결과 스냅샷 (없으면 result=None)."""
+    try:
+        if os.path.exists(_LAST_FORECAST_PATH):
+            with open(_LAST_FORECAST_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"saved_at": None, "result": None}
+
+
 def _parse_target_workbook(raw: bytes) -> dict:
     """판매예상량(목표) 엑셀 파싱.
 
@@ -507,8 +534,8 @@ def outbound_forecast(
     set_expanded_qty = 0  # 분해된 세트 수량 누계 (안내용)
 
     for tx in txs:
-        # 다수 위치 필터: 단일 위치는 API에서 이미 필터됨, 2개 이상이면 여기서 후필터
-        if loc_ids and not loc_id_single:
+        # 위치 필터: 거래목록 API가 location_id 파라미터를 무시하므로 개수 무관하게 상세(캐시)로 후필터
+        if loc_ids:
             lid = _get_bh_tx_loc_id(token, tx["id"], "location")
             if lid is not None and int(lid) not in loc_ids:
                 continue
@@ -569,7 +596,7 @@ def outbound_forecast(
             yoy_txs = U.fetch_transactions(token, "out", yoy_from, yoy_to, location_id=loc_id_single)
             _enrich_bh_items(token, yoy_txs, "location")
             for tx in yoy_txs:
-                if loc_ids and not loc_id_single:
+                if loc_ids:
                     lid = _get_bh_tx_loc_id(token, tx["id"], "location")
                     if lid is not None and int(lid) not in loc_ids:
                         continue
@@ -652,7 +679,7 @@ def outbound_forecast(
         unit_partner_month,
     ) if has_targets else {"enabled": False}
 
-    return {
+    result = {
         "from_date": from_date,
         "to_date": to_date,
         "period": period,
@@ -674,6 +701,8 @@ def outbound_forecast(
             "tx_count": len(txs),
         },
     }
+    _save_last_forecast(result)
+    return result
 
 
 # ── 판매 목표치 업로드/조회/삭제 ───────────────────────────────────────────────

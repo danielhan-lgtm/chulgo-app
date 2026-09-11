@@ -14,3 +14,5 @@ playwright
 anthropic
 python-pptx
 pdfplumber
+pypdfium2
+winocr; sys_platform == 'win32'

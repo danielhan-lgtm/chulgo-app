@@ -118,7 +118,11 @@ export default function OBOrders() {
         : <span style={{ color: '#9ca3af' }}>{c || '-'}</span>,
     },
     { title: '판매처', dataIndex: 'sach_nm', width: 130, ellipsis: true },
-    { title: '상품', dataIndex: 'prod_nm', ellipsis: true },
+    { title: '상품', dataIndex: 'prod_nm', ellipsis: true,
+      render: (v: string, r: OBOrder) => r.gift_yn === 'Y'
+        ? <span><Tag color="magenta" style={{ margin: '0 4px 0 0', fontSize: '0.68rem', padding: '0 5px', lineHeight: '17px' }}>🎁 사은품</Tag>{v}
+            {r.gift_orig_od_sno ? <span style={{ color: '#9ca3af', fontSize: '0.7rem' }}> (원주문 {r.gift_orig_od_sno})</span> : null}</span>
+        : v },
     { title: '수량', dataIndex: 'od_qty', width: 60, align: 'right' },
     { title: '수령인', dataIndex: 'recvr_nm', width: 90 },
     { title: '단계', dataIndex: 'stage_nm', width: 90, render: (s: string) => <Tag>{s}</Tag> },

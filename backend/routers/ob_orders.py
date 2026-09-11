@@ -278,8 +278,10 @@ def _notify_unmapped(unmapped: list):
         for u in unmapped:
             for it in u.get("items", []):
                 pc = str(it.get("prod_cd") or "")
-                p = prods.setdefault(pc, {"nm": it.get("prod_nm") or "", "ods": []})
+                p = prods.setdefault(pc, {"nm": it.get("prod_nm") or "", "ods": [], "gift": False})
                 p["ods"].append(str(u.get("od_sno")))
+                if str(it.get("gift_yn") or "") == "Y":
+                    p["gift"] = True
         conn = db._conn()
         try:
             cur = conn.cursor()
@@ -307,7 +309,8 @@ def _notify_unmapped(unmapped: list):
         lines = [f"⚠️ *OB 주문 미매핑 {len(fresh)}종* — BoxHero 출고등록에서 제외됨"]
         for pc, info in fresh.items():
             ods = ", ".join(info["ods"][:5])
-            lines.append(f"• `{pc}` {info['nm']} (주문 {ods})")
+            gift_tag = "🎁 사은품 · " if info.get("gift") else ""
+            lines.append(f"• {gift_tag}`{pc}` {info['nm']} (주문 {ods})")
         lines.append("→ *상품 매핑* 페이지에서 세트 구성/매핑 추가 필요. 이미 발송대기로 넘어간 주문은 수동 등록 필요.")
         U.slack_post_message(slack, channel_id, "\n".join(lines))
         state.add_log("warning", f"OB 미매핑 {len(fresh)}종 슬랙 알림", str(list(fresh)), source="ob-orders")
@@ -347,7 +350,8 @@ def _register_orders(orders, dry_run: bool) -> dict:
             qty = int(ln.get("od_qty") or 0)
             items, unm = _resolve_bh(conn, ln.get("prod_cd"), qty)
             if unm:
-                unmapped.append({"prod_cd": ln.get("prod_cd"), "prod_nm": ln.get("prod_nm")})
+                unmapped.append({"prod_cd": ln.get("prod_cd"), "prod_nm": ln.get("prod_nm"),
+                                 "gift_yn": ln.get("gift_yn")})
             for sku, q in items:
                 sku_qty[sku] += q
         if unmapped:
@@ -571,15 +575,27 @@ def _run_cycle(c: dict):
                                    do_collect=True, do_register=True, dry_run=False)
                 _auto_status.update(last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     last_result=res.get("register", {}).get("summary"), last_error=None)
+                try:  # 성공 → 실패 기록 해제 (세션복구 자동재실행 트리거용)
+                    if _load_cfg().get("ob_auto_last_failed"):
+                        U.save_config({"ob_auto_last_failed": ""})
+                except Exception:
+                    pass
                 return
             except Exception as e:
                 last_err = e
                 state.add_log("error", f"OB 완전자동화 시도 {attempt + 1}/3 실패",
                               str(e)[:300], source="ob-orders")
+                # CAPTCHA는 재시도해도 못 뚫고 실패 로그인만 쌓여 보안 플래그를 키움 — 즉시 중단
+                if "CAPTCHA" in str(e) or "보안 인증" in str(e):
+                    break
                 if attempt < 2:
                     time.sleep(90)
         _auto_status.update(last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             last_error=str(last_err)[:200])
+        try:  # 실패 기록을 config에 영속화 — 백엔드 재시작 후에도 세션복구 시 자동재실행되도록
+            U.save_config({"ob_auto_last_failed": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        except Exception:
+            pass
     finally:
         _auto_status["running"] = False
 
@@ -602,7 +618,14 @@ def _auto_scheduler_loop():
                     today = now.strftime("%Y-%m-%d")
                     hm = now.strftime("%H:%M")
                     lastf = _load_cfg().get("ob_auto_last_fired") or {}
-                    for slot in _parse_times(c.get("ob_auto_times")):
+                    slots = _parse_times(c.get("ob_auto_times"))
+                    # 실행 20분 전 사전점검: 세션 죽어 있으면 로그인 창 + 슬랙 → 본 실행 전에 복구 유도
+                    for slot in slots:
+                        pre = (datetime.strptime(slot, "%H:%M") - timedelta(minutes=20)).strftime("%H:%M")
+                        if pre <= hm < slot and _precheck_fired.get(slot) != today:
+                            _precheck_fired[slot] = today
+                            _prerun_session_check(slot)
+                    for slot in slots:
                         if hm >= slot and lastf.get(slot) != today:
                             lastf[slot] = today
                             U.save_config({"ob_auto_last_fired": lastf})  # 실행 전 기록(중복방지)
@@ -621,6 +644,36 @@ def _auto_scheduler_loop():
 def start_auto_scheduler():
     t = threading.Thread(target=_auto_scheduler_loop, daemon=True, name="ob-auto")
     t.start()
+
+
+# 실행 전 사전점검 발동 기록 (slot → date, 메모리 — 하루 1회)
+_precheck_fired: dict = {}
+
+
+def _prerun_session_check(slot: str):
+    """자동실행 20분 전 세션 점검 — 죽어 있으면 쿨다운 무시하고 로그인 창 + 슬랙 알림."""
+    try:
+        st = check_ourbox_session()
+        if st.get("ok"):
+            return
+        _launch_login_window()
+        cfg = _load_cfg()
+        slack = cfg.get("slack_token", "")
+        if not slack:
+            return
+        ch = str(cfg.get("slack_outbound_channel") or "물류_출고").strip()
+        channel_id = ch
+        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):
+            channel_id = U.fetch_slack_channels(slack).get(ch, "")
+        if not channel_id:
+            return
+        U.slack_post_message(slack, channel_id,
+                             f"⏰ *{slot} OB 자동출고 예정 — 아워박스 세션이 만료 상태입니다*\n"
+                             "사무실 PC에 로그인 창(Chrome)을 띄웠습니다. 지금 로그인해 두시면 "
+                             f"{slot} 자동실행이 정상 처리됩니다. (로그인만 하면 나머지는 자동)")
+        state.add_log("warning", f"{slot} 자동실행 사전점검 — 세션 만료, 로그인 창 오픈", "", source="ourbox-session")
+    except Exception:
+        pass
 
 
 # ── 아워박스 세션 관리 (상태 확인 / keep-alive / 재로그인) ─────────────
@@ -692,10 +745,17 @@ def _expiry_recently_handled(minutes: int = 120) -> bool:
 
 
 def _rerun_failed_cycle_after_recovery():
-    """세션 복구(만료→정상) 감지 시, 오늘 실패한 자동화 사이클을 1회 자동 재실행."""
+    """세션 복구(만료→정상) 감지 시, 오늘 실패한 자동화 사이클을 1회 자동 재실행.
+
+    실패 여부는 메모리(last_error) + config(ob_auto_last_failed, 재시작 생존) 둘 다 확인.
+    """
     try:
         c = _auto_cfg()
-        if not c.get("ob_auto_enabled") or not _auto_status.get("last_error") or _auto_status.get("running"):
+        if not c.get("ob_auto_enabled") or _auto_status.get("running"):
+            return
+        failed_today = str(_load_cfg().get("ob_auto_last_failed") or "").startswith(
+            datetime.now().strftime("%Y-%m-%d"))
+        if not _auto_status.get("last_error") and not failed_today:
             return
         state.add_log("success", "아워박스 세션 복구 감지 — 실패했던 자동화 재실행",
                       f"마지막 오류: {str(_auto_status.get('last_error'))[:100]}", source="ourbox-session")

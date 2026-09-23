@@ -230,6 +230,36 @@ def _ocr_parse_items(words: list[tuple[str, float, float]], order_code: str) -> 
     return items
 
 
+# OCR이 코드 글자를 자주 바꿔 읽는 문자 → 원래 글자 (예: 'K260930-A]53ERA' / 'ÅJ53ERÅ')
+_OCR_CODE_FIX = str.maketrans({
+    "Å": "A", "À": "A", "Á": "A", "Ä": "A",
+    "]": "J", "[": "J", "}": "J", "{": "J",
+    "|": "I", "!": "I",
+})
+
+
+def _ocr_order_code(full: str) -> str:
+    """OCR 텍스트에서 거래명세서코드(K260930_AJ53ERA 형식)를 복원한다.
+
+    '거래 명세서코드: K260930-A]53ERA' 처럼 오인식이 섞여도 접미부 토큰을 문자 치환 후
+    영숫자만 남겨 조합한다. 라벨 뒤에서 못 찾으면 본문 어디든 'K{6자리} 토큰' 패턴을 찾는다.
+    """
+    def _clean(tok: str) -> str:
+        tok = tok.translate(_OCR_CODE_FIX)
+        return re.sub(r"[^A-Z0-9]", "", tok.upper())
+
+    pats = (
+        r"거래\s*명세서\s*코드\s*[:：\.]?\s*([A-Z]\d{6})[\s_\-\.]*(\S+)",
+        r"(?<![A-Z0-9])([A-Z]\d{6})[\s_\-\.]+(\S+)",
+    )
+    for pat in pats:
+        for m in re.finditer(pat, full):
+            suffix = _clean(m.group(2))
+            if 4 <= len(suffix) <= 10:
+                return f"{m.group(1)}_{suffix}"
+    return ""
+
+
 def _ocr_parse_kurly(data: bytes, filename: str = "") -> dict:
     pages = _ocr_pages(data)
     full = "\n".join(" ".join(t for t, _, _ in pg) for pg in pages)
@@ -240,15 +270,26 @@ def _ocr_parse_kurly(data: bytes, filename: str = "") -> dict:
     if mf:
         order_code = mf.group(1).replace("-", "_")
     else:
-        mo = re.search(r"거래\s*명세서\s*코드\s*[:：\.]?\s*([A-Z]\d{6})[\s_\-\.]*([A-Z0-9]{4,})", full)
-        if mo:
-            order_code = f"{mo.group(1)}_{mo.group(2)}"
+        order_code = _ocr_order_code(full)
 
     supplier = ""
     ms = re.search(r"([\(\)가-힣A-Za-z0-9]+)\s*\(\s*VD\d*", full)
     if ms:
         supplier = _norm(ms.group(1))
-    md = re.search(r"입고일\s*[:：]?\s*(\d{4}-\d{2}-\d{2})", full)
+    # 입고일: (1) '입고일 2026-09-21' (2) 입고대행 양식 — '최종입고지 입고일 … 2026-09-21 ~ 2026-09-23' 처럼 사이에 단어가 끼거나
+    # 입차일('입사일'로 오인식)만 있는 경우 (3) 거래명세서코드 K{yymmdd} = 입고일 규칙 폴백
+    date = ""
+    for pat in (r"입고일\s*[:：]?\s*(\d{4}-\d{2}-\d{2})",
+                r"입고\S{0,4}일\s*[:：]?\s*(?:\S+\s+){0,4}?(\d{4}-\d{2}-\d{2})",
+                r"입[차사]\S{0,2}일\s*[:：]?\s*(\d{4}-\d{2}-\d{2})"):
+        m_ = re.search(pat, full)
+        if m_:
+            date = m_.group(1)
+            break
+    if not date:
+        mk = re.match(r"[A-Z](\d{2})(\d{2})(\d{2})", order_code or "")
+        if mk:
+            date = f"20{mk.group(1)}-{mk.group(2)}-{mk.group(3)}"
     mc = re.search(r"([가-힣]+)\s*\(\s*\d+\s*[층증]", full)
 
     items: list[dict] = []
@@ -259,7 +300,7 @@ def _ocr_parse_kurly(data: bytes, filename: str = "") -> dict:
         "orderCode": order_code,
         "orderCodes": [order_code] if order_code else [],
         "supplier": supplier or "(주)시나몬랩",
-        "date": md.group(1) if md else "",
+        "date": date,
         "center": _norm(mc.group(1)) if mc else "",
         "items": items,
     }

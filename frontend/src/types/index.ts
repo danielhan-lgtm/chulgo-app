@@ -112,7 +112,7 @@ export interface LogEntry {
   source?: string
 }
 
-export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'oborders' | 'receiving' | 'docreview' | 'invoice' | 'reconcile' | 'channel' | 'mapping' | 'orderplan' | 'disposal' | 'expiry' | 'coupangload' | 'coupanggrowthload' | 'kurlylabel' | 'outbound' | 'inventory' | 'execreport' | 'coupangreport' | 'oliveyoungreport' | 'kurlyreport' | 'settings'
+export type Page = 'dashboard' | 'general' | 'naver' | 'slack' | 'gmail' | 'oborders' | 'receiving' | 'docreview' | 'invoice' | 'reconcile' | 'channel' | 'mapping' | 'orderplan' | 'disposal' | 'expiry' | 'coupangload' | 'coupanggrowthload' | 'kurlylabel' | 'outbound' | 'inventory' | 'execreport' | 'coupangreport' | 'oliveyoungreport' | 'kurlyreport' | 'naverreport' | 'settings'
 
 export interface ReconcileRow {
   period: string

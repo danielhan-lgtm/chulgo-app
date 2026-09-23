@@ -1,7 +1,8 @@
 """컬리 발주·납품 보고 — 채널 공용 엔진(channel_report)에 컬리 스펙을 주입한 라우터.
 
 발주 데이터: 발주 캘린더에 올린 컬리 '거래명세서' PDF (채널=컬리, 텍스트/이미지 PDF 모두).
-  거래명세서에는 단가·확정수량·입고확정 정보가 없어 금액은 표시하지 않고(has_amt=False) 수량만 보고한다.
+  거래명세서에는 단가·확정수량·입고확정 정보가 없다. 금액은 컬리 파트너 '상품공급정보 다운로드' xlsx의 '일반단가'를
+  단가표로 올려두면(price_table) 수량×단가로 매입금액을 계산하고, 단가표가 없으면 수량만 보고한다.
   '입고일'이 납기이며, 입고 실적은 BoxHero 거래처 '마켓컬리' 출고로 본다(recv 없음 → 납품 = 출고).
 판매/재고 파일 업로드 없음(upload_mode='none').
 """
@@ -23,6 +24,8 @@ ALIASES = {
     "[크리스프파워] 프로틴 프레첼 참깨 50g": "프로틴 프레첼 참깨",
     "[크리스프파워] 프로틴 프레첼 에브리띵 50g": "프로틴 프레첼 에브리띵",
     "[크리스프파워] 프로틴 프레첼 씨솔트 50g": "프로틴 프레첼 씨솔트",
+    "[크리스프파워] 프로틴 프레첼 체다 50g": "프로틴 프레첼 체다",
+    "[DJ&A] 스냅피 크리스프 30g": "스냅피 크리스프",
     "[이알하나] ERr731 80mg (28일분)": "ERr731",
     "[이알하나] 식물성 멜라토닌 (30일분)": "멜라토닌",
 }
@@ -51,7 +54,19 @@ LABEL_BARCODES = {
     "팝타임 28g 씨솔트": "850053118326", "팝타임 28g 체다치즈": "850053118364",
     "팝타임 42g 스윗앤솔티": "850053118340", "팝타임 42g 할라피뇨": "850053118319",
     "멜라토닌": "8806136021078",
+    "ERr731": "8806136020880",
 }
+
+
+# 컬리 보고에서 빼는 품목 — 이알하나(ERr731·멜라토닌·NMN·메노포즈). 바코드 880613602xxxx 또는 품명 키워드
+_EXCLUDE_KW = ("이알하나", "이알히나", "ERr731", "ERR731", "멜라토닌", "NMN", "메노포즈")
+
+
+def kurly_exclude(name: str, sku: str) -> bool:
+    s = str(name or "")
+    if any(k in s for k in _EXCLUDE_KW):
+        return True
+    return str(sku or "").strip().startswith("880613602")
 
 
 def kurly_label(key: str):
@@ -81,6 +96,10 @@ def kurly_label(key: str):
             return "프로틴 프레첼 에브리띵"
         if "씨솔트" in k:
             return "프로틴 프레첼 씨솔트"
+        if "체다" in k:
+            return "프로틴 프레첼 체다"
+    if "스냅피" in k:
+        return "스냅피 크리스프"
     if "멜라" in k:
         return "멜라토닌"
     if "731" in k:
@@ -101,7 +120,10 @@ SPEC = ChannelSpec(
     aliases=ALIASES,
     barcodes=BARCODES,
     has_conf=False,
-    has_amt=False,               # 거래명세서에 단가 없음 → 금액 미표시
+    has_amt=False,               # 거래명세서에 단가 없음 → 단가표(상품공급정보 '일반단가')가 있으면 수량×단가로 매입금액 계산
+    price_table=True,
+    supply_includes_vat=True,    # 컬리 화면 '공급가 합계'는 부가세 포함 → 보고서도 같은 금액으로 (9/21 발주 9,644,250원 대조)
+    price_vat_included=False,    # 상품공급정보 '일반단가'는 부가세 별도 (컬리 화면 공급가 합계 = 일반단가×1.1×수량 확인, 2026-09-21분)
     has_recv=False,              # 거래명세서에 입고확정 수량 없음 → 입고등록 문구 생략
     alias_fallback=kurly_label,
     barcode_fallback=kurly_barcode,
@@ -110,6 +132,14 @@ SPEC = ChannelSpec(
     recv_hint="컬리는 별도 입고확정 절차가 없어 박스히어로 '마켓컬리' 출고분을 그대로 입고 확정으로 봅니다",
     po_word="거래명세서",
     upload_mode="none",
+    exclude_item=kurly_exclude,  # 이알하나 품목은 컬리 발주·납품 집계에서 제외 (DJ&A·팝타임·프로틴 프레첼만)
+    cancel_memo_kw="컬리",       # BH 입고 '# 컬리 김포취소'(9/8 1,188개) = 출고 취소 → 월별 출고에서 상계
+    bh_month_basis="due",        # 월별 추이를 쿠팡·올리브영과 같은 납기(입고일) 월로 — 메모 납기, 없으면 다음 거래명세서 입고일
+    exec_name="컬리",
+    # 경영 요약 월별 추이 값은 BH '마켓컬리' 출고의 납기월 합계(= 납품, 입고확정 절차가 없어 출고 = 입고 확정)이지만
+    # 사용자 보고 관행은 '발주 6월 1,974 → 7월 7,893 → 8월 8,343개' 로 적으므로 지표는 recv, 표기만 '발주'
+    exec_metric="recv",
+    exec_metric_word="발주",
     upload_hint="컬리는 판매·재고 파일 업로드가 없습니다. 발주 캘린더에 거래명세서 PDF만 올리면 됩니다.",
 )
 

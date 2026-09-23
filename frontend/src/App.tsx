@@ -26,6 +26,7 @@ import ExecutiveReport from './pages/ExecutiveReport'
 import CoupangReport from './pages/CoupangReport'
 import OliveyoungReport from './pages/OliveyoungReport'
 import KurlyReport from './pages/KurlyReport'
+import NaverReport from './pages/NaverReport'
 import type { Page, AppConfig, Location } from './types'
 import { getConfig, getMasterStatus, getLocations, slackConnect, getGmailStatus } from './services/api'
 
@@ -146,6 +147,7 @@ export default function App() {
       case 'coupangreport': return <CoupangReport />
       case 'oliveyoungreport': return <OliveyoungReport />
       case 'kurlyreport': return <KurlyReport />
+      case 'naverreport': return <NaverReport />
       case 'mapping': return <MappingPage config={config} />
       case 'orderplan': return <OrderPlannerPage />
       case 'disposal': return <DisposalReport />

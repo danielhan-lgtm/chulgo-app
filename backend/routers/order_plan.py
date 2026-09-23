@@ -907,7 +907,8 @@ _PLAN_STORE_PATH = os.path.join(
 # v8: 컬리 행에 발주번호(발주코드) 포함 — 입고일 변경 재발행 시 자동 대체
 # v9: 쿠팡 확정수량(업체납품가능수량) 파싱 추가 — 쿠팡 발주 보고서용
 # v10: 일반 양식(올리브영 납품확인서 등) '납품예정수량'/'확정수량' 컬럼 → conf (실제 납품 대상 수량)
-_PARSER_VER = 10
+# v11: 일반 양식 '발주일자' 컬럼 → order_date (올리브영 월별 추이를 발주일 기준으로도 집계)
+_PARSER_VER = 11
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1173,6 +1174,9 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
         conf_col = next((c for c in df.columns
                          if any(k in str(c).replace("\n", "").replace(" ", "") for k in ("납품예정수량", "확정수량"))
                          and c not in (qty_col, recv_col)), "")
+        # 발주일자 컬럼 — 올리브영 납품확인서 '발주일자' 등. 납기(입고예정일)와 별도로 보관해 월별 추이를 발주일 기준으로도 볼 수 있게 한다
+        order_col = next((c for c in df.columns
+                          if c != date_col and "발주일" in str(c).replace("\n", "").replace(" ", "")), None)
         # 금액 컬럼 자동 감지 — 발주 기준이 명확한 컬럼만 발주금액으로 사용.
         # (올리브영 '원가금액'은 납품수량 기준 금액이라 발주금액으로 쓰면 안 됨 → 단가×수량으로 계산)
         amt_col = next((c for c in df.columns
@@ -1242,8 +1246,10 @@ def _parse_rows_from_bytes(data: bytes, fname: str, m: dict) -> tuple:
                         conf = int(float(str(cv).replace(",", "")))
                     except (TypeError, ValueError):
                         conf = None
+            order_date = _normalize_date(row.get(order_col)) if order_col else None
             rows.append({"name": str(raw_name).strip(), "qty": qty, "date": date_str,
-                         "barcode": "", "recv": recv, "conf": conf, "amt": amt, "recv_amt": recv_amt})
+                         "barcode": "", "recv": recv, "conf": conf, "amt": amt, "recv_amt": recv_amt,
+                         "order_date": order_date or None})
     return rows, channel, fmt, skipped, []
 
 
@@ -1430,6 +1436,27 @@ def _build_plan_result(threshold=70, use_master=1, split_bundles=1) -> dict:
     return result
 
 
+def _kurly_doc_stem(fname: str) -> str:
+    """컬리 거래명세서 파일명에서 '업데이트'·번호·공백을 뺀 줄기 — 재발행판과 원본을 같은 서류로 묶는 키.
+    '업데이트 김포택배 거래명세서_(주)시나몬랩_K260921_T6KU9ZD.pdf' → '김포택배거래명세서'"""
+    s = os.path.splitext(str(fname or ""))[0]
+    s = re.sub(r"_\(주\)[^_]*_[A-Z]\d{6}_\w+", "", s)     # _(주)시나몬랩_K260921_XXXX
+    s = re.sub(r"\s*\((\d+)\)\s*$", "", s)              # ' (2)' 구분 표기
+    s = re.sub(r"\s*\[[^\]]*\]\s*", "", s)               # ' [K260930_XXXX]' 동명 구분 표기 (ingest 가 붙인 것)
+    s = s.replace("업데이트", "")
+    return re.sub(r"\s+", "", s)
+
+
+def _kurly_stem_generic(stem: str) -> bool:
+    """센터·유형 정보가 없는 줄기('거래명세서'·빈 값) — 컬리 원본 다운로드 이름은 전부 이렇게 되므로 줄기 일치로 서류를 묶을 수 없다."""
+    return stem in ("", "거래명세서")
+
+
+def _kurly_doc_sig(rows: list) -> tuple:
+    """거래명세서 내용 서명 — (품명, 수량, 입고일) 정렬 튜플. 번호만 다른 재발행 복사본 판별용."""
+    return tuple(sorted((str(r.get("name") or "").strip(), int(r.get("qty") or 0), str(r.get("date") or "")) for r in rows))
+
+
 @router.post("/ingest")
 async def ingest_plan(
     files: List[UploadFile] = File(...),
@@ -1503,7 +1530,72 @@ async def ingest_plan(
             if old_fn is not None:
                 del store["files"][old_fn]
                 replaced.append({"filename": fname, "replaced": old_fn})
+        elif fmt == "generic":
+            # 발주번호가 없는 일반 양식(올리브영 납품확인서 목록 등): 같은 채널의 기존 파일과 납기 날짜가 겹치면
+            # (컬리 PDF 는 번호를 못 읽은 경우 대체 없이 추가만 — 같은 날 다른 센터 서류를 지우면 안 된다)
+            # 재다운로드(입고확정 갱신)로 보고 기존 파일을 대체 — 9/8·9/10 확인서가 두 번 집계되는 것 방지
+            dates = {r.get("date") for r in rows if r.get("date")}
+            for efn, ef in list(store["files"].items()):
+                if efn == fname or (ef.get("channel") or "") != channel:
+                    continue
+                if any(r.get("po") for r in ef.get("rows", [])):
+                    continue
+                if dates & {r.get("date") for r in ef.get("rows", []) if r.get("date")}:
+                    del store["files"][efn]
+                    replaced.append({"filename": fname, "replaced": efn})
 
+        # ── 컬리 재발행 거래명세서 ──
+        #  컬리는 수량이 바뀌면 같은 입고일·같은 센터 서류를 새 번호로 '업데이트 …' 재발행한다 (원본은 무효).
+        #  (1) 입고일·품목·수량이 모두 같고 번호만 다르면 복사본 → 업데이트판이 오면 원본을 대체, 아니면 중복으로 건너뜀
+        #  (2) '업데이트 김포택배 …' 는 같은 입고일의 '김포택배 …' 원본(수량 다름)을 대체
+        if fmt == "kurly":
+            new_sig = _kurly_doc_sig(rows)
+            new_dates = {r.get("date") for r in rows if r.get("date")}
+            new_stem = _kurly_doc_stem(fname)
+            generic = _kurly_stem_generic(new_stem)   # '거래명세서_(주)시나몬랩_K…' 원본 이름: 센터 구분 불가
+            is_update = "업데이트" in fname
+            dup_of = None
+            cand_same, cand_stem = [], []   # 업데이트판이 대체할 원본 후보 (내용 동일 우선, 그다음 같은 줄기)
+            for efn, ef in list(store["files"].items()):
+                if (ef.get("channel") or "") != channel or ef.get("format") != "kurly":
+                    continue
+                e_rows = ef.get("rows", [])
+                if not (new_dates & {r.get("date") for r in e_rows}):
+                    continue
+                e_update = "업데이트" in efn
+                # 줄기 일치는 센터·유형 토큰이 있을 때만 의미 있다. 같은 날 두 센터에 같은 구성이 나갈 수 있으므로
+                # 내용이 같아도 줄기가 다르거나(또는 둘 다 센터 없는 이름이거나) 업데이트 표기가 없으면 별개 서류로 둔다
+                e_stem = _kurly_doc_stem(efn)
+                same_stem = (not generic) and (e_stem == new_stem)
+                # 양쪽 이름에 센터·유형이 있는데 서로 다르면(창원 vs 평택) 내용이 같아도 별개 서류
+                stem_ok = same_stem or generic or _kurly_stem_generic(e_stem)
+                if _kurly_doc_sig(e_rows) == new_sig and stem_ok and (same_stem or is_update or e_update):
+                    if is_update and not e_update:
+                        cand_same.append(efn)
+                    else:
+                        dup_of = efn
+                        break
+                elif is_update and not e_update and same_stem:
+                    cand_stem.append(efn)
+            if dup_of is not None:
+                duplicates.append({"filename": fname, "existing": dup_of, "reason": "동일 내용 재발행(번호만 다름)"})
+                continue
+            if is_update:
+                # 업데이트판 1장은 원본 1장만 대체한다 (센터 없는 '업데이트 거래명세서_…' 가 같은 날 서류를 전부 지우지 않게)
+                for efn in (cand_same or cand_stem)[:1]:
+                    del store["files"][efn]
+                    replaced.append({"filename": fname, "replaced": efn})
+
+        # 같은 파일명인데 다른 서류(발주/거래명세서 번호 집합이 다름)면 덮어쓰지 않고 별도 키로 저장.
+        # 컬리 거래명세서는 매주 '창원 거래명세서.pdf' 처럼 같은 이름으로 내려오는데, 같은 이름 = 갱신으로 취급해
+        # 7/22·7/28 거래명세서가 8/4 파일에 덮어써져 사라졌다 (2026-08-11 업로드). 재다운로드 갱신은
+        # 위의 번호 집합 일치 규칙이 처리하므로, 번호가 다른 동명 파일은 다른 서류다.
+        old = store["files"].get(fname)
+        if old is not None and po_set:
+            old_pos = {r.get("po") for r in old.get("rows", []) if r.get("po")}
+            if old_pos and old_pos != po_set:
+                stem, ext = os.path.splitext(fname)
+                fname = f"{stem} [{sorted(po_set)[0]}]{ext}"
         store["files"][fname] = {
             "channel": channel, "format": fmt, "rows": rows, "rows_count": len(rows),
             "qty": sum(int(r["qty"]) for r in rows), "skipped": skipped, "ingested_at": now,

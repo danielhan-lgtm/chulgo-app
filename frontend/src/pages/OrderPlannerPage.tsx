@@ -22,7 +22,8 @@ import {
 
 interface FileRow {
   file: File
-  filename: string
+  filename: string          // 업로드·저장 키. 같은 이름의 다른 파일이면 '(2)'를 붙여 구분 (컬리 거래명세서는 매주 같은 이름)
+  sig?: string              // 같은 파일(이름+크기+수정시각) 재추가 방지 키
   channel: string
   format: 'coupang' | 'kurly' | 'generic'
   date_col: string
@@ -69,6 +70,7 @@ export default function OrderPlannerPage() {
   const [fileRows, setFileRows] = useState<FileRow[]>([])
   // 업로드 큐 파일명 — state는 같은 배치 안에서 갱신이 안 보여 ref로 동기 중복방지
   const queuedNamesRef = useRef<Set<string>>(new Set())
+  const queuedSigsRef = useRef<Set<string>>(new Set())
   const [threshold, setThreshold] = useState(persisted.threshold ?? 70)
   const [useMaster, setUseMaster] = useState(persisted.useMaster ?? true)
   const [splitBundles, setSplitBundles] = useState(persisted.splitBundles ?? true)
@@ -234,20 +236,31 @@ export default function OrderPlannerPage() {
 
 
   async function handleFileSelect(file: File) {
-    if (queuedNamesRef.current.has(file.name)) {
+    // 같은 파일(이름+크기+수정시각)만 중복으로 막는다. 이름만 같은 다른 파일(컬리 '창원 거래명세서.pdf' 매주 동일)은 받아서 '(2)'로 구분
+    const sig = `${file.name}|${file.size}|${file.lastModified}`
+    if (queuedSigsRef.current.has(sig)) {
       message.warning(`이미 추가된 파일: ${file.name}`)
       return false
     }
-    queuedNamesRef.current.add(file.name)
+    queuedSigsRef.current.add(sig)
+    let filename = file.name
+    if (queuedNamesRef.current.has(filename)) {
+      const m = filename.match(/^(.*?)(\.[^.]+)?$/)
+      const stem = m?.[1] ?? filename, ext = m?.[2] ?? ''
+      let n = 2
+      while (queuedNamesRef.current.has(`${stem} (${n})${ext}`)) n++
+      filename = `${stem} (${n})${ext}`
+    }
+    queuedNamesRef.current.add(filename)
     const tempRow: FileRow = {
-      file, filename: file.name, channel: '', format: 'generic', date_col: '',
+      file, filename, sig, channel: '', format: 'generic', date_col: '',
       name_col: '', qty_col: '', recv_col: '', columns: [], rows: 0, loading: true,
     }
     setFileRows(prev => [...prev, tempRow])
     try {
       const data: OrderPlanColumns = await detectOrderPlanColumns(file)
       setFileRows(prev => prev.map(r =>
-        r.filename === file.name
+        r.filename === filename
           ? { ...r, format: data.format, channel: data.channel,
               date_col: data.date_col, name_col: data.name_col, qty_col: data.qty_col,
               recv_col: data.format === 'generic' ? (data.recv_col || '') : '',
@@ -258,7 +271,7 @@ export default function OrderPlannerPage() {
       ))
     } catch (e: any) {
       setFileRows(prev => prev.map(r =>
-        r.filename === file.name
+        r.filename === filename
           ? { ...r, loading: false, error: e.response?.data?.detail || e.message }
           : r
       ))
@@ -273,11 +286,14 @@ export default function OrderPlannerPage() {
 
   function removeRow(filename: string) {
     queuedNamesRef.current.delete(filename)
+    const sig = fileRows.find(r => r.filename === filename)?.sig
+    if (sig) queuedSigsRef.current.delete(sig)
     setFileRows(prev => prev.filter(r => r.filename !== filename))
   }
 
   function clearAll() {
     queuedNamesRef.current.clear()
+    queuedSigsRef.current.clear()
     setFileRows([])
     setResult(null)
   }
@@ -298,7 +314,8 @@ export default function OrderPlannerPage() {
     }
     setAggregating(true)
     try {
-      const files = fileRows.map(r => r.file)
+      // 서버는 업로드 파일명을 매핑 키·저장 키로 쓰므로, '(2)'가 붙은 구분 이름으로 보낸다
+      const files = fileRows.map(r => r.filename === r.file.name ? r.file : new File([r.file], r.filename, { type: r.file.type }))
       const mappings: OrderPlanMapping[] = fileRows.map(r => ({
         filename: r.filename, channel: r.channel, format: r.format,
         date_col: r.format === 'coupang' ? (r.detected_date || r.date_col || '') : r.date_col,
@@ -311,6 +328,7 @@ export default function OrderPlannerPage() {
       await refreshRecvCompare()
       setFileRows([])  // 업로드 큐 비움 — 파일은 서버에 누적 저장됨
       queuedNamesRef.current.clear()
+      queuedSigsRef.current.clear()   // 누적 완료 후 같은 파일을 다시 올릴 수 있게 (큐 기준 중복 방지 키 초기화)
       if (data.errors?.length) message.warning(`${data.errors.length}건 경고`)
       if (data.duplicates?.length) {
         message.info({

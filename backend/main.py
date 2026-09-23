@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report
+from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report, naver_report
 
 app = FastAPI(title="출고 라몬 API", version="2.0.0")
 
@@ -41,6 +41,23 @@ app.include_router(report.router, prefix="/api/exec-report", tags=["exec-report"
 app.include_router(coupang_report.router, prefix="/api/coupang-report", tags=["coupang-report"])
 app.include_router(oliveyoung_report.router, prefix="/api/oliveyoung-report", tags=["oliveyoung-report"])
 app.include_router(kurly_report.router, prefix="/api/kurly-report", tags=["kurly-report"])
+app.include_router(naver_report.router, prefix="/api/naver-report", tags=["naver-report"])
+
+
+# ── 4채널(쿠팡·올리브영·컬리 + 네이버) 경영 요약 보고문 — 채널별 보고 엔진을 한 번에 돌려 번호 붙여 묶는다 ──
+@app.get("/api/channel-report/exec", tags=["channel-report"])
+def channel_exec_report(as_of: str = "", month: str = ""):
+    from datetime import date, datetime
+    from routers.channel_report import build_exec_text
+    as_of = (as_of or date.today().isoformat())[:10]
+    try:
+        datetime.fromisoformat(as_of)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(400, "as_of 형식 오류 (YYYY-MM-DD)")
+    # 네이버는 발주 엔진(ChannelSpec)이 아니라 BH 거래 내역 업로드 기반이므로 블록 생성기로 4번에 이어 붙인다
+    return build_exec_text([coupang_report.SPEC, oliveyoung_report.SPEC, kurly_report.SPEC], as_of, month,
+                           extra_blocks=[naver_report.build_exec_block])
 
 
 @app.get("/")

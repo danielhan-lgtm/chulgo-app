@@ -15,6 +15,9 @@ SPEC = ChannelSpec(
     recv_hint="센터 검수 후 반영 · 발주서 재다운로드 시 갱신",
     po_word="발주서",
     upload_mode="daily",
+    unit_basis=True,             # 세트(3입·2입·혼합세트) 행을 구성 단품으로 풀어 집계 — BH 출고(단품 SKU)와 같은 단위. 금액은 발주서 합계 그대로
+    exec_name="쿠팡 로켓배송",
+    exec_metric="recv",
     upload_hint="쿠팡 윙 > 리포트: basic_operation_rocket_*.csv (일별 센터 출고·재고), *-forecast-*.xlsx (주간 판매 예측)",
 )
 

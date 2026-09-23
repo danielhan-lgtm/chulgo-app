@@ -1295,8 +1295,12 @@ export interface CpUploads {
   forecast: { filename: string; uploaded_at: string; weeks: { from: string; to: string }[] } | null
   files: { filename: string; uploaded_at: string; type: string; period?: string }[]
 }
+export interface CpPriceItem { unit: number; event?: number; name?: string; barcode?: string; code?: string; box?: number }
+export interface CpPrices { items: Record<string, CpPriceItem>; vat_included: boolean; source: string; updated_at: string }
+export interface CpPriceMeta { count: number; vat_included: boolean; source: string; updated_at: string; filled_rows: number; unpriced_rows: number; missing_labels: string[] }
 export interface CoupangReportSummary {
   channel: 'coupang' | 'oliveyoung' | 'kurly'; channel_name: string; has_conf: boolean; conf_word?: string; amt_includes_vat?: boolean; has_amt?: boolean; has_recv?: boolean; recv_word: string; upload_mode: 'daily' | 'monthly' | 'none'
+  prices?: CpPriceMeta | null
   as_of: string; as_of_md: string; month: string; month_label: string
   last_ingested_at: string; bh_connected: boolean; bh_stock_cached_at: string | null
   orders: { po_count: number; qty: number; order_qty?: number; short_vs_order?: number; conf: number; amt: number; supply: number; conf_avail: boolean; conf_diff: number; groups: CpGroup[]; core: { label: string; qty: number; conf: number }[] }
@@ -1318,7 +1322,22 @@ export interface CoupangReportSummary {
   all_groups: { date: string; md: string; qty: number; amt: number; supply: number; status: string }[]
   text: string
   text_detail: string
+  text_exec: string
+  exec_metric?: 'recv' | 'order'
+  exec_metric_word?: string      // 경영 요약 첫 줄에 쓰는 지표 표기 (납품/발주)
+  history_order_basis?: 'order_date' | 'due'   // 월별 추이 발주 수량 귀속 기준 (올리브영: 납품확인서 발주일자 월)
+  unit_basis?: boolean            // 세트 상품을 구성 단품으로 풀어 집계 (쿠팡)
+  history?: CpHistoryRow[]
 }
+// 월별 추이 한 행 — bh_shipped 는 박스히어로 해당 거래처 출고(출고월 기준, 참고용 / 컬리는 납품 자동값)
+export interface CpHistoryRow { ym: string; label: string; order_qty: number | null; delivered: number | null; auto_order_qty: number | null; auto_delivered: number | null; override: boolean; bh_shipped?: number | null }
+// 경영 요약(전 채널 묶음) — channels[].history 는 채널마다 형태가 달라 느슨하게 둠
+export interface ChannelExecReport { as_of: string; as_of_md: string; month: string; text: string; channels: { key: string; name: string; text: string; history: unknown[] | null; error: string }[] }
+export const getChannelExecReport = (asOf?: string, month?: string): Promise<ChannelExecReport> =>
+  api.get('/channel-report/exec', { params: { as_of: asOf || '', month: month || '' }, timeout: 300000 }).then(r => r.data)
+export type CpMonthlyOverride = Record<string, { order_qty?: number | null; delivered?: number | null } | null>
+export const saveChannelMonthly = (monthly: CpMonthlyOverride, base: ChannelReportBase): Promise<{ monthly: CpMonthlyOverride }> =>
+  api.put(`${base}/monthly`, { monthly }).then(r => r.data)
 export type ChannelReportBase = '/coupang-report' | '/oliveyoung-report' | '/kurly-report'
 export const getCoupangReport = (asOf?: string, month?: string, refreshBh = false, base: ChannelReportBase = '/coupang-report'): Promise<CoupangReportSummary> =>
   api.get(`${base}/summary`, { params: { as_of: asOf || '', month: month || '', refresh_bh: refreshBh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
@@ -1338,6 +1357,17 @@ export const saveCoupangReportAliases = (aliases: Record<string, string>, base: 
   api.put(`${base}/aliases`, { aliases }).then(r => r.data)
 export const saveCoupangIncoming = (row: { id?: string; label: string; qty: number; date: string; memo?: string }, base: ChannelReportBase = '/coupang-report'): Promise<{ incoming: CpIncoming[] }> =>
   api.post(`${base}/incoming`, row).then(r => r.data)
+export const getChannelPrices = (base: ChannelReportBase): Promise<{ prices: CpPrices }> =>
+  api.get(`${base}/prices`).then(r => r.data)
+export const saveChannelPrices = (body: { items?: Record<string, number | null>; vat_included?: boolean }, base: ChannelReportBase): Promise<{ prices: CpPrices }> =>
+  api.put(`${base}/prices`, body).then(r => r.data)
+export const uploadChannelPrices = (files: File[], base: ChannelReportBase): Promise<{ added: number; skipped: string[]; errors: string[]; prices: CpPrices }> => {
+  const fd = new FormData()
+  files.forEach(f => fd.append('files', f, f.name))
+  return api.post(`${base}/prices/upload`, fd, { timeout: 120000 }).then(r => r.data)
+}
+export const clearChannelPrices = (base: ChannelReportBase): Promise<{ prices: CpPrices }> =>
+  api.post(`${base}/prices/clear`, {}).then(r => r.data)
 export const deleteCoupangIncoming = (id: string, base: ChannelReportBase = '/coupang-report'): Promise<{ incoming: CpIncoming[] }> =>
   api.delete(`${base}/incoming/${id}`).then(r => r.data)
 
@@ -1355,3 +1385,43 @@ export const restorePlanBackup = (name: string): Promise<OrderPlanResult & { res
   api.post('/order-plan/plan/backups/restore', { name }).then(r => r.data)
 
 export default api
+
+// ── 네이버 스마트스토어(도착보장) 출고 보고 ─────────────────────────
+export interface NaverReportRow {
+  label: string; names: string[]; skus: string[]
+  month_qty: number; prev_qty: number; pct: number | null; avg14: number; w1: number
+  stock: number | null; stock_basis: 'ob' | 'bh' | ''; days_of_supply: number | null; spark: number[]
+}
+export interface NaverReportSummary {
+  as_of: string; as_of_md: string; month: string; month_label: string; prev_month_label: string
+  partner_kw: string[]; partners: string[]
+  data_from: string; data_to: string; eff_to: string; tx_rows: number; stale_days: number | null
+  month_qty: number; month_elapsed: number; month_avg: number; month_batches: number; month_returns: number
+  prev_qty: number; prev_avg: number; month_pct: number | null
+  w1: number; w0: number; w1_avg: number; w1_pct: number | null; w1_from: string; w1_to: string
+  last_day: string; last_day_md: string; last_day_qty: number; last_day_top: string
+  weeks: { from: string; to: string; md: string; qty: number; partial: boolean }[]
+  rows: NaverReportRow[]
+  stock_basis: 'ob' | 'bh' | ''; ob_connected: boolean; bh_connected: boolean
+  uploads: { filename: string; uploaded_at: string; rows: number; added: number; from: string; to: string }[]
+  notes: string
+  daily: { date: string; qty: number }[]
+  text: string
+  text_exec: string                 // 경영 요약용 네이버 블록 (전 채널 묶음의 4번)
+  history: NaverHistoryRow[]        // 월별 출고 추이 (주문일 기준)
+}
+export interface NaverHistoryRow { ym: string; label: string; qty: number | null }
+export const getNaverReport =(asOf?: string, refresh = false): Promise<NaverReportSummary> =>
+  api.get('/naver-report/summary', { params: { as_of: asOf || '', refresh: refresh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
+export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filename: string; rows: number; added: number; from: string; to: string }[]; errors: string[]; tx_rows: number }> => {
+  const fd = new FormData()
+  files.forEach(f => fd.append('files', f, f.name))
+  return api.post('/naver-report/upload', fd, { timeout: 180000 }).then(r => r.data)
+}
+export const clearNaverReportUploads = (): Promise<{ ok: boolean }> => api.post('/naver-report/upload/clear', {}).then(r => r.data)
+export const saveNaverReportSettings = (body: { partner_kw?: string[]; notes?: string }): Promise<{ partner_kw: string[]; notes: string }> =>
+  api.put('/naver-report/settings', body).then(r => r.data)
+export const getNaverReportAliases = (): Promise<{ defaults: Record<string, string>; overrides: Record<string, string> }> =>
+  api.get('/naver-report/aliases').then(r => r.data)
+export const saveNaverReportAliases = (aliases: Record<string, string>): Promise<{ ok: boolean }> =>
+  api.put('/naver-report/aliases', { aliases }).then(r => r.data)

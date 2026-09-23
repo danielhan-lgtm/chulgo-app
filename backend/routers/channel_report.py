@@ -54,6 +54,17 @@ class ChannelSpec:
     has_recv: bool = True            # 채널 입고확정 수량이 발주 데이터에 있는 채널. False(컬리)면 입고등록 관련 문구 생략
     alias_fallback: Optional[Callable[[str], Optional[str]]] = None    # 정규화 상품명 → 라벨 (별칭표에 없을 때, OCR 오인식 흡수용)
     barcode_fallback: Optional[Callable[[str], Optional[str]]] = None  # 정규화 상품명 → 바코드 (바코드표에 없을 때)
+    price_table: bool = False        # 발주 데이터에 금액이 없어 별도 단가표(상품공급정보 등)로 매입금액을 계산하는 채널(컬리)
+    price_vat_included: bool = True  # 단가표 단가에 부가세 포함 여부 기본값 (컬리 '일반단가'는 부가세 별도 → 컬리 화면 공급가 합계 = 단가×1.1)
+    supply_includes_vat: bool = False  # True(컬리): 채널이 부가세 포함 금액을 '공급가'로 부름 → 보고 금액을 ÷1.1 하지 않고 채널 화면과 같은 금액으로 표시
+    exec_name: str = ""              # 경영 요약(3채널 묶음) 표기 ('쿠팡 로켓배송' 등). 비면 display
+    exec_metric: str = "order"       # 경영 요약 월별 추이 지표: 'recv'(납품) | 'order'(발주)
+    exec_metric_word: str = ""       # 경영 요약 첫 줄 지표 표기. 비면 recv→'납품', order→'발주' (컬리: 값은 납품(출고)인데 '발주'로 적는 관행)
+    history_by_order_date: bool = False  # 월별 추이의 '발주 수량'을 납기월 대신 발주일 월로 집계 (올리브영: 납품확인서 '발주일자' 기준이 보고 관행)
+    exclude_item: Optional[Callable[[str, str], bool]] = None  # (품목명, SKU/바코드) → True 면 이 채널 집계에서 제외 (컬리: 이알하나)
+    cancel_memo_kw: str = ""         # BH '입고' 중 메모에 이 키워드 + '취소' 가 있으면 출고 취소로 보고 월별 출고에서 상계 (컬리: '# 컬리 김포취소')
+    bh_month_basis: str = "ship"     # 월별 BH 출고 귀속: 'ship'(출고일 월) | 'due'(납기월 — 메모 납기일, 없으면 다음 서류 납기일). 컬리는 'due'
+    unit_basis: bool = False         # True(쿠팡): 세트 상품(3입·2입·혼합세트) 행을 구성 단품 행으로 풀어 수량을 단품 단위로 집계 (금액은 행 합계를 나눠 붙임 → 발주서 합계 불변)
     upload_hint: str = ""
     state_path: str = ""
     upload_path: str = ""
@@ -89,7 +100,15 @@ def _load_state(sp: ChannelSpec) -> dict:
     st.setdefault("notes", "")
     st.setdefault("aliases", {})
     st.setdefault("incoming", [])   # [{id, label, qty, date, memo}] 입고 예정(항공분 등)
+    st.setdefault("prices", _empty_prices(sp))   # 매입 단가표 (price_table 채널)
+    st.setdefault("monthly", {})    # {YYYY-MM: {order_qty, delivered}} 월별 추이 수기 보정 (저장소에 없는 지난 달)
+    st.setdefault("bh_monthly", {})  # {YYYY-MM: {qty, fetched_at}} BH 채널 거래처 월별 출고 합계 캐시 (지난 달, 3일 TTL)
     return st
+
+
+def _empty_prices(sp: Optional["ChannelSpec"] = None) -> dict:
+    # items: {label: {unit, event, name, barcode, code, box}} — unit = 매입단가(원). vat_included: 단가에 부가세 포함 여부
+    return {"items": {}, "vat_included": (sp.price_vat_included if sp else True), "source": "", "updated_at": ""}
 
 
 def _empty_uploads() -> dict:
@@ -126,6 +145,7 @@ COMMON_ALIASES = {
     "DJ&A 머쉬룸 크리스프 30g 3ea": "머쉬룸 30g 3입",
     "DJ&A 머쉬룸 스모크칠리&갈릭 크리스프 30g 3ea": "스모크칠리 30g 3입",
     "디제이앤에이 표고버섯 크리스프 오리지널 30g 1봉": "머쉬룸 30g",
+    "DJ&A 머쉬룸 스모크칠리&갈릭 크리스프 30g": "스모크칠리 30g",
     "디제이앤에이 표고버섯 저키 오리지널 60g x 3봉": "저키 오리지널 3입",
     "디제이앤에이 표고버섯 저키 스모크칠리&갈릭 60g x 3봉": "저키 스모크칠리 3입",
     "디제이앤에이 표고버섯 저키 텍사스 BBQ 60g x 3봉": "저키 텍사스BBQ 3입",
@@ -170,8 +190,32 @@ COMMON_ALIASES = {
     "트윈픽스 프로틴 퍼프 60g 사워크림&어니언": "트윈픽스 사워크림어니언",
 }
 
+# 세트 라벨 → [(구성 단품 상품명, 세트당 개수)]. unit_basis 채널(쿠팡)에서 발주서 세트 행을 단품 행으로 풀 때 사용.
+# 구성 단품 상품명은 COMMON_ALIASES/COMMON_BARCODES 에 있는 쿠팡 단품명 그대로 (라벨·바코드가 그대로 붙게)
+_MUSH30 = "디제이앤에이 표고버섯 크리스프 오리지널 30g 1봉"
+_SMOKE65 = "표고버섯 크리스프 스모크 칠리&갈릭 65g"
+_MUSH65 = "표고버섯 크리스프 오리지널 65g"
+COMMON_BUNDLES = {
+    "머쉬룸 30g 3입": [(_MUSH30, 3)],
+    "머쉬룸 30g 4입": [(_MUSH30, 4)],
+    "스모크칠리 30g 3입": [("DJ&A 머쉬룸 스모크칠리&갈릭 크리스프 30g", 3)],
+    "스모크칠리 2입": [(_SMOKE65, 2)],
+    "스모크칠리 3입": [(_SMOKE65, 3)],
+    "베지크리스프 3입": [("디제이앤에이 베지 크리스프 오리지널 90g", 3)],
+    "포테이토 웨지 3입": [("디제이앤에이 포테이토 웨지 오리지널 100g", 3)],
+    "포테이토 웨지 스위트칠리 3입": [("디제이앤에이 포테이토 웨지 스위트칠리 100g", 3)],
+    "저키 오리지널 3입": [("디제이앤에이 표고버섯 저키 오리지널 60g", 3)],
+    "저키 스모크칠리 3입": [("디제이앤에이 표고버섯 저키 스모크칠리&갈릭 60g", 3)],
+    "저키 텍사스BBQ 3입": [("디제이앤에이 표고버섯 저키 텍사스 BBQ 60g", 3)],
+    "머쉬룸 혼합세트(30g×4+칠리×2)": [(_MUSH30, 4), (_SMOKE65, 2)],
+    "머쉬룸 혼합세트(30g×2+칠리×1)": [(_MUSH30, 2), (_SMOKE65, 1)],
+    "머쉬룸 혼합세트(65g×3+칠리×1)": [(_MUSH65, 3), (_SMOKE65, 1)],
+    "머쉬룸 혼합세트(65g×1+칠리×3)": [(_MUSH65, 1), (_SMOKE65, 3)],
+}
+
 # 라벨 → 바코드(BH SKU) — 채널 공통 (쿠팡 운영리포트 바코드 · 올리브영 상품코드가 모두 이 바코드)
 COMMON_BARCODES = {
+    "디제이앤에이 표고버섯 크리스프 오리지널 30g 1봉": "9345544001580",   # 세트 해체 단품 (BH: 시타케 머쉬룸 오리지널 30g)
     "표고버섯 크리스프 오리지널 65g": "9345544003454",
     "표고버섯 크리스프 스모크 칠리&갈릭 65g": "9345544005977",
     "디제이앤에이 베지 크리스프 오리지널 90g": "9345544006868",
@@ -283,18 +327,105 @@ def _barcode_map(sp: ChannelSpec, up: Optional[dict] = None) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 매입 단가표 (발주 데이터에 금액이 없는 채널 — 컬리 상품공급정보의 '일반단가')
+# ─────────────────────────────────────────────────────────────────
+def _to_int(v) -> int:
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0
+        return int(round(float(str(v).replace(",", "").strip() or 0)))
+    except Exception:
+        return 0
+
+
+def _parse_supply_info_xlsx(df: pd.DataFrame) -> list:
+    """컬리 파트너 '상품공급정보 다운로드' xlsx → [{name, unit, event, barcode, code, box}].
+    헤더 행(상품명·일반단가 포함)을 찾아 읽는다. 단가 '1,600' 문자열도 처리."""
+    hdr = None
+    for i in range(min(len(df), 10)):
+        vals = [str(x).strip() for x in df.iloc[i].tolist()]
+        if "상품명" in vals and any("일반단가" in v for v in vals):
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError("상품공급정보 형식이 아닙니다 (상품명·일반단가 컬럼 없음)")
+    cols = [str(x).strip() for x in df.iloc[hdr].tolist()]
+    idx = {c: k for k, c in enumerate(cols)}
+
+    def col(row, *names):
+        for nm in names:
+            if nm in idx:
+                v = row[idx[nm]]
+                if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    return v
+        return None
+
+    out = []
+    for r in range(hdr + 1, len(df)):
+        row = df.iloc[r].tolist()
+        name = str(col(row, "상품명") or "").strip()
+        if not name:
+            continue
+        bc = col(row, "대체코드", "바코드")
+        bc_s = ""
+        if bc is not None:
+            bc_s = str(int(bc)) if isinstance(bc, float) else str(bc).strip()
+        out.append({
+            "name": name,
+            "unit": _to_int(col(row, "일반단가")),
+            "event": _to_int(col(row, "이벤트단가")),
+            "barcode": bc_s,
+            "code": str(col(row, "마스터코드") or "").strip(),
+            "box": _to_int(col(row, "박스당 입수", "박스입수")),
+        })
+    return out
+
+
+def _apply_prices(sp: ChannelSpec, rows: list, amap: dict, prices: dict) -> tuple[int, list]:
+    """금액 없는 발주 행에 단가표 × 수량으로 매입금액(amt)을 채운다.
+    amt는 채널 스펙의 amt_includes_vat 기준(컬리 True → 부가세 포함 금액)으로 맞춘다.
+    반환: (금액 채운 행 수, 단가표에 없는 라벨 목록)"""
+    items = (prices or {}).get("items") or {}
+    if not items:
+        return 0, []
+    vat_inc = bool((prices or {}).get("vat_included", True))
+    # 단가 부가세 포함 여부와 채널 amt 기준이 다르면 ×1.1 / ÷1.1
+    if sp.amt_includes_vat:
+        scale = 1.0 if vat_inc else 1.1
+    else:
+        scale = (1 / 1.1) if vat_inc else 1.0
+    filled, missing = 0, []
+    for r in rows:
+        if r.get("amt") is not None:
+            continue
+        lb = _label_of(r["name"], amap)
+        it = items.get(lb)
+        if it is None or it.get("unit") is None:
+            if lb not in missing:
+                missing.append(lb)
+            continue
+        r["amt"] = int(round(r["qty"] * int(it["unit"]) * scale))
+        r["amt_from_price"] = True
+        filled += 1
+    return filled, missing
+
+
+# ─────────────────────────────────────────────────────────────────
 # 발주 데이터 (order_plan 누적 저장소의 채널 행)
 # ─────────────────────────────────────────────────────────────────
 def _channel_rows(sp: ChannelSpec) -> tuple[list, str]:
     """[{name, qty, conf, recv, amt, date, po, fname}], 마지막 반영 시각"""
     store = OP._load_plan_store()
     rows, last_ingest = [], ""
+    amap = _alias_map(sp) if sp.unit_basis else None
     for fname, f in store.get("files", {}).items():
         if (f.get("channel") or "") != sp.channel:
             continue
         last_ingest = max(last_ingest, f.get("ingested_at") or "")
         for r in f.get("rows", []):
             if not r.get("date"):
+                continue
+            if sp.exclude_item and sp.exclude_item(str(r.get("name") or ""), str(r.get("barcode") or "")):
                 continue
             qty = int(r.get("qty") or 0)
             conf = None if r.get("conf") is None else int(r.get("conf"))
@@ -310,14 +441,26 @@ def _channel_rows(sp: ChannelSpec) -> tuple[list, str]:
                     amt = recv_amt
             else:
                 order_qty = qty
-            rows.append({
-                "name": str(r.get("name") or "").strip(),
-                "qty": qty, "order_qty": order_qty,
-                "conf": conf,
-                "recv": (None if r.get("recv") is None else int(r.get("recv"))),
-                "amt": amt, "recv_amt": recv_amt,
-                "date": r.get("date"), "po": str(r.get("po") or ""), "fname": fname,
-            })
+            name = str(r.get("name") or "").strip()
+            recv = None if r.get("recv") is None else int(r.get("recv"))
+            base = {"date": r.get("date"), "po": str(r.get("po") or ""), "fname": fname,
+                    "order_date": (r.get("order_date") or None)}   # 발주일 (일반 양식 '발주일자' 컬럼, 구버전 저장 행은 None)
+            # 세트 상품 → 구성 단품 행 (unit_basis 채널). 수량·확정·입고는 세트당 개수를 곱하고,
+            # 금액은 행 합계를 구성 비율로 나눠 붙인다 (합계 = 발주서 금액 그대로). BH 출고는 단품 SKU 로 나가므로 이렇게 맞춘다.
+            comps = COMMON_BUNDLES.get(_label_of(name, amap)) if sp.unit_basis else None
+            if comps:
+                tot_k = sum(k for _, k in comps) or 1
+                for cname, k in comps:
+                    share = k / tot_k
+                    rows.append({**base, "name": cname, "bundle_of": name, "bundle_k": k,
+                                 "qty": qty * k, "order_qty": order_qty * k,
+                                 "conf": (None if conf is None else conf * k),
+                                 "recv": (None if recv is None else recv * k),
+                                 "amt": (None if amt is None else int(round(amt * share))),
+                                 "recv_amt": (None if recv_amt is None else int(round(recv_amt * share)))})
+            else:
+                rows.append({**base, "name": name, "qty": qty, "order_qty": order_qty, "conf": conf, "recv": recv,
+                             "amt": amt, "recv_amt": recv_amt})
     return rows, last_ingest
 
 
@@ -422,13 +565,38 @@ def _memo_due(memo: str, tx_date: str) -> str:
     return ""
 
 
-def _channel_outbound(sp: ChannelSpec, token: str, from_date: str, to_date: str) -> list:
-    """채널 거래처 출고 → [{date, created, sku, name, qty, partner, due}]"""
+def _tx_detail_strict(token: str, tx_id) -> list:
+    """거래 상세 items — strict 용. routers.channel._fetch_tx_detail 은 실패를 [] 로 삼켜 월합계 캐시가 과소로 굳을 수 있어,
+    여기서는 HTTP 오류를 예외로 올린다. 429/5xx 는 1·2·4초 간격으로 3번까지 재시도."""
+    import requests as _rq
+    from routers.channel import BH_BASE, _bh_headers
+    last = None
+    for i in range(3):
+        try:
+            r = _rq.get(f"{BH_BASE}/v1/location-txs/{tx_id}", headers=_bh_headers(token), timeout=15)
+            if r.status_code == 429 or r.status_code >= 500:
+                last = RuntimeError(f"BH 상세 {tx_id}: HTTP {r.status_code}")
+                time.sleep(2 ** i)
+                continue
+            r.raise_for_status()
+            return (r.json().get("item") or {}).get("items") or []
+        except _rq.RequestException as e:
+            last = e
+            time.sleep(2 ** i)
+    raise last or RuntimeError(f"BH 상세 {tx_id} 조회 실패")
+
+
+def _channel_outbound(sp: ChannelSpec, token: str, from_date: str, to_date: str, strict: bool = False) -> list:
+    """채널 거래처 출고 → [{date, created, sku, name, qty, partner, due}]
+    strict=False(기본): BH 조회 실패는 [] (화면 요약이 죽지 않게).
+    strict=True: 조회(목록·거래 상세) 실패를 그대로 올린다 — 월별 출고 캐시처럼 '실패 = 출고 0' 으로 저장되면 안 되는 호출용."""
     if not token:
         return []
     try:
         txs = U.fetch_transactions(token, "out", from_date, to_date)
     except Exception:
+        if strict:
+            raise
         return []
     out = []
     for tx in txs:
@@ -440,18 +608,205 @@ def _channel_outbound(sp: ChannelSpec, token: str, from_date: str, to_date: str)
         due = _memo_due(str(tx.get("memo") or ""), d)
         items = tx.get("items")
         if items is None:
-            try:
-                from routers.channel import _fetch_tx_detail
-                items = _fetch_tx_detail(token, tx.get("id"))
-            except Exception:
-                items = []
+            if strict:
+                items = _tx_detail_strict(token, tx.get("id"))   # 실패는 예외로 — 상세 누락분이 빠진 월합계가 캐시되면 3일간 과소 집계
+            else:
+                try:
+                    from routers.channel import _fetch_tx_detail
+                    items = _fetch_tx_detail(token, tx.get("id"))
+                except Exception:
+                    items = []
         for it in items or []:
             sku = str(it.get("sku") or (it.get("item") or {}).get("sku") or "").strip()
             name = it.get("name") or (it.get("item") or {}).get("name") or ""
+            if sp.exclude_item and sp.exclude_item(str(name), sku):
+                continue
             q = abs(int(it.get("quantity") or 0))
             if q:
                 out.append({"date": d, "created": created, "sku": sku, "name": name, "qty": q,
                             "partner": partner, "due": due, "tx": tx.get("id")})
+    return out
+
+
+def _channel_cancels(sp: ChannelSpec, token: str, from_date: str, to_date: str, strict: bool = False) -> list:
+    """출고 취소 입고 → [{date, sku, name, qty}]. BH 에 출고 취소가 거래처 없는 '입고'(메모 '# 컬리 김포취소')로 기록되는 경우용.
+    sp.cancel_memo_kw 가 비면 []. 메모에 키워드와 '취소' 가 모두 있어야 한다."""
+    kw = sp.cancel_memo_kw
+    if not kw or not token:
+        return []
+    try:
+        txs = U.fetch_transactions(token, "in", from_date, to_date)
+    except Exception:
+        if strict:
+            raise
+        return []
+    out = []
+    for tx in txs:
+        memo = str(tx.get("memo") or "")
+        if kw not in memo or "취소" not in memo:
+            continue
+        d = str(tx.get("transaction_time") or tx.get("created_at") or "")[:10]
+        items = tx.get("items")
+        if items is None:
+            if strict:
+                items = _tx_detail_strict(token, tx.get("id"))
+            else:
+                try:
+                    from routers.channel import _fetch_tx_detail
+                    items = _fetch_tx_detail(token, tx.get("id"))
+                except Exception:
+                    items = []
+        for it in items or []:
+            sku = str(it.get("sku") or (it.get("item") or {}).get("sku") or "").strip()
+            name = it.get("name") or (it.get("item") or {}).get("name") or ""
+            if sp.exclude_item and sp.exclude_item(str(name), sku):
+                continue
+            q = abs(int(it.get("quantity") or 0))
+            if q:
+                out.append({"date": d, "sku": sku, "name": name, "qty": q})
+    return out
+
+
+_BH_MONTHLY_TTL_DAYS = 3
+_BH_MONTHLY_VER = 3   # 캐시 형식 버전 — 제외 품목·취소 상계(v2), 납기월 귀속(v3). 버전이 다르면 다시 조회
+
+
+def _ship_due(sp: ChannelSpec, sh: dict, due_dates: Optional[list] = None) -> str:
+    """BH 출고 1건의 귀속 납기일(YYYY-MM-DD). 'ship' 기준이면 출고일.
+    'due' 기준이면 메모의 납기('# 컬리 배차 8월 4일')가 있으면 그 날, 없으면('# 컬리 배차')
+    출고일 이후 7일 안의 가장 가까운 서류 납기일(거래명세서 입고일), 그것도 없으면 출고일.
+    예: 8/26 '# 컬리 배차' 1,608개 → 9/1 거래명세서(1,608개) → 9/1."""
+    d = str(sh.get("date") or "")[:10]
+    if sp.bh_month_basis != "due":
+        return d
+    due = str(sh.get("due") or "")[:10]
+    if due:
+        return due
+    if due_dates and d:
+        import bisect
+        i = bisect.bisect_left(due_dates, d)
+        if i < len(due_dates):
+            try:
+                if (datetime.fromisoformat(due_dates[i]) - datetime.fromisoformat(d)).days <= 7:   # 컬리 배차·택배는 출고 후 1주 안에 입고
+                    return due_dates[i]
+            except ValueError:
+                pass
+    return d
+
+
+def _ship_month(sp: ChannelSpec, sh: dict, due_dates: Optional[list] = None) -> str:
+    """BH 출고 1건의 귀속 월 (_ship_due 의 월)."""
+    return _ship_due(sp, sh, due_dates)[:7]
+
+
+def _month_end(ym: str) -> str:
+    """'2026-09' → '2026-09-30'"""
+    y, m = int(ym[:4]), int(ym[5:7])
+    nxt = datetime(y + (m // 12), (m % 12) + 1, 1)
+    return (nxt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _bh_monthly_shipped(sp: ChannelSpec, token: str, months: list, as_of: str,
+                        current_ship: Optional[list] = None, current_from: str = "",
+                        current_cancels: Optional[list] = None, due_dates: Optional[list] = None) -> dict:
+    """채널 거래처(sp.partner_match) BH 출고의 월별 합계 → {ym: qty|None}. 출고일 월 기준, SKU 매핑 필터 없이 전체.
+    (컬리 6·7·8월 1,974/7,893/8,343 = BH '마켓컬리' 출고 월합계 — 사용자 보고 수치와 일치 확인)
+      - 이달(as_of[:7]): _build_summary 가 이미 조회한 raw 출고(current_ship, current_from~as_of)를 합산. current_from 이 월초보다
+        늦으면 월초~current_from 전날만 추가 조회 (보통 ship_from ≤ 월초-15일이라 추가 조회 없음).
+      - 지난 달: state 'bh_monthly' 캐시({ym: {qty, fetched_at}}). 없거나 fetched_at 이 3일 이상 지난 달만 한 번의 조회
+        (빠진 달 최소 월초 ~ 최대 월말)로 채워 저장. token 없으면 캐시값 또는 None.
+      - 어느 단계든 예외면 그 달은 None (전체 요약이 죽지 않게). BH 조회는 strict 로 호출해 실패를 구분한다 —
+        실패를 '출고 0' 으로 캐시하면 3일간 경영 요약 추이가 0 으로 나가므로, 실패한 달은 None 으로 두고 캐시 저장도 건너뛴다."""
+    cur_ym = as_of[:7]
+    out: dict = {ym: None for ym in months}
+    if not months:
+        return out
+    now = datetime.now()
+    now_s = now.strftime("%Y-%m-%d %H:%M")
+
+    # ── 이달: 이미 조회한 출고 재사용 (token 없으면 조회 자체가 안 된 것이므로 0 이 아니라 None) ──
+    if cur_ym in out and token:
+        try:
+            m_start = cur_ym + "-01"
+            # 납기월 기준이면 지난 달 말 출고(이달 납기분)도 봐야 하므로 월초-15일부터
+            need_from = ((datetime.fromisoformat(m_start) - timedelta(days=15)).strftime("%Y-%m-%d")
+                         if sp.bh_month_basis == "due" else m_start)
+            # 납기월 기준: 귀속 납기가 기준일 이후인 출고(선출고)는 아직 납품이 아니므로 이달 합계에서 제외 — 발주잔량으로 본다
+            def key(sh):
+                due = _ship_due(sp, sh, due_dates)
+                if sp.bh_month_basis == "due" and due > as_of:
+                    return ""
+                return due[:7]
+            if current_ship is not None:
+                qty = sum(int(sh.get("qty") or 0) for sh in current_ship if key(sh) == cur_ym)
+                if current_from and current_from > need_from:
+                    gap_to = (datetime.fromisoformat(current_from) - timedelta(days=1)).strftime("%Y-%m-%d")
+                    qty += sum(int(sh.get("qty") or 0) for sh in _channel_outbound(sp, token, need_from, gap_to, strict=True)
+                               if key(sh) == cur_ym)
+                out[cur_ym] = qty
+            else:
+                out[cur_ym] = sum(int(sh.get("qty") or 0) for sh in _channel_outbound(sp, token, need_from, as_of, strict=True)
+                                  if key(sh) == cur_ym)
+            if sp.cancel_memo_kw and out[cur_ym] is not None:
+                cc = current_cancels if current_cancels is not None else _channel_cancels(sp, token, m_start, as_of, strict=True)
+                out[cur_ym] = max(0, out[cur_ym] - sum(int(c["qty"]) for c in cc if str(c["date"])[:7] == cur_ym))
+        except Exception:
+            out[cur_ym] = None   # 조회 실패 = 미확인 (0 아님)
+
+    # ── 지난 달: 캐시 → 빠진 달만 한 번에 조회 ──
+    past = [ym for ym in months if ym < cur_ym]
+    if not past:
+        return out
+    try:
+        st = _load_state(sp)
+        cache = dict(st.get("bh_monthly") or {})
+        missing = []
+        for ym in past:
+            c = cache.get(ym) or {}
+            fresh = False
+            if c.get("qty") is not None and c.get("fetched_at") and c.get("v") == _BH_MONTHLY_VER:
+                try:
+                    fresh = (now - datetime.strptime(c["fetched_at"], "%Y-%m-%d %H:%M")).days < _BH_MONTHLY_TTL_DAYS
+                except ValueError:
+                    fresh = False
+            if fresh or not token:
+                out[ym] = (None if c.get("qty") is None else int(c["qty"]))
+            else:
+                missing.append(ym)
+        if missing and token:
+            f_from, f_to = min(missing) + "-01", _month_end(max(missing))
+            if sp.bh_month_basis == "due":   # 첫 달 납기분이 그 전달 말에 출고된 경우까지
+                f_from = (datetime.fromisoformat(f_from) - timedelta(days=15)).strftime("%Y-%m-%d")
+            try:
+                # BH 거래 목록 캐시는 완결된 달을 영구 보관한다 → 사후 수정(올리브영 6월 7,510 → 8,010 등)이 안 보이므로
+                # 월별 합계를 새로 받는 시점에는 그 달 캐시를 지우고 다시 받는다
+                try:
+                    U.invalidate_bh_txlist_cache(f_from, f_to)
+                except Exception:
+                    pass
+                shipped = _channel_outbound(sp, token, f_from, f_to, strict=True)
+                cancels = _channel_cancels(sp, token, f_from, f_to, strict=True) if sp.cancel_memo_kw else []
+            except Exception:
+                # BH 조회 실패: 빠진 달은 None 그대로, 캐시도 저장하지 않는다 (다음 호출에서 다시 시도).
+                # 만료된 옛 캐시값이 있으면 그거라도 보여준다 (0 으로 굳히는 것보다 낫다)
+                for ym in missing:
+                    c = cache.get(ym) or {}
+                    out[ym] = (None if c.get("qty") is None else int(c["qty"]))
+                return out
+            agg: dict = defaultdict(int)
+            for sh in shipped:
+                agg[_ship_month(sp, sh, due_dates)] += int(sh.get("qty") or 0)
+            for c in cancels:
+                agg[str(c.get("date") or "")[:7]] -= int(c.get("qty") or 0)
+            for ym in missing:
+                out[ym] = max(0, int(agg.get(ym, 0)))
+                cache[ym] = {"qty": out[ym], "fetched_at": now_s, "v": _BH_MONTHLY_VER}
+            st = _load_state(sp)   # 저장 직전 다시 읽어 다른 필드(notes·prices 등) 덮어쓰기 방지
+            st["bh_monthly"] = cache
+            _save_json(sp.state_path, st)
+    except Exception:
+        for ym in past:
+            out.setdefault(ym, None)
     return out
 
 
@@ -531,7 +886,7 @@ def _parse_forecast_xlsx(df: pd.DataFrame) -> dict:
         for k in wk_idx:
             v = df.iat[i, k]
             try:
-                vals.append(round(float(v), 1))
+                vals.append(0.0 if pd.isna(v) else round(float(v), 1))   # 빈 칸(NaN)은 0 — NaN 이 남으면 보고문 round() 에서 터진다
             except (TypeError, ValueError):
                 vals.append(0.0)
         items[str(name).strip()] = {"sku_id": ("" if id_idx is None else str(df.iat[i, id_idx]).split(".")[0]),
@@ -677,6 +1032,16 @@ def _n(v) -> str:
 def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = False) -> dict:
     rows, last_ingest = _channel_rows(sp)
     amap = _alias_map(sp)
+    has_amt = sp.has_amt
+    price_meta = None
+    if sp.price_table:
+        pr = _load_state(sp).get("prices") or _empty_prices(sp)
+        filled, missing = _apply_prices(sp, rows, amap, pr)
+        has_amt = has_amt or filled > 0
+        price_meta = {"count": len(pr.get("items") or {}), "vat_included": bool(pr.get("vat_included", True)),
+                      "source": pr.get("source", ""), "updated_at": pr.get("updated_at", ""),
+                      "filled_rows": filled, "unpriced_rows": sum(1 for r in rows if r.get("amt") is None),
+                      "missing_labels": missing}
     skumap = _sku_map(sp, rows)
     cfg = U.load_config()
     token = cfg.get("api_token") or ""
@@ -686,7 +1051,8 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
     def label(name):
         return _label_of(name, amap)
 
-    vat = 1.1 if sp.amt_includes_vat else 1.0
+    # 공급가 환산 배수. 채널 화면이 부가세 포함 금액을 공급가로 쓰면(컬리) 나누지 않는다
+    vat = 1.1 if (sp.amt_includes_vat and not sp.supply_includes_vat) else 1.0
 
     def sup(v):
         """발주금액 → 공급가액 (채널별 부가세 포함 여부 반영)"""
@@ -847,8 +1213,20 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         if prevs:
             ship_from = (datetime.fromisoformat(prevs[-1]) + timedelta(days=1)).strftime("%Y-%m-%d")
         ship_from = max(ship_from, (datetime.fromisoformat(month_start) - timedelta(days=15)).strftime("%Y-%m-%d"))
-    ship = _channel_outbound(sp, token, ship_from, as_of)
-    ship = [sh for sh in ship if sku_to_label.get(sh["sku"])]   # 채널 발주 품목으로 매핑되는 출고만
+    # 조회는 월초-15일부터 넓게 받고, 직전 납기 이전 출고는 메모 납기가 이달 첫 납기 이후인 것만 남긴다
+    # (예: 8/27 '# 쿠팡 밀크런 1일' 4,629개 → 9/1 납기분. 직전 납기 8/28 다음날부터만 보면 빠진다)
+    fetch_from = ship_from
+    if past_month or sp.bh_month_basis == "due":
+        fetch_from = min(ship_from, (datetime.fromisoformat(month_start) - timedelta(days=15)).strftime("%Y-%m-%d"))
+    first_due = past_month[0]["date"] if past_month else month_start
+    # 거래처 출고 전체 (월별 추이 BH 합계용). 조회 실패는 빈 목록이 아니라 '미확인'으로 구분해야 이달 값이 0 으로 나가지 않는다
+    try:
+        ship_raw_all = _channel_outbound(sp, token, fetch_from, as_of, strict=True)
+        ship_fetch_ok = True
+    except Exception:
+        ship_raw_all, ship_fetch_ok = [], False
+    ship_raw = [sh for sh in ship_raw_all if sh["date"] >= ship_from or (sh.get("due") and sh["due"] >= first_due)]
+    ship = [sh for sh in ship_raw if sku_to_label.get(sh["sku"])]   # 채널 발주 품목으로 매핑되는 출고만
     for i, sh in enumerate(ship):
         sh["_i"] = i
     ship_by_date: dict = defaultdict(lambda: defaultdict(int))
@@ -924,18 +1302,23 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
             u = unit_supply.get(it["label"], 0)
             it["billed_supply"] = int(round(recv * u))
             it["unbilled_supply"] = int(round(max(0, it["shipped"] - recv) * u))
+            # 미납 금액: 발주(또는 납품예정) 대비 미납 수량 × 공급단가. 올리브영은 발주 대비 납품예정 미달분도 미납
+            it["unfilled_supply"] = int(round((it["unfilled"] + (it.get("short_vs_order", 0) if sp.qty_is_conf else 0)) * u))
             g_ship += it["shipped"]; g_deliv += it["delivered"]
             g_billed += it["billed_supply"]; g_unbilled += it["unbilled_supply"]
         # 그룹 품목에 없는 라벨의 출고(발주 외 품목)도 납품·미반영에 포함
+        g["_extra_ship"] = {}
         for lb, q in shipped_lb.items():
             if lb not in {it["label"] for it in g["items"]} and q:
                 g_ship += q; g_deliv += q
                 g_unbilled += int(round(q * unit_supply.get(lb, 0)))
+                g["_extra_ship"][lb] = q
         g["shipped"] = g_ship
         g["delivered"] = g_deliv
         g["billed_supply"] = g_billed
         g["unbilled_supply"] = g_unbilled
         g["unfilled"] = sum(it["unfilled"] for it in g["items"])
+        g["unfilled_supply"] = sum(it["unfilled_supply"] for it in g["items"])
 
     # 예정 납기 선출고 (+ 어느 납기에도 못 붙은 출고)
     extra_by_label: dict = defaultdict(int)
@@ -953,7 +1336,33 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         extra_by_due[key]["supply"] += sh["qty"] * unit_supply.get(lb, 0)
     extra_qty = sum(extra_by_label.values())
     extra_supply = int(round(sum(q * unit_supply.get(lb, 0) for lb, q in extra_by_label.items())))
+    # 예정 납기(기준일 이후)로 귀속된 선출고 — 채널은 아직 입고 전이므로 '납품 완료'에서 빼고 납품 대기 쪽에서만 본다
+    early_qty = sum(v["qty"] for k, v in extra_by_due.items() if k)
+    early_supply = int(round(sum(v["supply"] for k, v in extra_by_due.items() if k)))
 
+    # 매입 미반영 = 라벨별로 '이달 출고 합계 − 채널 입고확정 합계'를 월 단위로 상계.
+    # (한 출고 거래가 두 납기분을 합쳐 나가면 납기 귀속이 어긋나 한 납기는 초과·다른 납기는 미달로 보이는데,
+    #  월 합계로 보면 이미 입고확정된 수량이므로 미반영이 아니다 — 올리브영 9/3 출고 = 9/5+9/8 납기분 사례)
+    if sp.has_recv:
+        net_ship: dict = defaultdict(int); net_recv: dict = defaultdict(int)
+        for g in past_month:
+            # 출고 기록이 전혀 없고 납기가 출고 집계 시작일 직후인 그룹(예: 9/1 납기 → 8월 말 출고)은 출고가 집계 범위 밖이라
+            # 입고확정만 있다. 이걸 상계에 넣으면 다른 납기의 '입고 진행 중'을 부당하게 깎으므로 제외한다.
+            if not g.get("shipped") and (datetime.fromisoformat(g["date"]) - datetime.fromisoformat(ship_from)).days <= 7:
+                continue
+            for it in g["items"]:
+                net_ship[it["label"]] += it["shipped"]; net_recv[it["label"]] += (it["recv"] or 0)
+            for lb, q in g.get("_extra_ship", {}).items():
+                net_ship[lb] += q
+        net_unbilled = {lb: max(0, q - net_recv.get(lb, 0)) for lb, q in net_ship.items()}
+        month_unbilled = int(round(sum(q * unit_supply.get(lb, 0) for lb, q in net_unbilled.items())))
+        for g in past_month:
+            g["unbilled_supply"] = 0
+            for it in g["items"]:
+                it["unbilled_supply"] = 0
+        # 상계 후 남는 미반영은 가장 늦은 납기 그룹에 표시
+        if month_unbilled and past_month:
+            past_month[-1]["unbilled_supply"] = month_unbilled
     delivered_total = sum(g["delivered"] for g in past_month) + extra_qty
     billed_supply = sum(g["billed_supply"] for g in past_month)
     unbilled_supply = sum(g["unbilled_supply"] for g in past_month) + extra_supply
@@ -965,7 +1374,10 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
                 delivered_by_label[it["label"]] += it["delivered"]
     for lb, q in extra_by_label.items():
         delivered_by_label[lb] += q
-    unbilled_by_group = [{"md": g["md"], "date": g["date"], "qty": sum(max(0, it["shipped"] - (it["recv"] or 0)) for it in g["items"]),
+    pending_by_group = [{"md": g["md"], "date": g["date"], "qty": q}
+                        for g in past_month for q in [sum(max(0, it["shipped"] - (it["recv"] or 0)) for it in g["items"])] if q]
+    unbilled_by_group = [{"md": g["md"], "date": g["date"],
+                          "qty": (sum(net_unbilled.values()) if sp.has_recv else sum(max(0, it["shipped"] - (it["recv"] or 0)) for it in g["items"])),
                           "supply": g["unbilled_supply"]} for g in past_month if g["unbilled_supply"]]
     for key, v in sorted(extra_by_due.items()):
         if v["qty"]:
@@ -1047,6 +1459,9 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
             continue
         if r["recv_amt"] and not sp.qty_is_conf:
             recv_supply += r["recv_amt"] / vat
+        elif sp.qty_is_conf and r["amt"] and r["qty"]:
+            # 행 단가(원가금액 ÷ 납품예정수량) × 납품수량 — 품목별 가중평균 단가를 쓰면 납품확인서 합계와 어긋난다
+            recv_supply += r["recv"] * (r["amt"] / r["qty"]) / vat
         else:
             recv_supply += r["recv"] * unit_supply.get(label(r["name"]), 0)
     recv_supply = int(round(recv_supply))
@@ -1060,10 +1475,43 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
 
     trend = _build_trend(sp, up, amap, as_of, month)
 
+    # 월별 추이: BH 거래처 출고 월합계(이달은 위 ship_raw 재사용, 지난 달은 state 캐시)
+    cancels_cur: Optional[list] = []
+    if sp.cancel_memo_kw:
+        try:
+            cancels_cur = _channel_cancels(sp, token, month_start, as_of, strict=True)
+        except Exception:
+            cancels_cur = None   # 취소 조회 실패 → 월별 합계 쪽에서 다시 시도(실패면 이달 None)
+    bh_monthly = _bh_monthly_shipped(sp, token, _prev_months(month), as_of,
+                                     current_ship=(ship_raw_all if ship_fetch_ok else None), current_from=fetch_from,
+                                     current_cancels=cancels_cur, due_dates=all_dates)
+    # 입고확정 없는 단가표 채널(컬리): 이달 출고일 기준 공급가를 BH SKU(바코드) → 단가표로 직접 계산.
+    # 발주 품목 매핑(ship_by_date)은 이달 거래명세서에 없는 품목을 빼 버려 수량(bh_shipped)과 모집단이 어긋난다
+    month_ship_supply = None; month_ship_unpriced = 0
+    if sp.price_table and not sp.has_recv:
+        _pr = _load_state(sp).get("prices") or {}
+        _mult = 1.0 if _pr.get("vat_included", True) else 1.1
+        _bc_unit = {str(v.get("barcode") or "").strip(): int(v.get("unit") or 0)
+                    for v in (_pr.get("items") or {}).values() if v.get("barcode") and v.get("unit")}
+        _tot = 0.0
+        for sh in ship_raw_all:
+            _due = _ship_due(sp, sh, all_dates)
+            if _due[:7] != month or (sp.bh_month_basis == "due" and _due > as_of):   # 수량(bh_shipped)과 같은 귀속 기준, 선출고 제외
+                continue
+            u = _bc_unit.get(sh["sku"])
+            if u:
+                _tot += sh["qty"] * u * _mult
+            else:
+                month_ship_unpriced += sh["qty"]
+        for c in (cancels_cur or []):
+            if str(c["date"])[:7] == month:
+                _tot -= c["qty"] * _bc_unit.get(c["sku"], 0) * _mult
+        month_ship_supply = int(round(max(0.0, _tot))) if ship_fetch_ok else None
+
     core = sorted(pend_by_label.items(), key=lambda kv: -kv[1]["qty"])[:2]
     summary = {
         "channel": sp.key, "channel_name": sp.display, "has_conf": sp.has_conf, "conf_word": sp.conf_word,
-        "amt_includes_vat": sp.amt_includes_vat, "has_amt": sp.has_amt, "has_recv": sp.has_recv,
+        "amt_includes_vat": (sp.amt_includes_vat and not sp.supply_includes_vat), "has_amt": has_amt, "has_recv": sp.has_recv, "prices": price_meta,
         "recv_word": sp.recv_word, "upload_mode": sp.upload_mode,
         "as_of": as_of, "as_of_md": _md(as_of), "month": month, "month_label": month_label,
         "last_ingested_at": last_ingest, "bh_connected": bool(token),
@@ -1083,12 +1531,17 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
             "recv_by_label": [{"label": k, "qty": v} for k, v in sorted(recv_by_label.items(), key=lambda kv: -kv[1])],
             "ship_total": delivered_total, "ship_today": ship_today,
             "ship_supply": delivered_supply, "ship_priced_qty": ship_priced,
+            "early_total": early_qty, "early_supply": early_supply,   # 예정 납기 선출고 (납품 완료에 포함된 채널 미입고분)
+            "month_ship_supply": month_ship_supply, "month_ship_unpriced": month_ship_unpriced,   # 이달 출고일 기준 공급가(단가표 채널)
+            "cancel_qty": sum(int(c["qty"]) for c in (cancels_cur or []) if str(c["date"])[:7] == month),   # 이달 출고 취소 입고(상계분)
+            "bh_fetch_ok": ship_fetch_ok,   # False 면 이달 BH 출고 조회 실패(경영 요약 이달 값 미확인)
             "bh_ship_total": ship_total, "bh_ship_supply": ship_supply, "ship_from": ship_from,
             "delivered_by_label": [{"label": k, "qty": v} for k, v in sorted(delivered_by_label.items(), key=lambda kv: -kv[1])],
             "recv_supply": recv_supply,
             "unbilled_supply": unbilled_supply,
             "billed_supply": billed_supply,
             "unbilled_by_group": unbilled_by_group,
+            "pending_by_group": pending_by_group,   # 납기별 출고 완료·채널 입고등록 대기 수량 (상계 전)
             "ship_by_label": [{"label": k, "qty": v, "supply": ship_supply_by_label.get(k, 0)}
                               for k, v in sorted(ship_by_label.items(), key=lambda kv: -kv[1])],
             "ship_today_by_label": [{"label": k, "qty": v} for k, v in sorted(ship_today_by_label.items(), key=lambda kv: -kv[1])],
@@ -1107,23 +1560,41 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         "notes": _load_state(sp).get("notes", ""),
         "all_groups": [{"date": g["date"], "md": g["md"], "qty": g["qty"], "amt": g["amt"], "supply": g["supply"], "status": g["status"]}
                        for g in groups],
+        "history": _build_history(sp, rows, month, bh_monthly=bh_monthly),
+        "history_order_basis": ("order_date" if sp.history_by_order_date else "due"),   # 월별 추이 발주 수량 귀속 기준
+        "unit_basis": sp.unit_basis,   # 세트 상품을 단품으로 풀어 집계했는지 (쿠팡)
+        "exec_metric": sp.exec_metric,
+        "exec_metric_word": sp.exec_metric_word or ("납품" if sp.exec_metric == "recv" else "발주"),
     }
     if not sp.has_recv:
         # 채널 입고확정 데이터가 없는 채널(컬리): 별도 입고확정 절차가 없어 출고분 = 입고 확정으로 본다
         dvx = summary.get("delivery") or {}
         for g in dvx.get("groups") or []:
             g["recv"] = int(g.get("delivered") or 0)
+            g["billed_supply"] = int(g.get("billed_supply") or 0) + int(g.get("unbilled_supply") or 0)
+            g["unbilled_supply"] = 0
             for it in g.get("items") or []:
                 it["recv"] = int(it.get("delivered") or 0)
+                it["billed_supply"] = int(it.get("billed_supply") or 0) + int(it.get("unbilled_supply") or 0)
+                it["unbilled_supply"] = 0
         dvx["recv_month"] = int(dvx.get("ship_total") or 0)
+        # 금액도 출고분 전체를 매입 확정으로 (단가표로 계산한 채널)
+        dvx["billed_supply"] = int(dvx.get("ship_supply") or 0)
+        dvx["recv_supply"] = int(dvx.get("ship_supply") or 0)
+        dvx["unbilled_supply"] = 0
+        dvx["unbilled_by_group"] = []
     summary["text"] = _render_text(sp, summary)
     summary["text_detail"] = _render_text_detail(sp, summary)
-    if not sp.has_amt:
-        summary["text"] = _strip_money(summary["text"])
+    summary["text_exec"] = _render_text_exec(sp, summary)
+    # 후처리(금액·입고 문구 정리)는 상세 양식에만. 간결 양식은 렌더러가 has_amt / has_recv 를 직접 반영한다
+    if not has_amt:
         summary["text_detail"] = _strip_money(summary["text_detail"])
     if not sp.has_recv:
-        summary["text"] = _strip_recv_lines(summary["text"])
         summary["text_detail"] = _strip_recv_lines(summary["text_detail"])
+        if has_amt:
+            # 입고확정 절차가 없는 채널: '매입 확정'은 출고분 기준임을 문구에 드러낸다
+            summary["text_detail"] = (summary["text_detail"].replace(" — 전량 매입 확정", " — 출고분 전량 매입 반영(출고 = 입고 확정)")
+                                      .replace("(매입 확정)", "(출고 완료 = 입고 확정)"))
     return summary
 
 
@@ -1176,7 +1647,7 @@ def _build_trend_daily(up: dict, amap: dict) -> dict:
             "trend_pct": (round((avg7 - avgp) / avgp * 100) if avgp else None),
             "stock_last": last_stock, "stock_first": first_stock, "stock_delta": last_stock - first_stock,
             "days_of_supply": (round(last_stock / avg7, 1) if avg7 > 0 else None),
-            "forecast_weekly": fcv, "forecast_next": (fcv[0] if fcv else None),
+            "forecast_weekly": fcv, "forecast_next": (fcv[0] if fcv and fcv[0] == fcv[0] else None),   # NaN 방어 (NaN != NaN)
         })
     for lb, vals in fc_by_label.items():
         if lb not in per_label and vals and sum(vals) > 0:
@@ -1363,7 +1834,7 @@ def _render_text_detail(sp: ChannelSpec, s: dict) -> str:
         L.append(f"* {g['md']} 납기 — {_won(g['supply'])} ({_n(g['qty'])}개) · {_top(g['items'], 'qty', 2)}"
                  + (f" · 발주 {_n(g['order_qty'])} 중 미납 {_n(g['short_vs_order'])}" if sp.qty_is_conf and g.get("short_vs_order") else ""))
     if sp.qty_is_conf and o.get("short_vs_order"):
-        L.append(f"* 발주 {_n(o['order_qty'])}개 중 {sp.conf_word} {_n(o['qty'])}개 — 미납 {_n(o['short_vs_order'])}개는 재고 부족으로 납품예정에서 제외")
+        L.append(f"* 발주 {_n(o['order_qty'])}개 중 {sp.conf_word} {_n(o['qty'])}개 — 미납 {_n(o['short_vs_order'])}개는 납품예정에서 제외")
     if sp.has_conf and o["conf_avail"] and o["conf_diff"]:
         L.append(f"* {sp.conf_word}수량은 발주 대비 {_n(abs(o['conf_diff']))}개 {'적음' if o['conf_diff'] < 0 else '많음'} (납품가능 수량 확정 조정)")
     if s["last_ingested_at"]:
@@ -1469,151 +1940,294 @@ def _pct1(a: float, b: float) -> str:
     if not b:
         return "0%"
     v = a / b * 100
-    return f"{int(v)}%" if abs(v - round(v)) < 0.05 else f"{v:.1f}%"
+    return f"{round(v)}%" if abs(v - round(v)) < 0.05 else f"{v:.1f}%"
+
+
+def _pct_txt(tp) -> str:
+    """증감을 (+80%) / (-6%) 처럼 — 사람이 손으로 쓰던 표기"""
+    if tp is None:
+        return ""
+    return f"({'+' if tp > 0 else ''}{tp:g}%)"
+
+
+def _bar(ratio: float, width: int = 10) -> str:
+    """0~1 비율 → ▰▰▰▱▱ 막대. 슬랙 본문은 고정폭이 아니라서 같은 글자만 써 칸 수로 비교되게 한다"""
+    ratio = max(0.0, min(1.0, ratio or 0.0))
+    filled = width if ratio >= 1 else min(width - 1, int(ratio * width))   # 100% 만 가득 — 96% 가 만칸으로 보이지 않게
+    return "▰" * filled + "▱" * (width - filled)
 
 
 def _render_text(sp: ChannelSpec, s: dict) -> str:
-    """보고문 — 요약 3줄 · 납기별 발주잔량 · 재고 및 납품 가능 · 채널 판매/재고 (간결 양식)."""
-    o = s["orders"]; dv = s["delivery"]; f = s.get("fulfil") or {}; t = s.get("trend") or {}
-    ch = sp.display
-    L = [f"안녕하세요, {s['as_of_md']} 기준 {ch} 발주·납품 현황 공유드립니다.", "", "■ 요약"]
+    """슬랙 본문용 보고문 — 담당자가 직접 쓰던 양식(인사 1줄 · ■ 요약 · * 항목 · 마무리 1줄)을 그대로 따른다.
+    이모지·특수 기호 없이, 요약 3줄(납품 / 남은 발주 / 진행률)과 채널 판매(막대 포함)만. 상세는 '상세' 양식으로."""
+    o = s["orders"]; dv = s["delivery"]; t = s.get("trend") or {}
+    ch = sp.display; ml = s["month_label"]
+    has_amt = s.get("has_amt", True)   # 금액 없는 채널(단가표 없는 컬리)은 수량만
 
-    # 1) 발주잔량
-    if o["groups"]:
-        core = " · ".join(f"{c['label']} {_n(c['qty'])}" for c in o["core"])
-        L.append(f"* 미납품 발주잔량 {_won(o['supply'])} ({_n(o['qty'])}개 · {o['po_count']}건)" + (f" — {core}" if core else ""))
-        if sp.qty_is_conf and o.get("short_vs_order"):
-            shorts: dict = defaultdict(int)
-            for g in o["groups"]:
-                for it in g["items"]:
-                    if it.get("short_vs_order"):
-                        shorts[it["label"]] += it["short_vs_order"]
-            L.append(f"* 발주 {_n(o['order_qty'])}개 중 {sp.conf_word} {_n(o['qty'])}개 · 미납 {_n(o['short_vs_order'])}개 ("
-                     + " · ".join(f"{k} {_n(v)}" for k, v in sorted(shorts.items(), key=lambda kv: -kv[1])[:3]) + ") — 재고 부족으로 납품예정에서 제외")
-    else:
-        L.append("* 기준일 이후 납기 예정 발주 없음")
+    def amt_qty(supply, qty):
+        return f"{_won(supply)} ({_n(qty)}개)" if has_amt else f"{_n(qty)}개"
 
-    # 2) 납품
-    if s["bh_connected"] and dv["ship_total"]:
-        line = f"* {s['month_label']} 납품 {_won(dv.get('ship_supply'))} ({_n(dv['ship_total'])}개)"
-        if dv.get("unbilled_supply"):
-            line += f" — 매입 확정 {_won(dv.get('billed_supply'))}, 출고 완료·매입 미반영 {_won(dv.get('unbilled_supply'))}"
+    L = [f"[{ch}] 안녕하세요, {s['as_of_md']} 기준 {ch} 발주·납품 현황 공유드립니다.", "", "■ 요약"]
+
+    # 1) 이번 달 납품 (예정 납기 선출고분은 아직 채널 미입고 → 남은 발주 쪽)
+    done_q = done_s = 0
+    if s["bh_connected"]:
+        done_q = dv["ship_total"] - (dv.get("early_total") or 0)
+        done_s = (dv.get("ship_supply") or 0) - (dv.get("early_supply") or 0)
+        if done_q > 0:
+            line = f"* {ml} 납품 {amt_qty(done_s, done_q)}"
+            pend_s = (dv.get("unbilled_supply") or 0) - (dv.get("early_supply") or 0)
+            pend_q = sum(u["qty"] for u in (dv.get("unbilled_by_group") or [])) - (dv.get("early_total") or 0)   # 금액과 같은 모집단
+            if sp.has_recv and pend_s > 0 and pend_q > 0:
+                line += f" — 이 중 {sp.recv_word} 대기 {amt_qty(pend_s, pend_q)}"
+            L.append(line)
         else:
-            line += " — 전량 매입 확정"
-        unf = sum(g.get("unfilled", 0) for g in dv["groups"])
-        if sp.qty_is_conf:
-            unf += sum(g.get("short_vs_order", 0) for g in dv["groups"])
-        if unf:
-            line += f" · 지난 납기 발주 대비 미납 {_n(unf)}개"
-        L.append(line)
-    elif s["bh_connected"]:
-        L.append(f"* {s['month_label']} 납품 실적 없음")
+            L.append(f"* {ml} 납품 실적 없음")
 
-    # 3) 납품 가능
-    inc = [r for r in (f.get("incoming") or []) if r.get("applied")]
-    if s["bh_connected"] and o["groups"] and f:
-        need, deliv, short = f.get("need", 0), f.get("deliverable", 0), f.get("shortage", 0)
-        early = f.get("shipped_early") or 0
-        src = ("·".join(sorted({r["md"] for r in inc})) + " 입고분으로") if inc else "현 재고로"
-        early_txt = f", 선출고 {_n(early)}개 포함" if early else ""
-        if short == 0:
-            L.append(f"* {src} 발주잔량 전량 납품 가능합니다 ({_n(deliv)}/{_n(need)}개{early_txt})")
-        else:
-            L.append(f"* {src} 발주잔량의 {_pct1(deliv, need)} 납품 가능합니다 ({_n(deliv)}/{_n(need)}개{early_txt}) · 부족 "
-                     + " · ".join(f"{x['label']} {_n(x['qty'])}" for x in (f.get("short_by_label") or [])[:3]))
-
-    # ── 납기별 발주잔량
+    # 2) 남은 발주
     if o["groups"]:
-        L += ["", "■ 납기별 발주잔량"]
+        rng = f"{o['groups'][0]['md']}~{o['groups'][-1]['md']}" if len(o["groups"]) > 1 else o["groups"][0]["md"]
+        by_lb: dict = defaultdict(int)
         for g in o["groups"]:
-            line = f"* {g['md']} — {_won(g['supply'])} ({_n(g['qty'])}개)" + (f" · {_top(g['items'], 'qty', 2)}" if len(g["items"]) > 1 or g["items"][0]["qty"] != g["qty"] else (f" · {g['items'][0]['label']}" if g["items"] else ""))
-            if sp.qty_is_conf and g.get("short_vs_order"):
-                sh = sorted([it for it in g["items"] if it.get("short_vs_order")], key=lambda it: -it["short_vs_order"])
-                line += f" · 발주 {_n(g['order_qty'])} 중 미납 {_n(g['short_vs_order'])}(" + " · ".join(f"{it['label']} {_n(it['short_vs_order'])}" for it in sh[:2]) + ")"
-            L.append(line)
+            for it in g["items"]:
+                by_lb[it["label"]] += it.get("qty") or 0
+        top = _top([{"label": k, "qty": v} for k, v in sorted(by_lb.items(), key=lambda kv: -kv[1])], "qty", 1)
+        L.append(f"* 남은 발주 {amt_qty(o['supply'], o['qty'])} · {rng} 납기 · {o['po_count']}건" + (f" — {top}" if top else ""))
+    else:
+        L.append("* 남은 발주 없음")
 
-    # ── 재고 및 납품 가능
-    if s["bh_connected"] and o["groups"]:
-        L += ["", "■ 재고 및 납품 가능"]
-        inc_by_label: dict = defaultdict(list)
-        for r in inc:
-            inc_by_label[r["label"]].append(r)
-        # 라벨 정규화 (입고 예정 라벨은 사용자가 적은 이름)
-        label_of_inc = {}
-        for lb, rs in inc_by_label.items():
-            hit = next((x["label"] for x in s["stock"] if _nkey(x["label"]) == _nkey(lb)), lb)
-            label_of_inc[hit] = label_of_inc.get(hit, []) + rs
-        outs = [r for r in s["stock"] if r["status"] in ("out", "short") and r["pending"] > 0]
-        short_lbl = {x["label"]: x["qty"] for x in (f.get("short_by_label") or [])}
-        for r in outs:
-            rs = label_of_inc.get(r["label"], [])
-            early_r = sum(it.get("shipped_early", 0) for g in o["groups"] for it in g["items"] if it["label"] == r["label"])
-            sh_q = short_lbl.get(r["label"], 0)
-            line = f"* {r['label']} — 가용 {_n(r['stock'])}개"
-            if early_r:
-                line += f", 선출고 {_n(early_r)}개 완료"
-            if rs:
-                line += ", " + " · ".join(f"{x['md']} 입고 {_n(x['qty'])}개" for x in rs) + ("로 충당" if not sh_q else f"로 일부 충당 (부족 {_n(sh_q)}개)")
-            elif sh_q:
-                line += f", 미납품 발주잔량 {_n(r['pending'])}개 → 부족 {_n(sh_q)}개"
-            else:
-                line += f" → 발주잔량 {_n(r['pending'])}개 납품 가능"
-            L.append(line)
-        oks = [r for r in s["stock"] if r["status"] == "ok" and r["pending"] > 0]
-        non_full = [g for g in o["groups"] if g.get("shortage")]
-        if oks:
-            rate_txt = ("납기별 납품률은 모두 100%입니다" if not non_full else
-                        "납기별 납품률은 " + " · ".join(f"{g['md']} {_pct1(g['deliverable'], g['need'])}" for g in non_full)
-                        + ("이고 나머지는 100%입니다" if len(non_full) < len(o["groups"]) else "입니다"))
-            L.append(f"* 그 외 {len(oks)}종은 현 재고로 대응 가능하며, {rate_txt}")
-        rest_short = [x for x in (f.get("short_by_label") or []) if x["label"] not in {r["label"] for r in outs}]
-        for x in rest_short[:3]:
-            L.append(f"* {x['label']} {_n(x['qty'])}개 부족 — 추가 입고 필요")
-        um = [r for r in s["stock"] if r["status"] == "unmapped" and r["pending"] > 0]
-        if um:
-            L.append(f"* 세트·미매핑 {len(um)}종({_n(sum(r['pending'] for r in um))}개)은 재고 미확인으로 계산에서 제외")
-        # 특이사항 메모는 이 섹션 끝에 그대로
-        for ln in (s.get("notes") or "").splitlines():
-            ln = ln.strip()
-            if ln:
-                L.append(ln if ln.startswith(("*", "-", "•")) else f"* {ln}")
-    elif (s.get("notes") or "").strip():
-        L += ["", "■ 특이사항"]
-        for ln in (s.get("notes") or "").splitlines():
-            ln = ln.strip()
-            if ln:
-                L.append(ln if ln.startswith(("*", "-", "•")) else f"* {ln}")
+    # 3) 이번 달 진행률 — 납품 완료 ÷ (납품 완료 + 남은 발주). 금액이 없는 채널은 수량으로
+    if s["bh_connected"] and done_q > 0:
+        done, rest = (done_s, o["supply"] or 0) if has_amt else (done_q, o["qty"] or 0)
+        total = done + rest
+        if total > 0:
+            L.append(f"* {ml} 진행률 {_pct1(done, total)} {_bar(done / total)}")
 
-    # ── 채널 판매/재고
+    # 단가표가 일부만 등록된 채널(컬리): 금액이 일부 품목만 합산된 것임을 표시
+    pm_meta = s.get("prices") or {}
+    if has_amt and pm_meta.get("unpriced_rows"):
+        miss = pm_meta.get("missing_labels") or []
+        L.append(f"* 단가 미등록 {len(miss) or pm_meta['unpriced_rows']}종은 금액에서 제외" + (f" ({' · '.join(miss[:3])})" if miss else ""))
+
+    # ── 채널 판매: 품목별 한 줄, 끝에 재고 소진일 막대 (1칸 = 5일)
     if (t.get("has_rocket") or t.get("has_forecast")) and t.get("rows"):
         per = t.get("period_label", "")
+
+        def stock_tail(r):
+            dos = r.get("days_of_supply")
+            if dos is None:
+                return f" · 재고 {_n(r.get('stock_last'))}개" if r.get("stock_last") is not None else ""
+            return f" · 재고 {dos:g}일분" + (" — 부족" if dos < 7 else "") + f"  {_bar(dos / 50)}"
+
         if t.get("mode") == "monthly":
-            L += ["", f"■ {ch} 판매 현황 ({per} · {ch} 매장·온라인 소비자 판매)"]
-            L.append(f"* 판매 {_n(t.get('total_sales'))}개 (매장 {_n(t.get('total_store'))} · 온라인 {_n(t.get('total_online'))}) · 소비자가 {_won(t.get('total_retail'))} · 공급가 {_won(t.get('total_amount'))}"
-                     + (f" · 전월 {_n(t.get('total_sales_prev'))}개" if t.get("total_sales_prev") is not None else ""))
+            pv = t.get("total_sales_prev"); el = t.get("elapsed_days") or 0; pm = t.get("prev") or ""
+            head = f"■ {ch} 판매 ({per}"
+            if pv and el and t.get("total_sales") and len(pm) >= 7:
+                import calendar
+                pdays = calendar.monthrange(int(pm[:4]), int(pm[5:7]))[1]
+                pct = round(((t['total_sales'] / el) / (pv / pdays) - 1) * 100)
+                head += f" · 일평균 전월 대비 {'+' if pct > 0 else ''}{pct}%"
+            L += ["", head + ")"]
+            L.append(f"* 합계 {_n(t.get('total_sales'))}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전월 {_n(pv)}개)" if pv else ""))
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
-                tp = r["trend_pct"]
-                L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])}) · 소비자가 {_won(r['sales_retail'])}"
-                         + (f" · 일평균 {_n(round(r['avg_7d']))}개" + (f"({'+' if tp >= 0 else ''}{tp}%)" if tp is not None else "") if r["avg_7d"] else "")
-                         + f" · {ch} 재고 센터 {_n(r['stock_center'])}/매장 {_n(r['stock_store'])}" + (f" ({r['days_of_supply']:g}일분)" if r.get("days_of_supply") else ""))
+                L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
         else:
-            L += ["", f"■ {ch} 판매·재고" + (f" ({per})" if per else "")]
+            L += ["", f"■ {ch} 판매 ({per} 일평균 · 전주 대비 · {ch} 재고)"]
             for r in [x for x in t["rows"] if x["avg_7d"] or x.get("forecast_next")][:3]:
-                bits = []
                 if r["avg_7d"]:
-                    tp = r["trend_pct"]
-                    bits.append(f"일평균 {_n(round(r['avg_7d']))}개" + (f"({'+' if tp >= 0 else ''}{tp}%)" if tp is not None else ""))
-                    bits.append(f"재고 {r['days_of_supply']:g}일분" if r.get("days_of_supply") else f"재고 {_n(r['stock_last'])}개")
-                if r.get("forecast_next") is not None and not r["avg_7d"]:
-                    bits.append(f"다음주 예측 {_n(round(r['forecast_next']))}개")
-                if bits:
-                    L.append(f"* {r['label']} — " + " · ".join(bits))
+                    L.append(f"* {r['label']} — {_n(round(r['avg_7d']))}개/일 {_pct_txt(r['trend_pct'])}".rstrip() + stock_tail(r))
+                elif r.get("forecast_next") is not None:
+                    L.append(f"* {r['label']} — 다음주 예측 {_n(round(r['forecast_next']))}개")
+        if any(r.get("days_of_supply") is not None for r in t["rows"][:4]):
+            L.append("  (재고 막대 1칸 = 5일, 가득이면 50일 이상)")
+
+    # ── 특이사항 메모 (있을 때만)
+    notes = [ln.strip().lstrip("*-•■ ").strip() for ln in (s.get("notes") or "").splitlines() if ln.strip()]
+    if notes:
+        L += ["", "■ 특이사항"] + [f"* {ln}" for ln in notes]
+
+    L += ["", "참고로만 공유드립니다. 감사합니다."]
     return "\n".join(L)
+
+
+
+# ─────────────────────────────────────────────────────────────────
+# 월별 추이 · 경영 요약(3채널 묶음) 보고문
+# ─────────────────────────────────────────────────────────────────
+def _prev_months(month: str, n: int = 4) -> list:
+    """'2026-09', 4 → ['2026-06','2026-07','2026-08','2026-09']"""
+    y, m = int(month[:4]), int(month[5:7])
+    out = []
+    for k in range(n - 1, -1, -1):
+        yy, mm = y, m - k
+        while mm <= 0:
+            yy, mm = yy - 1, mm + 12
+        out.append(f"{yy:04d}-{mm:02d}")
+    return out
+
+
+def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_monthly: Optional[dict] = None) -> list:
+    """최근 n개월 월별 발주·납품 수량 (납기일 기준). 저장소에 없는 달은 화면에서 입력한 수기 값(state.monthly)으로 보정.
+    bh_monthly({ym: BH 거래처 출고 월합계}) 가 있으면 각 행에 bh_shipped 로 붙이고, 채널 입고확정 데이터가 없는 채널(컬리)은
+    출고 = 입고 확정이므로 그 값을 auto_delivered 로 쓴다. has_recv 채널은 저장소 입고 합계가 auto_delivered, bh_shipped 는 참고값.
+    [{ym, label, order_qty, delivered, auto_order_qty, auto_delivered, bh_shipped, override}]"""
+    agg: dict = defaultdict(lambda: {"order_qty": 0, "recv": 0, "recv_n": 0})
+    for r in rows:
+        ym = (r["date"] or "")[:7]
+        if not ym:
+            continue
+        # 발주 수량의 귀속 월: 기본은 납기월. history_by_order_date 채널(올리브영)은 발주일 월 (없는 행은 납기월로 폴백)
+        oym = ((r.get("order_date") or "")[:7] if sp.history_by_order_date else "") or ym
+        agg[oym]["order_qty"] += int(r.get("order_qty", r["qty"]) or 0)
+        a = agg[ym]
+        if r.get("recv") is not None:
+            a["recv"] += int(r["recv"]); a["recv_n"] += 1
+    ov = _load_state(sp).get("monthly") or {}
+    bh_monthly = bh_monthly or {}
+    out = []
+    for ym in _prev_months(month, n):
+        a = agg.get(ym) or {"order_qty": 0, "recv": 0, "recv_n": 0}
+        o = ov.get(ym) or {}
+        bh_q = bh_monthly.get(ym)
+        bh_q = None if bh_q is None else int(bh_q)
+        if sp.has_recv:
+            auto_recv = a["recv"] if a["recv_n"] else None
+        else:
+            auto_recv = bh_q   # 입고확정 절차가 없는 채널: BH 출고 = 납품
+        row = {"ym": ym, "label": f"{int(ym[5:7])}월",
+               "auto_order_qty": a["order_qty"] or None, "auto_delivered": auto_recv, "bh_shipped": bh_q,
+               "order_qty": a["order_qty"] or None, "delivered": auto_recv, "override": False}
+        for k in ("order_qty", "delivered"):
+            if o.get(k) is not None:
+                row[k] = int(o[k]); row["override"] = True
+        out.append(row)
+    return out
+
+
+def _render_text_exec(sp: ChannelSpec, s: dict, idx: Optional[int] = None) -> str:
+    """경영 요약 한 채널 블록 —
+        1. 쿠팡 로켓배송 — 납품 6월 32,069 → 7월 96,035 → 8월 68,661개 → 9월(78,719)
+        9월 납품 3억 5,791만원 (78,719개)
+        미납품 발주잔량 1,489만원 (3,008개 · 9/22 납기)"""
+    o = s["orders"]; dv = s["delivery"]
+    hist = s.get("history") or []
+    ml = s["month_label"]; month = s["month"]
+    has_amt = s.get("has_amt", True)
+    name = sp.exec_name or sp.display
+    metric_word = s.get("exec_metric_word") or sp.exec_metric_word or ("납품" if sp.exec_metric == "recv" else "발주")
+
+    # 이달 납품(진행중): 채널 입고확정이 있으면 그 수량(이달 납기 전체), 없으면 출고분
+    if sp.has_recv:
+        cur_deliv = max(int(dv.get("recv_month") or 0), sum(h["delivered"] or 0 for h in hist if h["ym"] == month))
+        cur_supply = int(dv.get("recv_supply") or 0)
+    else:
+        # 입고확정 없는 채널(컬리): 지난 달 추이(bh_shipped = BH 출고일 월합계)와 같은 '출고일 월' 기준으로 이달을 잡는다.
+        # dv.ship_total 은 납기 귀속 기준이라 지난 달 말 출고(예: 8/26~31 출고 → 9월 납기)가 이달로 넘어와
+        # '8월 8,343 → 9월(9,573)' 처럼 두 달에 중복 집계되고, 다음 달이 되면 9월 값이 다시 내려앉는다.
+        cur_row = next((h for h in hist if h["ym"] == month), None)
+        bh_cur = cur_row.get("bh_shipped") if cur_row else None
+        cur_deliv = int(bh_cur) if bh_cur is not None else int(dv.get("ship_total") or 0)
+        # 금액도 같은 기준: 이달 출고일자 출고의 공급가 합계(ship_by_date). 없으면 납기 귀속 금액(ship_supply)으로 폴백.
+        # (ship_by_date 는 발주 품목으로 매핑된 출고만이라 bh_shipped(거래처 전체)와 미매핑 SKU 만큼 차이 날 수 있음)
+        month_ship = [x for x in (dv.get("ship_by_date") or []) if str(x.get("date") or "")[:7] == month]
+        cur_supply = (int(sum(int(x.get("supply") or 0) for x in month_ship)) if month_ship and bh_cur is not None
+                      else int(dv.get("ship_supply") or 0))
+        if dv.get("month_ship_supply") is not None and bh_cur is not None:
+            cur_supply = int(dv["month_ship_supply"])   # BH SKU → 단가표 (수량과 같은 모집단)
+    # 수기 보정이 이달에도 있으면 그 값 우선
+    for h in hist:
+        if h["ym"] == month and h["override"] and h["delivered"] is not None:
+            cur_deliv = h["delivered"]
+
+    past = [h for h in hist if h["ym"] != month]
+    vals = [(h["label"], (h["delivered"] if sp.exec_metric == "recv" else h["order_qty"])) for h in past]
+    parts = [f"{lb} {_n(v)}" for lb, v in vals if v is not None]
+    if parts:
+        parts[-1] += "개"   # 자료 없는 달을 건너뛴 뒤 마지막 값에 단위
+    prev_lv = next(((lb, v) for lb, v in reversed(vals) if v is not None), None)   # 값이 있는 가장 최근 지난 달
+    # 첫 줄 이달 괄호는 지난 달과 같은 지표로: 발주 채널(올리브영)은 이달 납기 발주 수량, 납품 채널은 이달 납품
+    cur_row = next((h for h in hist if h["ym"] == month), None)
+    cur_metric = int((cur_row or {}).get("order_qty") or 0) if sp.exec_metric == "order" else cur_deliv
+    cur = f"{ml}({_n(cur_metric)}"
+    prev_v = prev_lv[1] if prev_lv else None
+    prev_label = prev_lv[0] if prev_lv else ""
+    pend_q = int(o.get("qty") or 0)
+    early_q = 0
+    shipped_early = min(pend_q, int((s.get("fulfil") or {}).get("shipped_early") or 0))
+    if not sp.has_recv and sp.bh_month_basis != "due":
+        # 이달 값이 출고일 기준이면 예정 납기분 선출고는 이미 이달 값에 들어 있으므로 잔량에서 뺀다 (이중 계산 방지)
+        early_q = shipped_early
+        pend_q = pend_q - early_q
+    if prev_v and cur_metric < prev_v:
+        if sp.exec_metric == "recv" and cur_metric + pend_q >= prev_v:
+            cur += f" / 진행중, {prev_label} 실적 초과예상"
+        elif (prev_v - cur_metric) / prev_v <= 0.05:
+            cur += f" / 진행중, {prev_label} 실적 근접"
+        else:
+            cur += " / 진행중"
+    cur += ")"
+    head = f"{name} — {metric_word} " + " → ".join(parts + [cur]) if parts else f"{name} — {ml} {metric_word} {cur}"
+    L = [f"{idx}. {head}" if idx else head, ""]
+
+    if cur_deliv:
+        L.append(f"{ml} 납품 " + (f"{_won(cur_supply)} ({_n(cur_deliv)}개)" if has_amt and cur_supply else f"{_n(cur_deliv)}개"))
+    # 잔량 그룹이 있어도 납품예정 수량이 0이면(올리브영: 발주 30 중 납품예정 0) '없음'으로.
+    # 출고 = 납품인 채널(컬리)은 선출고분을 잔량에서 뺀다 — 이미 이달 납품에 들어 있다
+    left_groups = [g for g in o["groups"] if (g.get("qty") or 0) - (0 if early_q == 0 else (g.get("shipped_early") or 0)) > 0]
+    tot_q = int(o.get("qty") or 0)
+    if left_groups and pend_q > 0:
+        due = "·".join(g["md"] for g in left_groups)
+        left_supply = int(round((o.get("supply") or 0) * pend_q / tot_q)) if tot_q else 0
+        # 납기 전인데 이미 출고한 물량은 잔량에 두되 '선출고 완료·입고 대기' 로 표시
+        early_note = f" · 선출고 {_n(shipped_early)}개 입고 대기" if (shipped_early and early_q == 0) else ""
+        L.append("미납품 발주잔량 " + (f"{_won(left_supply)} ({_n(pend_q)}개 · {due} 납기{early_note})" if has_amt and left_supply
+                                  else f"{_n(pend_q)}개 ({due} 납기{early_note})"))
+    elif early_q:
+        due = "·".join(g["md"] for g in o["groups"] if g.get("shipped_early"))
+        L.append(f"미납품 발주잔량 없음 ({due} 납기분 {_n(early_q)}개 선출고 완료)")
+    else:
+        L.append("미납품 발주잔량 없음")
+    return "\n".join(L)
+
+
+def build_exec_text(specs: list, as_of: str, month: str = "", extra_blocks: Optional[list] = None) -> dict:
+    """3채널(쿠팡·올리브영·컬리) 경영 요약을 한 번에. 채널별 summary 를 만들어 블록을 번호 붙여 이어 붙인다.
+    extra_blocks: 발주 엔진을 쓰지 않는 채널(네이버 등)의 블록 생성기 목록. 각 callable(as_of, month, idx) →
+    {key, name, text, history, error} 를 specs 뒤에 번호를 이어 붙인다. 실패는 '집계 실패' 블록."""
+    month = (month or as_of[:7])[:7]
+    blocks, channels = [], []
+    for i, sp in enumerate(specs, 1):
+        try:
+            sm = _build_summary(sp, as_of, month)
+            txt = _render_text_exec(sp, sm, idx=i)
+            channels.append({"key": sp.key, "name": sp.exec_name or sp.display, "text": txt, "history": sm.get("history"), "error": ""})
+        except Exception as e:  # 한 채널 실패가 전체를 막지 않게
+            txt = f"{i}. {sp.exec_name or sp.display} — 집계 실패 ({str(e)[:80]})"
+            channels.append({"key": sp.key, "name": sp.exec_name or sp.display, "text": txt, "history": None, "error": str(e)[:200]})
+        blocks.append(txt)
+    for k, fn in enumerate(extra_blocks or [], len(specs) + 1):
+        key = getattr(fn, "exec_key", f"extra{k}")
+        name = getattr(fn, "exec_name", key)
+        try:
+            blk = dict(fn(as_of, month, k) or {})
+            blk.setdefault("key", key); blk.setdefault("name", name)
+            blk.setdefault("history", None); blk.setdefault("error", "")
+            if not blk.get("text"):
+                blk["text"] = f"{k}. {blk['name']} — 집계 실패 (보고문 없음)"
+        except Exception as e:
+            blk = {"key": key, "name": name, "text": f"{k}. {name} — 집계 실패 ({str(e)[:80]})", "history": None, "error": str(e)[:200]}
+        channels.append(blk)
+        blocks.append(blk["text"])
+    return {"as_of": as_of, "as_of_md": _md(as_of), "month": month, "text": "\n\n".join(blocks), "channels": channels}
 
 
 # ─────────────────────────────────────────────────────────────────
 # 라우터
 # ─────────────────────────────────────────────────────────────────
+class MonthlyIn(BaseModel):
+    monthly: dict   # {YYYY-MM: {order_qty?: int|None, delivered?: int|None}} — None/빈 dict 이면 보정 삭제
+
+
 class NotesIn(BaseModel):
     notes: str
 
@@ -1624,6 +2238,11 @@ class IncomingIn(BaseModel):
     date: str
     memo: str = ""
     id: Optional[str] = None
+
+
+class PricesIn(BaseModel):
+    items: dict = {}                 # {label: unit(int) | {unit, ...} | None(삭제)}
+    vat_included: Optional[bool] = None
 
 
 class AliasIn(BaseModel):
@@ -1730,6 +2349,109 @@ def make_router(sp: ChannelSpec) -> APIRouter:
         st["incoming"] = [r for r in st.get("incoming", []) if r.get("id") != rid]
         _save_json(sp.state_path, st)
         return {"incoming": st["incoming"]}
+
+    @router.get("/prices")
+    def get_prices():
+        st = _load_state(sp)
+        return {"prices": st.get("prices") or _empty_prices(sp)}
+
+    @router.put("/prices")
+    def put_prices(body: PricesIn):
+        """단가표 수정. items 값이 정수면 unit만 바꾸고 원상품명·바코드 등 메타는 유지. None이면 삭제."""
+        st = _load_state(sp)
+        pr = st.get("prices") or _empty_prices(sp)
+        items = dict(pr.get("items") or {})
+        for lb, v in (body.items or {}).items():
+            lb = str(lb).strip()
+            if not lb:
+                continue
+            if v is None:
+                items.pop(lb, None)
+                continue
+            cur = dict(items.get(lb) or {})
+            if isinstance(v, dict):
+                cur.update({k: v[k] for k in ("unit", "event", "name", "barcode", "code", "box") if k in v})
+            else:
+                cur["unit"] = v
+            cur["unit"] = _to_int(cur.get("unit"))
+            items[lb] = cur
+        pr["items"] = items
+        if body.vat_included is not None:
+            pr["vat_included"] = bool(body.vat_included)
+        pr["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st["prices"] = pr
+        _save_json(sp.state_path, st)
+        return {"prices": pr}
+
+    @router.post("/prices/upload")
+    async def upload_prices(files: list[UploadFile] = File(...)):
+        """컬리 '상품공급정보 다운로드' xlsx → 라벨별 매입단가(일반단가). 같은 라벨이 여러 행이면 마지막 행."""
+        st = _load_state(sp)
+        pr = st.get("prices") or _empty_prices(sp)
+        amap = _alias_map(sp)
+        items = dict(pr.get("items") or {})
+        added, errors, skipped, src = 0, [], [], []
+        for f in files:
+            fname = f.filename or "file"
+            data = await f.read()
+            try:
+                df = pd.read_excel(io.BytesIO(data), header=None)
+                for it in _parse_supply_info_xlsx(df):
+                    lb = _label_of(it["name"], amap)
+                    if it["unit"] <= 0:
+                        # 증정품 등 단가 0 행: 같은 라벨의 정상 단가를 덮어쓰지 않는다
+                        skipped.append(f"{lb} (단가 0)")
+                        if (items.get(lb) or {}).get("unit"):
+                            continue
+                    items[lb] = it
+                    added += 1
+                src.append(fname)
+            except Exception as e:
+                errors.append(f"{fname}: {e}")
+        pr["items"] = items
+        if src:
+            pr["source"] = ", ".join(src)
+            pr["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st["prices"] = pr
+        _save_json(sp.state_path, st)
+        return {"added": added, "skipped": skipped, "errors": errors, "prices": pr}
+
+    @router.post("/prices/clear")
+    def clear_prices():
+        st = _load_state(sp)
+        st["prices"] = _empty_prices(sp)
+        _save_json(sp.state_path, st)
+        return {"prices": st["prices"]}
+
+    @router.get("/monthly")
+    def get_monthly():
+        return {"monthly": _load_state(sp).get("monthly") or {}}
+
+    @router.put("/monthly")
+    def put_monthly(body: MonthlyIn):
+        """월별 추이 수기 보정 저장. 값 None 이면 해당 항목 삭제, 항목이 모두 비면 그 달 삭제."""
+        st = _load_state(sp)
+        cur = dict(st.get("monthly") or {})
+        for ym, v in (body.monthly or {}).items():
+            ym = str(ym)[:7]
+            if not re.match(r"^\d{4}-\d{2}$", ym):
+                raise HTTPException(400, f"월 형식 오류: {ym}")
+            if not v:
+                cur.pop(ym, None); continue
+            row = dict(cur.get(ym) or {})
+            for k in ("order_qty", "delivered"):
+                if k in v:
+                    if v[k] is None or v[k] == "":
+                        row.pop(k, None)
+                    else:
+                        row[k] = _to_int(v[k])
+            if row:
+                cur[ym] = row
+            else:
+                cur.pop(ym, None)
+        st["monthly"] = cur
+        _save_json(sp.state_path, st)
+        return {"monthly": cur}
 
     @router.get("/aliases")
     def get_aliases():

@@ -30,6 +30,7 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
       { key: 'coupangreport', icon: <ShoppingOutlined />, label: '쿠팡 발주 보고' },
       { key: 'oliveyoungreport', icon: <ShopOutlined />, label: '올리브영 발주 보고' },
       { key: 'kurlyreport', icon: <GiftOutlined />, label: '컬리 발주 보고' },
+      { key: 'naverreport', icon: <FundOutlined />, label: '네이버 출고 보고' },
     ],
   },
   {

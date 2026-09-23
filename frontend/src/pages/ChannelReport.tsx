@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef, Fragment } from 'react'
 import { Button, DatePicker, Upload, Spin, Alert, Tag, Tooltip, message, Popconfirm, Collapse, Input, Select, InputNumber, Segmented } from 'antd'
 import {
   ReloadOutlined, CopyOutlined, UploadOutlined, SaveOutlined, DeleteOutlined, EditOutlined, PlusOutlined,
@@ -7,8 +7,10 @@ import dayjs from 'dayjs'
 import {
   getCoupangReport, uploadCoupangReportFiles, clearCoupangReportUploads, saveCoupangReportNotes,
   getCoupangReportAliases, saveCoupangReportAliases, saveCoupangIncoming, deleteCoupangIncoming,
+  getChannelPrices, saveChannelPrices, uploadChannelPrices, clearChannelPrices,
+  getChannelExecReport, saveChannelMonthly,
 } from '../services/api'
-import type { CoupangReportSummary, CpGroup, CpStockRow, CpTrendRow, ChannelReportBase } from '../services/api'
+import type { CoupangReportSummary, CpGroup, CpStockRow, CpTrendRow, ChannelReportBase, CpPrices, ChannelExecReport } from '../services/api'
 
 export interface ChannelCfg {
   base: ChannelReportBase
@@ -22,7 +24,8 @@ export interface ChannelCfg {
   uploadHint: React.ReactNode
   monthly: boolean       // 판매/재고 파일이 월 단위(올리브영)
   noUpload?: boolean     // 판매/재고 파일 업로드가 없는 채널(컬리)
-  noAmt?: boolean        // 발주 데이터에 금액이 없는 채널(컬리) → 금액을 '-'로 표시
+  noAmt?: boolean        // 발주 데이터에 금액이 없는 채널(컬리) → 단가표가 없으면 금액을 '-'로 표시
+  priceTable?: boolean   // 매입 단가표(상품공급정보 xlsx)를 올려 수량×단가로 금액을 계산하는 채널(컬리)
 }
 
 /** 쿠팡 발주 보고 — 발주 캘린더에 쌓인 쿠팡 발주서(납기·확정·입고)와 BH 재고/출고,
@@ -100,15 +103,20 @@ function stockTag(r: CpStockRow) {
 
 export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   const B = cfg.base
-  NO_AMT = !!cfg.noAmt
   const [asOf, setAsOf] = useState(dayjs().format('YYYY-MM-DD'))
   const [data, setData] = useState<CoupangReportSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [text, setText] = useState('')
   const [textDirty, setTextDirty] = useState(false)
-  const [fmt, setFmt] = useState<'compact' | 'detail'>(() => { try { return (localStorage.getItem('cpr_fmt') as 'compact' | 'detail') || 'compact' } catch { return 'compact' } })
-  const pick = (d: CoupangReportSummary, f: 'compact' | 'detail') => f === 'detail' ? d.text_detail : d.text
+  type Fmt = 'compact' | 'detail' | 'exec'
+  const [fmt, setFmt] = useState<Fmt>(() => { try { return (localStorage.getItem('cpr_fmt') as Fmt) || 'compact' } catch { return 'compact' } })
+  const [execRep, setExecRep] = useState<ChannelExecReport | null>(null)
+  const [execLoading, setExecLoading] = useState(false)
+  // exec: 묶음 응답이 같은 기준일일 때만 쓰고, 아니면 이 채널 단독 text_exec 로 폴백 (기준일 변경 중 옛 텍스트 덮어쓰기 방지)
+  const pick = (d: CoupangReportSummary, f: Fmt) => f === 'detail' ? d.text_detail : f === 'exec' ? ((execRep && execRep.as_of === d.as_of ? execRep.text : undefined) ?? d.text_exec) : d.text
+  const [monthlyEdit, setMonthlyEdit] = useState<Record<string, { order_qty?: number | null; delivered?: number | null }>>({})
+  const [monthlySaving, setMonthlySaving] = useState(false)
   const [notes, setNotes] = useState('')
   const [notesSaving, setNotesSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -122,6 +130,15 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   const [incSaving, setIncSaving] = useState(false)
   const pendingFiles = useRef<File[]>([])
   const uploadTimer = useRef<number | null>(null)
+  const [prices, setPrices] = useState<CpPrices | null>(null)
+  const [priceOpen, setPriceOpen] = useState(false)
+  const [priceEdit, setPriceEdit] = useState<Record<string, number | null>>({})
+  const [priceBusy, setPriceBusy] = useState(false)
+  const pendingPriceFiles = useRef<File[]>([])
+  const priceTimer = useRef<number | null>(null)
+  // 금액 없는 채널이라도 단가표로 금액이 채워졌으면(has_amt) 표시
+  const noAmt = !!cfg.noAmt && !data?.has_amt
+  NO_AMT = noAmt
 
   async function load(refreshBh = false) {
     setLoading(true); setError(null)
@@ -138,6 +155,44 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   }
   useEffect(() => { load() }, [asOf])  // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 경영 요약(전 채널 묶음) — 이 형식을 고를 때만 쿠팡·올리브영·컬리·네이버 엔진을 한 번에 돌린다
+  async function loadExec(force = false) {
+    if (execLoading) return
+    if (!force && execRep && execRep.as_of === asOf) return
+    setExecLoading(true)
+    try {
+      const r = await getChannelExecReport(asOf, asOf.slice(0, 7))
+      setExecRep(r)
+      if (!textDirty) setText(r.text)
+      r.channels.filter(c => c.error).forEach(c => message.warning(`${c.name} 집계 실패: ${c.error}`))
+    } catch (e: unknown) { message.error(e instanceof Error ? e.message : '경영 요약 조회 실패') }
+    finally { setExecLoading(false) }
+  }
+  useEffect(() => { if (fmt === 'exec') loadExec() }, [fmt, asOf])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 저장·업로드 뒤 다시 읽기 — 경영 요약 모드면 4채널 묶음도 다시 집계 (아니면 저장 전 텍스트로 되돌아감)
+  async function reload(refreshBh = false) {
+    await load(refreshBh)
+    if (fmt === 'exec') await loadExec(true)
+  }
+
+  async function saveMonthly() {
+    setMonthlySaving(true)
+    try {
+      await saveChannelMonthly(monthlyEdit, B)
+      setMonthlyEdit({}); setTextDirty(false); message.success('월별 추이 저장')
+      setExecRep(null); await load(); if (fmt === 'exec') await loadExec(true)
+    } catch { message.error('저장 실패') } finally { setMonthlySaving(false) }
+  }
+  async function resetMonthly(ym: string) {
+    setMonthlySaving(true)
+    try {
+      await saveChannelMonthly({ [ym]: null }, B)
+      setMonthlyEdit(e => { const c = { ...e }; delete c[ym]; return c }); setTextDirty(false)
+      setExecRep(null); await load(); if (fmt === 'exec') await loadExec(true)
+    } catch { message.error('초기화 실패') } finally { setMonthlySaving(false) }
+  }
+
   // 파일 여러 개 드롭 시 한 번에 업로드 (antd Upload는 파일별로 beforeUpload 호출)
   function queueUpload(file: File) {
     pendingFiles.current.push(file)
@@ -149,26 +204,60 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
         const res = await uploadCoupangReportFiles(files, B, cfg.monthly ? uploadPeriod : undefined)
         res.errors.forEach(e => message.error(e))
         if (res.added.length) message.success(`${res.added.map(a => a.filename).join(', ')} 반영`)
-        await load()
+        await reload()
       } catch { message.error('업로드 실패') } finally { setUploading(false) }
     }, 250)
     return false
   }
 
+  async function loadPrices() {
+    try { const r = await getChannelPrices(B); setPrices(r.prices); setPriceEdit({}) } catch { message.error('단가표 조회 실패') }
+  }
+  useEffect(() => { if (cfg.priceTable) loadPrices() }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  function queuePriceUpload(file: File) {
+    pendingPriceFiles.current.push(file)
+    if (priceTimer.current) window.clearTimeout(priceTimer.current)
+    priceTimer.current = window.setTimeout(async () => {
+      const files = pendingPriceFiles.current.splice(0)
+      setPriceBusy(true)
+      try {
+        const res = await uploadChannelPrices(files, B)
+        res.errors.forEach(e => message.error(e))
+        if (res.added) message.success(`단가 ${res.added}건 반영${res.skipped.length ? ` · 단가 0 제외: ${res.skipped.join(', ')}` : ''}`)
+        setPrices(res.prices); setPriceEdit({}); setPriceOpen(true); setTextDirty(false)
+        await reload()
+      } catch { message.error('단가표 업로드 실패') } finally { setPriceBusy(false) }
+    }, 250)
+    return false
+  }
+  async function savePrices(vatIncluded?: boolean) {
+    setPriceBusy(true)
+    try {
+      const r = await saveChannelPrices({ items: priceEdit, ...(vatIncluded === undefined ? {} : { vat_included: vatIncluded }) }, B)
+      setPrices(r.prices); setPriceEdit({}); setTextDirty(false); message.success('단가표 저장'); await reload()
+    } catch { message.error('단가표 저장 실패') } finally { setPriceBusy(false) }
+  }
+  async function removePrices() {
+    setPriceBusy(true)
+    try { const r = await clearChannelPrices(B); setPrices(r.prices); setPriceEdit({}); setTextDirty(false); await reload() }
+    catch { message.error('단가표 삭제 실패') } finally { setPriceBusy(false) }
+  }
+
   async function saveNotes() {
     setNotesSaving(true)
-    try { await saveCoupangReportNotes(notes, B); message.success('특이사항 저장'); setTextDirty(false); await load() }
+    try { await saveCoupangReportNotes(notes, B); message.success('특이사항 저장'); setTextDirty(false); await reload() }
     catch { message.error('저장 실패') } finally { setNotesSaving(false) }
   }
 
   async function addIncoming() {
     if (!incLabel || !incQty || !incDate) { message.warning('품목·수량·도착일을 입력하세요'); return }
     setIncSaving(true)
-    try { await saveCoupangIncoming({ label: incLabel, qty: incQty, date: incDate, memo: incMemo }, B); setIncQty(null); setIncMemo(''); setTextDirty(false); await load() }
+    try { await saveCoupangIncoming({ label: incLabel, qty: incQty, date: incDate, memo: incMemo }, B); setIncQty(null); setIncMemo(''); setTextDirty(false); await reload() }
     catch { message.error('저장 실패') } finally { setIncSaving(false) }
   }
   async function removeIncoming(id: string) {
-    try { await deleteCoupangIncoming(id, B); setTextDirty(false); await load() } catch { message.error('삭제 실패') }
+    try { await deleteCoupangIncoming(id, B); setTextDirty(false); await reload() } catch { message.error('삭제 실패') }
   }
 
   async function copyText() {
@@ -192,7 +281,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
       const k = ln.slice(0, i).trim(), v = ln.slice(i + 1).trim()
       if (k && v) out[k] = v
     }
-    try { await saveCoupangReportAliases(out, B); message.success('별칭 저장'); setAliasOpen(false); setTextDirty(false); await load() }
+    try { await saveCoupangReportAliases(out, B); message.success('별칭 저장'); setAliasOpen(false); setTextDirty(false); await reload() }
     catch { message.error('별칭 저장 실패') }
   }
 
@@ -201,8 +290,8 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   const coreLabels = useMemo(() => new Set((o?.core || []).map(c => c.label)), [o])
 
   const renderGroupRows = (g: CpGroup, showRecv: boolean) => (
-    <>
-      <tr className="grp" key={g.date}>
+    <Fragment key={g.date}>{/* 납기 그룹 = 헤더 행 + 품목 행. map 에서 배열로 돌려주므로 Fragment 에 key 필요 (React key 경고 원인) */}
+      <tr className="grp">
         <td>{g.md} 납기 <span className="muted" style={{ fontWeight: 400 }}>· {g.po_count}건</span></td>
         <td className="num">{n(g.order_qty ?? g.qty)}{(g.short_vs_order || 0) > 0 ? <span className="bad" style={{ fontSize: '0.7rem' }}> (미납 {n(g.short_vs_order)})</span> : null}</td>
         {data?.has_conf && <td className="num">{g.conf_avail ? n(g.conf) : <span className="muted">-</span>}</td>}
@@ -224,7 +313,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
           <td className="num muted">{won(Math.round(it.amt / (data?.amt_includes_vat === false ? 1 : 1.1)))}</td>
         </tr>
       ))}
-    </>
+    </Fragment>
   )
 
   return (
@@ -253,6 +342,14 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
               <Button icon={<UploadOutlined />} loading={uploading}>{cfg.uploadLabel}</Button>
             </Upload>
           )}
+          {cfg.priceTable && (
+            <Upload accept=".xlsx,.xls" multiple showUploadList={false} beforeUpload={queuePriceUpload}>
+              <Tooltip title="컬리 파트너 > 상품 > 상품공급정보 다운로드 xlsx (일반단가 = 매입단가)">
+                <Button icon={<UploadOutlined />} loading={priceBusy}>단가표 업로드</Button>
+              </Tooltip>
+            </Upload>
+          )}
+          {cfg.priceTable && <Button icon={<EditOutlined />} onClick={() => setPriceOpen(v => !v)}>매입 단가표{prices ? ` (${Object.keys(prices.items).length})` : ''}</Button>}
           <Button icon={<EditOutlined />} onClick={openAliases}>품목 별칭</Button>
         </div>
       </div>
@@ -266,7 +363,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
             <div className="kpi">
               <div className="k">발주 현황 (기준일 이후 납기)</div>
               <div className="v">{n(o.qty)}<small>개 · {o.po_count}건</small></div>
-              <div className="d">{cfg.noAmt ? `${cfg.poWord} 기준 · 금액 정보 없음` : <>공급가 {won(o.supply)}{data.amt_includes_vat !== false && <span className="muted"> (매입가 {won(o.amt)})</span>}</>}</div>
+              <div className="d">{noAmt ? `${cfg.poWord} 기준 · 금액 정보 없음 (단가표 업로드 시 표시)` : <>공급가 {won(o.supply)}{data.amt_includes_vat !== false && <span className="muted"> (매입가 {won(o.amt)})</span>}</>}</div>
             </div>
             <div className="kpi">
               <div className="k">{data.fulfil.incoming_total ? `${data.ob_connected ? '가용재고' : '재고'} + 입고 예정 기준 납품 가능` : `현재 ${data.ob_connected ? '아워박스 가용재고' : '재고'}로 납품 가능`}</div>
@@ -276,8 +373,8 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
             </div>
             <div className="kpi">
               <div className="k">{data.month_label} 납품 실적</div>
-              <div className="v">{n(dv.ship_total)}<small>개{!cfg.noAmt && <> · 공급가 {won(dv.ship_supply)}</>}</small></div>
-              <div className="d">{cfg.noAmt || data.has_recv === false
+              <div className="v">{n(dv.ship_total)}<small>개{!noAmt && <> · 공급가 {won(dv.ship_supply)}</>}</small></div>
+              <div className="d">{noAmt || data.has_recv === false
                 ? <>출고 = 입고 확정 ({cfg.name} 별도 입고확정 없음){dv.ship_today ? ` · 오늘 출고 ${n(dv.ship_today)}개` : ''}</>
                 : <>매입 확정 {won(dv.billed_supply)}{dv.unbilled_supply ? <span className="warn"> · 매입 미반영 {won(dv.unbilled_supply)}</span> : null} · {data.recv_word} {n(dv.recv_month)}개{dv.ship_total - dv.recv_month > 0 ? <span className="warn"> · {data.recv_word} 대기 {n(Math.max(0, dv.ship_total - dv.recv_month))}개</span> : null}{dv.ship_today ? ` · 오늘 출고 ${n(dv.ship_today)}개` : ''}</>}</div>
             </div>
@@ -367,7 +464,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                          {data.trend.has_forecast ? ` · 예측 ${data.uploads.forecast?.weeks?.[0]?.from}~ (${data.uploads.forecast?.weeks?.length}주)` : ' · 예측 미업로드'}</>}
                   </span>
                   {(data.trend.has_rocket || data.trend.has_forecast) && (
-                    <Popconfirm title="업로드한 판매·재고·예측 자료를 모두 지울까요?" onConfirm={async () => { await clearCoupangReportUploads(B); await load() }}>
+                    <Popconfirm title="업로드한 판매·재고·예측 자료를 모두 지울까요?" onConfirm={async () => { await clearCoupangReportUploads(B); await reload() }}>
                       <Button size="small" type="text" icon={<DeleteOutlined />} style={{ marginLeft: 'auto' }} />
                     </Popconfirm>
                   )}
@@ -446,35 +543,72 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
             {/* 우측: 보고문 + 특이사항 */}
             <div>
               <div className="panel">
-                <h3>보고문
-                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '상세', value: 'detail' }]}
-                    onChange={v => { const f = v as 'compact' | 'detail'; setFmt(f); try { localStorage.setItem('cpr_fmt', f) } catch { /* ignore */ } if (!textDirty) setText(pick(data, f)) }} />
-                  <span className="sub">{textDirty ? '수정 중 (새로고침해도 유지)' : '자동 생성'}</span>
+                <h3 style={{ flexWrap: 'wrap' }}>보고문
+                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '상세', value: 'detail' }, { label: '경영 요약 (전 채널)', value: 'exec' }]}
+                    onChange={v => { const f = v as Fmt; setFmt(f); try { localStorage.setItem('cpr_fmt', f) } catch { /* ignore */ } if (!textDirty) setText(pick(data, f)) }} />
+                  <span className="sub">{textDirty ? '수정 중 (새로고침해도 유지)' : fmt === 'exec' ? (execLoading ? '전 채널 집계 중…' : '전 채널 자동 생성') : '자동 생성'}</span>
                   <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
                     {textDirty && <Button size="small" onClick={() => { setTextDirty(false); setText(pick(data, fmt)) }}>자동 생성으로 되돌리기</Button>}
+                    {fmt === 'exec' && <Button size="small" icon={<ReloadOutlined />} loading={execLoading} onClick={() => loadExec(true)}>다시 집계</Button>}
                     <Button size="small" type="primary" icon={<CopyOutlined />} onClick={copyText}>복사</Button>
                   </span>
                 </h3>
                 <textarea className="report" value={text} onChange={e => { setText(e.target.value); setTextDirty(true) }} spellCheck={false} />
                 <div className="hint" style={{ marginTop: 6 }}>
-                  {cfg.noAmt ? `${cfg.poWord}에는 단가가 없어 금액은 표시하지 않습니다. ${cfg.name}는 별도 입고확정 절차가 없어 박스히어로 ${cfg.name} 출고분을 그대로 입고 확정으로 봅니다. ` : data.amt_includes_vat === false ? '금액은 납품확인서 원가금액(공급가액, 부가세 제외) 그대로이며 협력사정산 마감내역과 같은 기준입니다. ' : '공급가는 발주금액(매입가)에서 부가세 10%를 제외한 금액입니다. '}{cfg.noAmt ? '' : data.has_conf ? "확정수량은 발주서의 '업체납품가능수량', 입고등록은 '입고수량' 컬럼이며, 쿠팡 윙에서 발주서를 다시 내려받아 발주 캘린더에 올릴 때 갱신됩니다." : `${data.recv_word}은 ${cfg.poWord}의 납품수량 기준이며, 최신 ${cfg.poWord}를 발주 캘린더에 올릴 때 갱신됩니다.`}
-                  납품은 납기일 기준으로 묶으며, 박스히어로 출고 메모의 'N일'을 납기 힌트로 씁니다.
+                  {noAmt ? `${cfg.poWord}에는 단가가 없어 금액은 표시하지 않습니다. 상품공급정보 xlsx를 '단가표 업로드'하면 수량×일반단가로 매입금액을 계산합니다. ${cfg.name}는 별도 입고확정 절차가 없어 박스히어로 ${cfg.name} 출고분을 그대로 입고 확정으로 봅니다. ` : cfg.priceTable && data.has_amt ? `금액은 상품공급정보 단가표의 일반단가 × 수량${data.prices?.vat_included === false ? ' × 1.1(부가세)' : ''}이며, ${cfg.name} 화면의 '공급가 합계'(부가세 포함)와 같은 기준입니다. ${cfg.name}는 별도 입고확정 절차가 없어 출고분을 그대로 매입 반영으로 봅니다. ` : data.amt_includes_vat === false ? '금액은 납품확인서 원가금액(공급가액, 부가세 제외) 그대로이며 협력사정산 마감내역과 같은 기준입니다. ' : '공급가는 발주금액(매입가)에서 부가세 10%를 제외한 금액입니다. '}{noAmt || cfg.priceTable ? '' : data.has_conf ? "확정수량은 발주서의 '업체납품가능수량', 입고등록은 '입고수량' 컬럼이며, 쿠팡 윙에서 발주서를 다시 내려받아 발주 캘린더에 올릴 때 갱신됩니다." : `${data.recv_word}은 ${cfg.poWord}의 납품수량 기준이며, 최신 ${cfg.poWord}를 발주 캘린더에 올릴 때 갱신됩니다.`}
+                  납품은 납기일 기준으로 묶으며, 박스히어로 출고 메모의 'N일'을 납기 힌트로 씁니다.{data.unit_basis ? ' 세트 상품(3입·2입·혼합세트)은 구성 단품으로 풀어 수량을 세므로 발주서의 세트 수와 다르고, 금액은 발주서 합계 그대로입니다.' : ''}
                 </div>
               </div>
+
+              {fmt === 'exec' && (
+                <div className="panel">
+                  <h3>■ 월별 추이 보정 <span className="sub">{cfg.name} · 경영 요약 첫 줄의 월별 수치. 자동값은 발주 캘린더(납기월 기준)·BH 출고이며, 자료에 없는 지난 달은 여기서 직접 입력</span>
+                    <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                      {Object.keys(monthlyEdit).length > 0 && <Button size="small" onClick={() => setMonthlyEdit({})}>취소</Button>}
+                      <Button size="small" type="primary" icon={<SaveOutlined />} loading={monthlySaving} disabled={!Object.keys(monthlyEdit).length} onClick={saveMonthly}>저장</Button>
+                    </span>
+                  </h3>
+                  <table>
+                    <thead><tr><th>월</th><th className="num">발주 수량{data.exec_metric === 'order' && <span className="muted"> ★</span>}</th><th className="num">납품 수량{data.exec_metric === 'recv' && <span className="muted"> ★</span>}</th><th className="num"><Tooltip title={`박스히어로 ${cfg.name} 거래처 출고 · 출고월 기준 (읽기 전용)`}>BH 출고</Tooltip></th><th>출처</th><th /></tr></thead>
+                    <tbody>{(data.history || []).map(h => {
+                      const e = monthlyEdit[h.ym] || {}
+                      const cur = (k: 'order_qty' | 'delivered') => (k in e ? e[k] : h[k]) ?? null
+                      const fmtN = (v: string | number | undefined) => `${v ?? ''}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+                      const parseN = (v: string | undefined) => { const s = (v || '').replace(/,/g, ''); return s === '' ? null : Number(s) }
+                      const isCur = h.ym === data.month
+                      return (
+                        <tr key={h.ym} style={isCur ? { background: '#f0fdf4' } : undefined}>
+                          <td>{h.label}{isCur && <span className="muted"> (이달)</span>}</td>
+                          <td className="num"><InputNumber size="small" value={cur('order_qty')} min={0} style={{ width: 110 }} formatter={fmtN} parser={parseN as never}
+                            placeholder={h.auto_order_qty == null ? '-' : n(h.auto_order_qty)} onChange={v => setMonthlyEdit(m => ({ ...m, [h.ym]: { ...(m[h.ym] || {}), order_qty: v == null ? null : Number(v) } }))} /></td>
+                          <td className="num"><InputNumber size="small" value={cur('delivered')} min={0} style={{ width: 110 }} formatter={fmtN} parser={parseN as never}
+                            placeholder={h.auto_delivered == null ? '-' : n(h.auto_delivered)} onChange={v => setMonthlyEdit(m => ({ ...m, [h.ym]: { ...(m[h.ym] || {}), delivered: v == null ? null : Number(v) } }))} /></td>
+                          <td className={`num${h.bh_shipped == null ? ' muted' : ''}`}>{h.bh_shipped == null ? '-' : n(h.bh_shipped)}</td>
+                          <td>{h.ym in monthlyEdit ? <Tag color="blue">수정 중</Tag> : h.override ? <Tooltip title={`자동값: 발주 ${n(h.auto_order_qty)} · 납품 ${n(h.auto_delivered)}`}><Tag color="orange">수기</Tag></Tooltip> : (h.auto_order_qty == null && h.auto_delivered == null) ? <Tag>데이터 없음</Tag> : <Tag color="green">자동</Tag>}</td>
+                          <td>{h.override && <Button size="small" type="text" onClick={() => resetMonthly(h.ym)}>자동값으로</Button>}</td>
+                        </tr>
+                      )
+                    })}</tbody>
+                  </table>
+                  <div className="hint" style={{ marginTop: 6 }}>★ 표시 열{data.exec_metric_word ? `(${data.exec_metric_word})` : ''}이 경영 요약 첫 줄(월별 추이)에 쓰입니다. 이달 괄호 안 수치는 이달 {data.exec_metric_word || (data.exec_metric === 'recv' ? '납품' : '발주')}(진행중) 수량입니다.{data.exec_metric === 'recv' ? ' 이달 납품 + 미납품 잔량이 전월 실적 이상이면 "전월 실적 초과예상"이 자동으로 붙습니다.' : ''}
+                    컬리는 BH 마켓컬리 출고를 납기(입고일) 월로 묶은 값이 납품 자동값입니다(메모 납기, 없으면 다음 거래명세서 입고일 · 이알하나 제외 · 취소 입고 상계). 쿠팡·올리브영은 발주 캘린더의 입고수량이 자동값이며 BH 출고는 참고용입니다.{data.history_order_basis === 'order_date' ? ` ${cfg.name} 발주 수량은 ${cfg.poWord}의 발주일자 월 기준으로 합칩니다(납기월이 아님).` : ''} 다른 채널의 월별 보정은 각 채널 보고 화면에서 입력하세요.</div>
+                </div>
+              )}
 
               <div className="panel">
                 <h3>■ 입고 예정 (항공분 등) <span className="sub">도착일이 납기 이전이면 납품 가능 계산에 포함</span></h3>
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
                   <Select
-                    showSearch placeholder="품목" value={incLabel || undefined} onChange={v => setIncLabel(v)} style={{ minWidth: 180, flex: 1 }}
-                    options={data.stock.map(r => ({ value: r.label, label: r.label }))}
+                    showSearch mode="tags" maxCount={1} placeholder="품목 (목록에 없으면 직접 입력)" value={incLabel ? [incLabel] : []}
+                    onChange={v => setIncLabel(((v as string[]) || []).slice(-1)[0]?.trim() || '')} style={{ minWidth: 200, flex: 1 }}
+                    options={[...new Set([...data.stock.map(r => r.label), ...(prices ? Object.keys(prices.items) : [])])].sort((a, b) => a.localeCompare(b, 'ko')).map(l => ({ value: l, label: l }))}
                   />
                   <InputNumber placeholder="수량" value={incQty} onChange={v => setIncQty(v)} min={1} style={{ width: 110 }} formatter={v => `${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')} parser={v => Number((v || '').replace(/,/g, ''))} />
                   <DatePicker value={dayjs(incDate)} allowClear={false} onChange={d => d && setIncDate(d.format('YYYY-MM-DD'))} style={{ width: 130 }} />
                   <Input placeholder="메모 (26차 항공 등)" value={incMemo} onChange={e => setIncMemo(e.target.value)} style={{ width: 150 }} />
                   <Button type="primary" icon={<PlusOutlined />} loading={incSaving} onClick={addIncoming}>추가</Button>
                 </div>
-                {data.fulfil.incoming.length === 0 ? <div className="hint">등록된 입고 예정이 없습니다. 항공 도착 예정 수량을 넣으면 "재고 + 입고 예정 기준" 납품 가능으로 계산됩니다.</div> : (
+                {data.fulfil.incoming.length === 0 ? <div className="hint">등록된 입고 예정이 없습니다. 항공 도착 예정 수량을 넣으면 "재고 + 입고 예정 기준" 납품 가능으로 계산됩니다. 목록에 없는 품목은 이름을 직접 입력하세요. 보고서 품목명(별칭)과 같아야 계산에 반영되며, 발주가 없는 품목은 '미매칭'으로 표시되고 계산에서 제외됩니다.</div> : (
                   <table>
                     <thead><tr><th>도착일</th><th>품목</th><th className="num">수량</th><th>메모</th><th>반영</th><th /></tr></thead>
                     <tbody>{data.fulfil.incoming.map(r => (
@@ -497,6 +631,59 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                   placeholder={'예)\n26차 항공분 9/10(목) 18:15 출발 → 9/11(금) 03:40 인천 도착 예정\n도착 후 통관·검수·입고 등록을 최단으로 진행해 9/15 납기 전 출고 예정\nBE팀 요청 납기 연장 반영: 9/8 납기분 → 9/15·9/17·9/22'}
                 />
               </div>
+
+              {cfg.priceTable && data.prices && data.prices.missing_labels.length > 0 && (
+                <Alert type="warning" showIcon style={{ marginBottom: 14 }} message={`단가표에 없는 품목 ${data.prices.missing_labels.length}종 — 금액 미계산`}
+                  description={<span className="hint">{data.prices.missing_labels.join(' · ')} · 아래 매입 단가표에서 직접 입력하거나 최신 상품공급정보를 다시 올려주세요.</span>} />
+              )}
+              {cfg.priceTable && priceOpen && (
+                <div className="panel">
+                  <h3 style={{ flexWrap: 'wrap' }}>■ 매입 단가표 <span className="sub">{cfg.name} 상품공급정보 '일반단가' · 수량 × 단가 = 매입금액{prices?.source ? ` · ${prices.source} (${prices.updated_at})` : ''}</span>
+                    <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <Tooltip title="일반단가에 부가세가 포함돼 있는지. 별도면 매입금액 = 단가 × 1.1 × 수량">
+                        <Segmented size="small" value={prices?.vat_included === false ? 'ex' : 'in'} disabled={priceBusy}
+                          options={[{ label: '단가 부가세 포함', value: 'in' }, { label: '부가세 별도', value: 'ex' }]}
+                          onChange={v => savePrices(v === 'in')} />
+                      </Tooltip>
+                      <Popconfirm title="단가표를 모두 지울까요? 금액이 다시 '-'로 표시됩니다." onConfirm={removePrices}>
+                        <Button size="small" danger icon={<DeleteOutlined />} loading={priceBusy}>전체 삭제</Button>
+                      </Popconfirm>
+                      <Button size="small" onClick={() => { setPriceOpen(false); setPriceEdit({}) }}>닫기</Button>
+                      <Button size="small" type="primary" icon={<SaveOutlined />} loading={priceBusy} disabled={!Object.keys(priceEdit).length} onClick={() => savePrices()}>저장</Button>
+                    </span>
+                  </h3>
+                  {!prices || !Object.keys(prices.items).length
+                    ? <div className="hint">단가표가 없습니다. 컬리 파트너 &gt; 상품 &gt; 상품공급정보 다운로드 xlsx를 '단가표 업로드'로 올리면 라벨별 일반단가가 저장됩니다.</div>
+                    : (
+                      <table>
+                        <thead><tr><th>품목</th><th>{cfg.name} 상품명</th><th className="num">박스입수</th><th className="num">매입단가</th><th className="num">공급단가</th><th /></tr></thead>
+                        <tbody>{Object.entries(prices.items).sort((a, b) => a[0].localeCompare(b[0], 'ko')).map(([lb, it]) => {
+                          const unit = lb in priceEdit ? priceEdit[lb] : it.unit
+                          const vatIn = prices.vat_included !== false
+                          const supply = unit == null ? null : Math.round(vatIn ? unit / 1.1 : unit)
+                          const removed = lb in priceEdit && priceEdit[lb] === null
+                          return (
+                            <tr key={lb} style={removed ? { opacity: 0.4, textDecoration: 'line-through' } : undefined}>
+                              <td style={{ fontWeight: 600 }}>{lb}</td>
+                              <td className="hint"><Tooltip title={[it.code, it.barcode].filter(Boolean).join(' · ')}>{it.name || '-'}</Tooltip></td>
+                              <td className="num muted">{it.box || '-'}</td>
+                              <td className="num">
+                                <InputNumber size="small" value={unit ?? undefined} min={0} style={{ width: 100 }} disabled={removed}
+                                  formatter={v => `${v ?? ''}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')} parser={v => Number((v || '').replace(/,/g, ''))}
+                                  onChange={v => setPriceEdit(e => ({ ...e, [lb]: v == null ? it.unit : Math.round(Number(v)) }))} />
+                              </td>
+                              <td className="num muted">{supply == null ? '-' : `${n(supply)}원`}</td>
+                              <td>{removed
+                                ? <Button size="small" type="text" onClick={() => setPriceEdit(e => { const c = { ...e }; delete c[lb]; return c })}>되돌리기</Button>
+                                : <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => setPriceEdit(e => ({ ...e, [lb]: null }))} />}</td>
+                            </tr>
+                          )
+                        })}</tbody>
+                      </table>
+                    )}
+                  <div className="hint" style={{ marginTop: 6 }}>품목은 보고서 짧은 이름(별칭) 기준으로 묶입니다. 상품공급정보의 상품명이 별칭표에 없으면 상품명 그대로 표시되니 '품목 별칭'에서 연결해 주세요. 증정품 등 단가 0 행은 무시합니다.</div>
+                </div>
+              )}
 
               {aliasOpen && (
                 <div className="panel">

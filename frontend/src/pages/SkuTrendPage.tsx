@@ -5,6 +5,70 @@ import type { OrderPlanItem, SalesTrend, SalesTrendRow, NaverSkuDailyItem } from
 import { getOrderPlan, getSalesTrend, getNaverSkuDaily, downloadBlob } from '../services/api'
 
 const NAVER = '네이버'
+
+// 같은 상품인데 표기만 다른 행을 합친다 (마스터 매핑이 없을 때).
+//  - 채널 내 구분 꼬리표 '(온)'·'(오프)', 끝의 'x'·',' 같은 군더더기
+//  - 컬리 OCR 오인식('표고버,±것' → '표고버섯', '세다지즈' → '체다치즈', '슬티' → '솔티')
+//  - 브랜드 표기 차이('[DJ&A]'·'디제이앤에이' → 'DJ&A'), 단어 사이 공백('크리스 프' → '크리스프')
+// 마스터에 매핑된 항목은 SKU로, 미매핑은 위 정리를 거친 이름으로 묶는다.
+const NAME_TAGS = /\s*\((온|오프|온라인|오프라인|매장|온라인몰)\)\s*/g
+const OCR_FIX: [RegExp, string][] = [
+  [/버[,•·]*±것/g, '버섯'], [/세다지즈/g, '체다치즈'], [/슬티/g, '솔티'],
+]
+function normName(name: string): string {
+  let n = name.replace(NAME_TAGS, ' ')
+  n = n.replace(/^\s*\[[^\]]*\]\s*/, '')                  // [브랜드] 접두
+  n = n.replace(/디제이앤에이|dj&a|dja/gi, '')                 // 브랜드 표기는 묶음 키에서 제외
+  for (const [re, to] of OCR_FIX) n = n.replace(re, to)
+  n = n.replace(/[\s,]*x?\s*$/i, '')                       // 끝의 ' x', ','
+  n = n.replace(/\s*&\s*/g, '&').replace(/\s+/g, '')       // 공백 제거
+  return n.toLowerCase()
+}
+// 화면 표시용 이름 정리 — OCR 오인식·끊긴 단어·군더더기만 고치고 띄어쓰기는 유지
+const WORD_FIX: [RegExp, string][] = [
+  [/크리스\s+프/g, '크리스프'], [/아보카\s*도\s*오\s*일/g, '아보카도오일'], [/핑크\s*솔\s*트/g, '핑크솔트'],
+  [/체다치\s*즈\s*향/g, '체다치즈향'], [/브로콜\s+리/g, '브로콜리'], [/프\s+레첼/g, '프레첼'], [/멜라\s+토닌/g, '멜라토닌'],
+]
+function cleanName(name: string): string {
+  let n = name.replace(NAME_TAGS, ' ')
+  for (const [re, to] of OCR_FIX) n = n.replace(re, to)
+  for (const [re, to] of WORD_FIX) n = n.replace(re, to)
+  n = n.replace(/[\s,]*x\s*$/i, '').replace(/,\s*$/, '')
+  return n.replace(/\s+/g, ' ').trim()
+}
+// 표기가 얼마나 지저분한지 — 대표 이름 고를 때 낮은 쪽 우선
+function messiness(name: string): number {
+  let m = 0
+  if (/[±•]/.test(name)) m += 10
+  if (NAME_TAGS.test(name)) m += 3
+  NAME_TAGS.lastIndex = 0
+  if (/[\s,]x?\s*$/i.test(name) && /x$|,$/.test(name.trim())) m += 2
+  m += (name.match(/(^|\s)\S(\s|$)/g) || []).length * 2   // 한 글자짜리 토큰(끊긴 단어)
+  return m
+}
+function mergeKeyOf(it: OrderPlanItem): string {
+  if (it.matched && it.sku) return `sku:${it.sku}`
+  return `name:${normName(it.name)}`
+}
+function mergeItems(items: OrderPlanItem[]): OrderPlanItem[] {
+  const map = new Map<string, OrderPlanItem>()
+  for (const it of items) {
+    const k = mergeKeyOf(it)
+    const cur = map.get(k)
+    if (!cur) { map.set(k, { ...it, by_date: { ...it.by_date }, by_channel: { ...it.by_channel }, raw_names: [...it.raw_names], raw_breakdown: { ...(it.raw_breakdown || {}) } }); continue }
+    for (const [d, q] of Object.entries(it.by_date)) cur.by_date[d] = (cur.by_date[d] || 0) + q
+    for (const [c, q] of Object.entries(it.by_channel)) cur.by_channel[c] = (cur.by_channel[c] || 0) + q
+    cur.total += it.total
+    for (const n of it.raw_names) if (!cur.raw_names.includes(n)) cur.raw_names.push(n)
+    Object.assign(cur.raw_breakdown!, it.raw_breakdown || {})
+    // 대표 이름은 덜 지저분한 표기, 같으면 수량 많은 쪽
+    if (!cur.matched) {
+      const a = messiness(cur.name), b = messiness(it.name)
+      if (b < a || (b === a && it.total > cur.total - it.total)) cur.name = it.name
+    }
+  }
+  return Array.from(map.values()).map(it => it.matched ? it : { ...it, name: cleanName(it.name) })
+}
 // 네이버 도착보장 출고(박스히어로 거래 내역)를 발주 캘린더 항목 모양으로 변환 — 발주가 아니라 출고수량
 function naverToItems(items: NaverSkuDailyItem[]): OrderPlanItem[] {
   return items.map(it => ({
@@ -282,7 +346,7 @@ export default function SkuTrendPage() {
         getNaverSkuDaily().catch(() => null),
       ])
       const nvItems = naverToItems(nv?.items || [])
-      setItems([...(data.items || []), ...nvItems])
+      setItems(mergeItems([...(data.items || []), ...nvItems]))
       const totals: Record<string, number> = { ...(data.total_by_channel || {}) }
       if (nvItems.length) totals[NAVER] = nvItems.reduce((a, x) => a + x.total, 0)
       const chs = Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([c]) => c)

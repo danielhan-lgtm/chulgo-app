@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PlanBackupInfo } from '../services/api'
+import { itemQtyByDate } from './SkuTrendPage'
 import {
   Button, Upload, Select, Table, Tag, message, Spin, Alert, Slider, Switch, Tooltip, Empty,
   Modal, Input, List, Popconfirm,
@@ -1176,25 +1177,6 @@ export default function OrderPlannerPage() {
 
     </div>
   )
-}
-
-// 품목의 날짜별 수량 — 거래처 필터 적용 시 raw_breakdown의 거래처×날짜 교차값 사용
-// (구버전 데이터로 by_channel_date가 없으면, 해당 거래처 단독 raw만 by_date로 대체)
-function itemQtyByDate(it: OrderPlanItem, channel: string): Record<string, number> {
-  if (!channel) return it.by_date
-  const out: Record<string, number> = {}
-  for (const rb of Object.values(it.raw_breakdown || {})) {
-    const cd = rb.by_channel_date?.[channel]
-    if (cd) {
-      for (const [d, q] of Object.entries(cd)) out[d] = (out[d] || 0) + q
-    } else if (rb.by_channel[channel] > 0) {
-      const chs = Object.keys(rb.by_channel)
-      if (chs.length === 1) {
-        for (const [d, q] of Object.entries(rb.by_date)) out[d] = (out[d] || 0) + q
-      }
-    }
-  }
-  return out
 }
 
 // 월별 달력 그리드 — 발주가 있는 날짜에 수량 표시, 클릭 시 품목 세부내역

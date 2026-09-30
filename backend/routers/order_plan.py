@@ -1344,13 +1344,19 @@ def _aggregate_rows(all_rows: list, threshold: int = 70, use_master: int = 1, sp
         rb = entry["raw_breakdown"].setdefault(original_raw, {"by_date": {}, "by_channel": {}, "total": 0,
                                                               "had_bundle": False, "bundle_count": 1,
                                                               "recv_by_date": {}, "has_recv": False,
-                                                              "amt_by_date": {}, "recv_amt_by_date": {}})
+                                                              "amt_by_date": {}, "recv_amt_by_date": {},
+                                                              # 거래처×날짜 교차 분해 — 캘린더 거래처 필터·SKU 추이용
+                                                              "by_channel_date": {}, "recv_by_channel_date": {}})
         rb["by_date"][date_str] = rb["by_date"].get(date_str, 0) + effective_qty
         rb["by_channel"][channel] = rb["by_channel"].get(channel, 0) + effective_qty
+        cd = rb["by_channel_date"].setdefault(channel, {})
+        cd[date_str] = cd.get(date_str, 0) + effective_qty
         rb["total"] += effective_qty
         if effective_recv is not None:
             rb["recv_by_date"][date_str] = rb["recv_by_date"].get(date_str, 0) + effective_recv
             rb["has_recv"] = True
+            rcd = rb["recv_by_channel_date"].setdefault(channel, {})
+            rcd[date_str] = rcd.get(date_str, 0) + effective_recv
         if amt is not None:
             rb["amt_by_date"][date_str] = rb["amt_by_date"].get(date_str, 0) + int(amt)
         if recv_amt is not None:

@@ -15,6 +15,7 @@ import ReconcilePage from './pages/ReconcilePage'
 import ChannelPage from './pages/ChannelPage'
 import MappingPage from './pages/MappingPage'
 import OrderPlannerPage from './pages/OrderPlannerPage'
+import SkuTrendPage from './pages/SkuTrendPage'
 import DisposalReport from './pages/DisposalReport'
 import ExpiryDonationReport from './pages/ExpiryDonationReport'
 import CoupangLoadList from './pages/CoupangLoadList'
@@ -150,6 +151,7 @@ export default function App() {
       case 'naverreport': return <NaverReport />
       case 'mapping': return <MappingPage config={config} />
       case 'orderplan': return <OrderPlannerPage />
+      case 'skutrend': return <SkuTrendPage />
       case 'disposal': return <DisposalReport />
       case 'expiry': return <ExpiryDonationReport />
       case 'coupangload': return <CoupangLoadList />

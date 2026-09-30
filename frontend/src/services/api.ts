@@ -935,6 +935,8 @@ export interface RawBreakdownEntry {
   by_channel: Record<string, number>
   // 거래처×날짜 교차 분해 — 월별 캘린더 거래처 필터용 (구버전 데이터엔 없을 수 있음)
   by_channel_date?: Record<string, Record<string, number>>
+  recv_by_date?: Record<string, number>
+  recv_by_channel_date?: Record<string, Record<string, number>>
   total: number
   had_bundle?: boolean
   bundle_count?: number
@@ -1408,12 +1410,15 @@ export interface NaverReportSummary {
   daily: { date: string; qty: number }[]
   text: string
   text_exec: string                 // 경영 요약용 네이버 블록 (전 채널 묶음의 4번)
-  history: NaverHistoryRow[]        // 월별 출고 추이 (주문일 기준)
+  history: NaverHistoryRow[]        // 월별 출고 추이 (주문일 기준) + 사은품(주문 관리 목록 업로드 시)
+  gift_month?: number | null        // 이달 사은품 출고 (주문 관리 목록 기준, 전체 출고에 포함된 물량)
+  has_orders?: boolean              // 도착보장 주문 관리 목록(manageList) 업로드 여부
+  order_files?: { filename: string; uploaded_at: string; from: string; to: string; total: number; gift: number }[]
 }
-export interface NaverHistoryRow { ym: string; label: string; qty: number | null }
+export interface NaverHistoryRow { ym: string; label: string; qty: number | null; gift?: number | null; gift_total?: number | null; order_days?: number }
 export const getNaverReport =(asOf?: string, refresh = false): Promise<NaverReportSummary> =>
   api.get('/naver-report/summary', { params: { as_of: asOf || '', refresh: refresh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
-export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filename: string; rows: number; added: number; from: string; to: string }[]; errors: string[]; tx_rows: number }> => {
+export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filename: string; rows: number; added: number; from: string; to: string; type?: 'orders'; total?: number; gift?: number }[]; errors: string[]; tx_rows: number; order_days?: number }> => {
   const fd = new FormData()
   files.forEach(f => fd.append('files', f, f.name))
   return api.post('/naver-report/upload', fd, { timeout: 180000 }).then(r => r.data)
@@ -1425,3 +1430,23 @@ export const getNaverReportAliases = (): Promise<{ defaults: Record<string, stri
   api.get('/naver-report/aliases').then(r => r.data)
 export const saveNaverReportAliases = (aliases: Record<string, string>): Promise<{ ok: boolean }> =>
   api.put('/naver-report/aliases', { aliases }).then(r => r.data)
+
+// ── 채널 판매/재고/예측 추이 (SKU 출고 추이 화면용 · 채널 보고서 업로드 파일 기반) ──
+export interface SalesTrendRow {
+  label: string; names: string[]
+  sales_series: number[]; stock_series?: number[]; amount_series?: number[]
+  sales_7d: number; avg_7d: number; avg_prev_7d: number | null; trend_pct: number | null
+  stock_last: number | null; stock_center?: number; stock_store?: number; days_of_supply: number | null
+  forecast_weekly?: number[] | null; forecast_next?: number | null
+  sales_store?: number; sales_online?: number; promo?: string
+}
+export interface SalesTrend {
+  channel: string; mode: 'daily' | 'monthly'
+  days: string[]; months: string[]; weeks: { from: string; to: string }[]
+  period_label: string; latest?: string | null; elapsed_days?: number | null
+  rows: SalesTrendRow[]
+  labels: Record<string, string>   // 발주 캘린더 raw 상품명 → 라벨
+  uploads: { rocket_range?: [string, string] | null; forecast?: { filename: string; uploaded_at: string } | null; months?: string[]; files?: { filename: string; uploaded_at: string; type: string; period?: string }[] }
+}
+export const getSalesTrend = (channelKey: 'coupang' | 'oliveyoung', asOf?: string): Promise<SalesTrend> =>
+  api.get(`/${channelKey}-report/sales-trend`, { params: asOf ? { as_of: asOf } : {} }).then(r => r.data)

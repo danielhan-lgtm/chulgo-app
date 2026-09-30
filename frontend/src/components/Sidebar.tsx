@@ -56,6 +56,7 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
     title: '입고 · 발주',
     items: [
       { key: 'orderplan', icon: <CalendarOutlined />, label: '발주 캘린더' },
+      { key: 'skutrend', icon: <LineChartOutlined />, label: 'SKU 출고 추이' },
       { key: 'receiving', icon: <ImportOutlined />, label: '입고 정산기' },
       { key: 'docreview', icon: <AuditOutlined />, label: '서류 검토' },
     ],

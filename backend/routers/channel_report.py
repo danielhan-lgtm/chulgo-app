@@ -2262,6 +2262,32 @@ def make_router(sp: ChannelSpec) -> APIRouter:
         month = (month or as_of[:7])[:7]
         return _build_summary(sp, as_of, month, refresh_bh=bool(refresh_bh))
 
+    @router.get("/sales-trend")
+    def get_sales_trend(as_of: str = ""):
+        """SKU 출고 추이 화면용 — 업로드된 판매/재고/예측 리포트를 라벨 단위로 정리해 내려준다.
+        labels: 발주 캘린더 raw 상품명 → 라벨 (프론트에서 발주 SKU 행과 판매 행을 잇는 키)."""
+        as_of = (as_of or date.today().isoformat())[:10]
+        up = _load_uploads(sp)
+        amap = _alias_map(sp)
+        t = _build_trend(sp, up, amap, as_of, as_of[:7])
+        labels = {}
+        store = OP._load_plan_store()
+        for f in store.get("files", {}).values():
+            if (f.get("channel") or "") != sp.channel:
+                continue
+            for r in f.get("rows", []):
+                n = str(r.get("name") or "").strip()
+                if n and n not in labels:
+                    labels[n] = _label_of(n, amap)
+        keep = ("label", "names", "sales_series", "stock_series", "sales_7d", "avg_7d", "avg_prev_7d", "trend_pct",
+                "stock_last", "stock_center", "stock_store", "days_of_supply", "forecast_weekly", "forecast_next",
+                "sales_store", "sales_online", "amount_series", "promo")
+        rows = [{k: r.get(k) for k in keep if k in r} for r in t.get("rows", [])]
+        return {"channel": sp.channel, "mode": t.get("mode"), "days": t.get("days", []), "months": t.get("months", []),
+                "weeks": t.get("weeks", []), "period_label": t.get("period_label", ""),
+                "latest": t.get("latest"), "elapsed_days": t.get("elapsed_days"),
+                "rows": rows, "labels": labels, "uploads": _upload_meta(sp, up)}
+
     @router.post("/upload")
     async def upload_files(files: list[UploadFile] = File(...), period: str = Form("")):
         """판매/재고 파일 업로드. 쿠팡: rocket csv / forecast xlsx. 올리브영: 상품별 매출_재고 xlsx (period=YYYY-MM 필수, 미지정 시 이달)."""

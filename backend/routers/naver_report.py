@@ -26,6 +26,7 @@ router = APIRouter()
 
 STATE_PATH = os.path.join(_DATA_DIR, "naver_report_state.json")
 TX_PATH = os.path.join(_DATA_DIR, "naver_report_tx.json")
+ORDERS_PATH = os.path.join(_DATA_DIR, "naver_report_orders.json")   # 도착보장 주문 관리 목록(manageList xlsx) 일별 집계 — 사은품 분리용
 DEFAULT_PARTNER_KW = ["스마트스토어", "DJ&A"]
 EXEC_NAME = "네이버 스마트스토어(도착보장)"   # 경영 요약(4채널 묶음) 표기
 
@@ -44,6 +45,50 @@ def _state() -> dict:
 
 def _tx_all() -> list:
     return _load_json(TX_PATH, [])
+
+
+def _orders() -> dict:
+    """{"days": {YYYY-MM-DD: {total, gift, returns, gift_items{name: qty}}}, "files": [...]}"""
+    o = _load_json(ORDERS_PATH, {})
+    o.setdefault("days", {})
+    o.setdefault("files", [])
+    return o
+
+
+_ORDER_COLS = ["이슈", "주문일시", "주문수량", "상품명", "주문상태"]
+
+
+def _is_order_list(df) -> bool:
+    return all(c in df.columns for c in _ORDER_COLS)
+
+
+def _parse_order_list(df) -> dict:
+    """도착보장 주문 관리 목록(manageList_*.xlsx) → 주문일별 {total(정상 주문수량), gift(그중 사은품), returns(반품·교환·취소), gift_items}.
+    '이슈' 열에 '사은품' 이 있으면 사은품 행(주문금액 0). 주문상태 '정상' 만 출고로 본다."""
+    days: dict = {}
+    for r in df.itertuples(index=False):
+        rec = dict(zip(df.columns, r))
+        ts = rec.get("주문일시")
+        d = ts.strftime("%Y-%m-%d") if isinstance(ts, (datetime, pd.Timestamp)) else str(ts)[:10]
+        if not d or d == "nan" or len(d) < 10:
+            continue
+        try:
+            q = int(float(str(rec.get("주문수량") or 0).replace(",", "")))
+        except (TypeError, ValueError):
+            continue
+        if q <= 0:
+            continue
+        e = days.setdefault(d, {"total": 0, "gift": 0, "returns": 0, "gift_items": {}})
+        status = str(rec.get("주문상태") or "").strip()
+        if status != "정상":
+            e["returns"] += q
+            continue
+        e["total"] += q
+        if "사은품" in str(rec.get("이슈") or ""):
+            e["gift"] += q
+            nm = str(rec.get("상품명") or "").strip()
+            e["gift_items"][nm] = e["gift_items"].get(nm, 0) + q
+    return days
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -160,14 +205,24 @@ def _pct(cur: float, prev: float) -> Optional[int]:
     return round((cur - prev) / prev * 100)
 
 
-def _build_history(by_day: dict, month: str, n: int = 4, eff_to: str = "") -> list:
+def _build_history(by_day: dict, month: str, n: int = 4, eff_to: str = "", order_days: Optional[dict] = None) -> list:
     """최근 n개월 월별 출고 수량 (주문일 기준, 취소 보정 입고 차감이 반영된 by_day 그대로).
     eff_to 가 있으면 그 날까지만 합산(이달은 자료 마지막 주문일·기준일 중 빠른 쪽). 자료가 한 날도 없는 달은 qty None.
-    [{ym, label, qty}]"""
+    order_days(주문 관리 목록 일별 집계)가 있으면 그 달의 사은품 수량 gift 를 붙인다 — 주문 목록 자료가 없는 달은 None.
+    사은품은 박스히어로 출고 총량(qty)에 이미 포함된 물량이라 따로 뺀 값이 아니다.
+    [{ym, label, qty, gift, gift_total}]"""
     out = []
+    order_days = order_days or {}
     for ym in _prev_months(month, n):
         days = [d for d in by_day if d[:7] == ym and (not eff_to or d <= eff_to)]
-        out.append({"ym": ym, "label": f"{int(ym[5:7])}월", "qty": (sum(by_day[d] for d in days) if days else None)})
+        odays = sorted(d for d in order_days if d[:7] == ym and (not eff_to or d <= eff_to))
+        # 주문 목록이 그 달을 거의 다 덮을 때만 사은품 수치를 쓴다 (6/30 하루만 있는 파일로 '6월 사은품 8개' 가 나가지 않게):
+        #   지난 달은 주문일이 20일 이상, 이달은 1~3일 사이에 시작하는 자료여야 함
+        covered = bool(odays) and ((ym != month and len(odays) >= 20) or (ym == month and odays[0] <= ym + "-03"))
+        out.append({"ym": ym, "label": f"{int(ym[5:7])}월", "qty": (sum(by_day[d] for d in days) if days else None),
+                    "gift": (sum(order_days[d]["gift"] for d in odays) if covered else None),
+                    "gift_total": (sum(order_days[d]["total"] for d in odays) if covered else None),   # 주문 목록 기준 전체(대조용)
+                    "order_days": len(odays), "gift_partial": bool(odays) and not covered})
     return out
 
 
@@ -303,8 +358,11 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         "stock_basis": ("ob" if ob_connected else ("bh" if bh else "")), "ob_connected": ob_connected, "bh_connected": bool(bh),
         "uploads": st["uploads"], "notes": st.get("notes", ""),
         "daily": [{"date": d, "qty": by_day[d]} for d in sorted(by_day) if d >= (datetime.fromisoformat(eff_to).date() - timedelta(days=59)).isoformat()] if data_to else [],
-        "history": _build_history(by_day, month, eff_to=eff_to),
+        "history": _build_history(by_day, month, eff_to=eff_to, order_days=_orders().get("days")),
     }
+    summary["gift_month"] = next((h["gift"] for h in summary["history"] if h["ym"] == month), None)
+    summary["has_orders"] = bool(_orders().get("days"))
+    summary["order_files"] = _orders().get("files", [])
     summary["text"] = _render_text(summary)
     summary["text_exec"] = _render_text_exec(summary)
     return summary
@@ -335,6 +393,8 @@ def _render_text(s: dict) -> str:
         L.append(f"* 최근 7일({rng}) 일평균 {_n(round(s['w1_avg']))}개" + (f" · 전주 대비 {_pct_txt(s['w1_pct'])}" if s["w1_pct"] is not None else ""))
     if s["last_day"]:
         L.append(f"* 마지막 주문일 {s['last_day_md']} — {_n(s['last_day_qty'])}개" + (f" · {s['last_day_top']}" if s["last_day_top"] else ""))
+    if s.get("gift_month"):
+        L.append(f"* {ml} 사은품 출고 {_n(s['gift_month'])}개 (위 출고에 포함 · 주문 관리 목록 기준)")
     if s["month_returns"]:
         L.append(f"* {ml} 취소 보정 {_n(s['month_returns'])}개 (출고에서 차감)")
     if s.get("stale_days") and s["stale_days"] >= 2:
@@ -414,6 +474,11 @@ def _render_text_exec(s: dict, idx: Optional[int] = None) -> str:
         L.append(line)
     else:
         L.append(f"{ml} 출고 없음" + ("" if s.get("data_to") else " (박스히어로 거래 내역 미업로드)"))
+    # 사은품 월별 별도 표기 — 주문 관리 목록(manageList) 이 올라온 달만. 위 출고 수량에 포함된 물량이다.
+    gifts = [(h["label"], h["gift"]) for h in hist if h.get("gift") is not None]
+    if gifts:
+        gtxt = " → ".join(f"{lb} {_n(g)}" for lb, g in gifts) + "개"
+        L.append(f"사은품 출고 {gtxt} (위 출고에 포함 · 별도 표기)")
     return "\n".join(L)
 
 
@@ -462,9 +527,35 @@ async def upload(files: list[UploadFile] = File(...)):
     tx = _tx_all()
     added_files, errors = [], []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    orders = _orders()
     for f in files:
+        data = await f.read()
+        # 1) 도착보장 주문 관리 목록(manageList_*.xlsx) — 사은품 분리용. 같은 날짜 범위는 새 파일로 교체(재업로드 중복 방지)
         try:
-            rows = _parse_transactions(await f.read(), st["partner_kw"])
+            df0 = pd.read_excel(io.BytesIO(data), sheet_name=0)
+        except Exception as e:
+            errors.append(f"{f.filename}: 읽기 오류 {str(e)[:80]}")
+            continue
+        if _is_order_list(df0):
+            days = _parse_order_list(df0)
+            if not days:
+                errors.append(f"{f.filename}: 주문 행이 없습니다")
+                continue
+            ds = sorted(days)
+            for d in [d for d in orders["days"] if ds[0] <= d <= ds[-1]]:
+                del orders["days"][d]
+            orders["days"].update(days)
+            gift_sum = sum(v["gift"] for v in days.values()); tot = sum(v["total"] for v in days.values())
+            orders["files"] = (orders["files"] + [{"filename": f.filename, "uploaded_at": now, "from": ds[0], "to": ds[-1],
+                                                    "total": tot, "gift": gift_sum}])[-20:]
+            st["uploads"].append({"filename": f.filename, "uploaded_at": now, "rows": int(len(df0)), "added": gift_sum,
+                                  "from": ds[0], "to": ds[-1], "type": "orders"})
+            added_files.append({"filename": f.filename, "rows": int(len(df0)), "added": gift_sum, "from": ds[0], "to": ds[-1],
+                                "type": "orders", "total": tot, "gift": gift_sum})
+            continue
+        # 2) 박스히어로 거래 내역
+        try:
+            rows = _parse_transactions(data, st["partner_kw"])
         except Exception as e:
             errors.append(f"{f.filename}: {str(e)[:120]}")
             continue
@@ -477,8 +568,9 @@ async def upload(files: list[UploadFile] = File(...)):
         added_files.append({"filename": f.filename, "rows": len(rows), "added": added, "from": ds[0], "to": ds[-1]})
     st["uploads"] = st["uploads"][-20:]
     _save_json(TX_PATH, tx)
+    _save_json(ORDERS_PATH, orders)
     _save_json(STATE_PATH, st)
-    return {"added": added_files, "errors": errors, "tx_rows": len(tx)}
+    return {"added": added_files, "errors": errors, "tx_rows": len(tx), "order_days": len(orders["days"])}
 
 
 @router.post("/upload/clear")
@@ -487,6 +579,7 @@ def clear_uploads():
     st["uploads"] = []
     _save_json(STATE_PATH, st)
     _save_json(TX_PATH, [])
+    _save_json(ORDERS_PATH, {"days": {}, "files": []})
     return {"ok": True}
 
 

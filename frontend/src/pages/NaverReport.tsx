@@ -147,7 +147,9 @@ export default function NaverReport() {
       setUploading(true)
       try {
         const res = await uploadNaverReportFiles(files)
-        if (res.added.length) message.success(`${res.added.map(a => `${a.filename} (${a.from.slice(5)}~${a.to.slice(5)} · ${n(a.added)}행 추가)`).join(', ')}`)
+        if (res.added.length) message.success(`${res.added.map(a => a.type === 'orders'
+          ? `${a.filename} (주문 목록 ${a.from.slice(5)}~${a.to.slice(5)} · 사은품 ${n(a.gift)}개 분리)`
+          : `${a.filename} (${a.from.slice(5)}~${a.to.slice(5)} · ${n(a.added)}행 추가)`).join(', ')}`)
         res.errors.forEach(e => message.warning(e, 6))
         setTextDirty(false)
         await reload()
@@ -205,8 +207,8 @@ export default function NaverReport() {
         <DatePicker value={dayjs(asOf)} onChange={d => { if (d) { setTextDirty(false); setAsOf(d.format('YYYY-MM-DD')) } }} allowClear={false} />
         <Button icon={<ReloadOutlined />} onClick={() => { setTextDirty(false); reload(true) }} loading={loading}>새로고침</Button>
         <Upload accept=".xlsx,.xls" multiple showUploadList={false} beforeUpload={queueUpload}>
-          <Tooltip title="박스히어로 > 거래 내역 > 엑셀 내보내기. 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
-            <Button icon={<UploadOutlined />} loading={uploading}>거래 내역 업로드</Button>
+          <Tooltip title="박스히어로 > 거래 내역 > 엑셀 내보내기 (출고량), 또는 도착보장 주문 관리 목록 manageList_*.xlsx (사은품 분리). 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
+            <Button icon={<UploadOutlined />} loading={uploading}>거래 내역 · 주문 목록 업로드</Button>
           </Tooltip>
         </Upload>
         <Button icon={<EditOutlined />} onClick={openAliases}>품목 별칭</Button>
@@ -324,20 +326,22 @@ export default function NaverReport() {
 
               {fmt === 'exec' && (data.history || []).length > 0 && (
                 <div className="panel">
-                  <h3>■ 월별 추이 <span className="sub">경영 요약 첫 줄의 월별 수치 · 박스히어로 {data.partner_kw.join(' + ')} 출고 (주문일 기준)</span></h3>
+                  <h3>■ 월별 추이 <span className="sub">경영 요약 첫 줄의 월별 수치 · 박스히어로 {data.partner_kw.join(' + ')} 출고 (주문일 기준) · 사은품은 주문 관리 목록 기준</span></h3>
                   <table>
-                    <thead><tr><th>월</th><th className="num">출고 수량</th></tr></thead>
+                    <thead><tr><th>월</th><th className="num">출고 수량</th><th className="num">사은품 (포함분)</th><th className="num">사은품 제외</th></tr></thead>
                     <tbody>{(data.history || []).map(h => {
                       const isCur = h.ym === data.month
                       return (
                         <tr key={h.ym} style={isCur ? { background: '#f0fdf4' } : undefined}>
                           <td>{h.label}{isCur && <span className="muted"> (이달 · 진행중)</span>}</td>
                           <td className={`num${h.qty == null ? ' muted' : ''}`}>{h.qty == null ? '-' : n(h.qty)}</td>
+                          <td className={`num${h.gift == null ? ' muted' : ''}`}>{h.gift == null ? '-' : n(h.gift)}</td>
+                          <td className={`num${(h.qty == null || h.gift == null) ? ' muted' : ''}`}>{(h.qty == null || h.gift == null) ? '-' : n(h.qty - h.gift)}</td>
                         </tr>
                       )
                     })}</tbody>
                   </table>
-                  <div className="hint" style={{ marginTop: 6 }}>업로드한 거래 내역 범위 안의 달만 채워집니다. 지난 달 수치가 비어 있으면 그 기간의 박스히어로 거래 내역을 함께 올려주세요.</div>
+                  <div className="hint" style={{ marginTop: 6 }}>출고 수량은 박스히어로 거래 내역, 사은품은 도착보장 주문 관리 목록(manageList xlsx)의 '이슈=사은품' 행입니다. 두 자료를 모두 올린 달만 사은품이 채워지고, 보고문에는 "사은품 출고 … (위 출고에 포함 · 별도 표기)" 줄로 들어갑니다.</div>
                 </div>
               )}
 

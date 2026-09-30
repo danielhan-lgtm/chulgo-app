@@ -603,6 +603,35 @@ def put_settings(body: SettingsIn):
     return {"partner_kw": st["partner_kw"], "notes": st.get("notes", "")}
 
 
+@router.get("/sku-daily")
+def get_sku_daily():
+    """SKU 출고 추이 화면용 — 네이버 도착보장 출고를 SKU(바코드)별·일자별로 집계.
+    출고는 +, 취소 보정(입고)은 -. 라벨은 별칭이 있으면 별칭, 없으면 자동 축약명."""
+    st = _state()
+    aliases = st["aliases"]
+    items: dict = {}
+    for r in _tx_all():
+        if r.get("kind") not in ("출고", "입고"):
+            continue
+        sku = str(r.get("sku") or "").strip() or str(r.get("name") or "").strip()
+        if not sku:
+            continue
+        e = items.setdefault(sku, {"sku": sku, "name": _label(str(r.get("name") or ""), aliases), "raw_name": str(r.get("name") or ""), "by_date": {}})
+        d = str(r.get("date") or "")[:10]
+        q = int(r.get("qty") or 0)
+        if r["kind"] == "입고":
+            q = -abs(q)
+        e["by_date"][d] = e["by_date"].get(d, 0) + q
+    out = []
+    for e in items.values():
+        e["by_date"] = {d: q for d, q in e["by_date"].items() if q > 0}
+        e["total"] = sum(e["by_date"].values())
+        if e["total"] > 0:
+            out.append(e)
+    out.sort(key=lambda x: -x["total"])
+    return {"channel": "네이버", "items": out}
+
+
 @router.get("/aliases")
 def get_aliases():
     st = _state()

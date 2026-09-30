@@ -1426,6 +1426,9 @@ export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filena
 export const clearNaverReportUploads = (): Promise<{ ok: boolean }> => api.post('/naver-report/upload/clear', {}).then(r => r.data)
 export const saveNaverReportSettings = (body: { partner_kw?: string[]; notes?: string }): Promise<{ partner_kw: string[]; notes: string }> =>
   api.put('/naver-report/settings', body).then(r => r.data)
+export interface NaverSkuDailyItem { sku: string; name: string; raw_name: string; by_date: Record<string, number>; total: number }
+export const getNaverSkuDaily = (): Promise<{ channel: string; items: NaverSkuDailyItem[] }> =>
+  api.get('/naver-report/sku-daily').then(r => r.data)
 export const getNaverReportAliases = (): Promise<{ defaults: Record<string, string>; overrides: Record<string, string> }> =>
   api.get('/naver-report/aliases').then(r => r.data)
 export const saveNaverReportAliases = (aliases: Record<string, string>): Promise<{ ok: boolean }> =>

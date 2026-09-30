@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Button, Select, Switch, Tag, Empty, Spin, Alert, Tooltip } from 'antd'
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons'
-import type { OrderPlanItem, SalesTrend, SalesTrendRow } from '../services/api'
-import { getOrderPlan, getSalesTrend, downloadBlob } from '../services/api'
+import type { OrderPlanItem, SalesTrend, SalesTrendRow, NaverSkuDailyItem } from '../services/api'
+import { getOrderPlan, getSalesTrend, getNaverSkuDaily, downloadBlob } from '../services/api'
+
+const NAVER = '네이버'
+// 네이버 도착보장 출고(박스히어로 거래 내역)를 발주 캘린더 항목 모양으로 변환 — 발주가 아니라 출고수량
+function naverToItems(items: NaverSkuDailyItem[]): OrderPlanItem[] {
+  return items.map(it => ({
+    sku: it.sku, name: it.name, matched: true, match_score: 1, by_date: it.by_date, by_channel: { [NAVER]: it.total }, total: it.total,
+    sources: ['네이버 출고 보고'], raw_names: [it.raw_name],
+    raw_breakdown: { [it.raw_name]: { by_date: it.by_date, by_channel: { [NAVER]: it.total }, by_channel_date: { [NAVER]: it.by_date }, total: it.total } },
+  }))
+}
 
 /** SKU 출고 추이 — 발주 캘린더 저장소의 채널별 SKU 수량(발주 추이)에
  *  채널 보고서에 올린 판매/재고/예측 리포트(쿠팡 rocket csv·forecast xlsx, 올리브영 상품별 매출_재고 xlsx)를 붙여
@@ -265,13 +275,17 @@ export default function SkuTrendPage() {
         const raw = localStorage.getItem('orderplan_state_v1')
         if (raw) { const p = JSON.parse(raw); opts = { threshold: p.threshold, useMaster: p.useMaster, splitBundles: p.splitBundles } }
       } catch { /* 무시 */ }
-      const [data, cp, oy] = await Promise.all([
+      const [data, cp, oy, nv] = await Promise.all([
         getOrderPlan(opts),
         getSalesTrend('coupang').catch(() => null),
         getSalesTrend('oliveyoung').catch(() => null),
+        getNaverSkuDaily().catch(() => null),
       ])
-      setItems(data.items || [])
-      const chs = Object.entries(data.total_by_channel || {}).sort((a, b) => b[1] - a[1]).map(([c]) => c)
+      const nvItems = naverToItems(nv?.items || [])
+      setItems([...(data.items || []), ...nvItems])
+      const totals: Record<string, number> = { ...(data.total_by_channel || {}) }
+      if (nvItems.length) totals[NAVER] = nvItems.reduce((a, x) => a + x.total, 0)
+      const chs = Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([c]) => c)
       setChannels(chs)
       setChannel(c => (c && chs.includes(c)) ? c : (chs[0] || ''))
       setSales({ '쿠팡': cp, '올리브영': oy })
@@ -449,7 +463,7 @@ export default function SkuTrendPage() {
               {perChannel.map(p => (
                 <div key={p.channel} style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 10, cursor: 'pointer', background: p.channel === channel ? '#f0f9ff' : '#fff' }}
                   onClick={() => setChannel(p.channel)}>
-                  <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 6 }}>{p.channel}</div>
+                  <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 6 }}>{p.channel}{p.channel === NAVER && <span style={{ fontWeight: 400, fontSize: '0.75rem', color: '#9ca3af', marginLeft: 6 }}>도착보장 출고수량 기준 (발주 아님)</span>}</div>
                   {([['주 대비', p.weekCmp, p.weekTop], ['월 대비', p.monthCmp, p.monthTop]] as const).map(([title, cmp, top]) => (
                     <div key={title} style={{ marginBottom: 8 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.8rem', marginBottom: 3 }}>
@@ -498,7 +512,7 @@ export default function SkuTrendPage() {
                   <thead>
                     <tr style={{ background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
                       <th style={{ ...cellStyle, textAlign: 'left', position: 'sticky', left: 0, background: '#f9fafb', zIndex: 1, minWidth: 220 }}>SKU / 품명</th>
-                      <th style={{ ...cellStyle, textAlign: 'center' }}>발주 추이</th>
+                      <th style={{ ...cellStyle, textAlign: 'center' }}>{channel === NAVER ? '출고' : '발주'} 추이</th>
                       {periods.map(p => (
                         <th key={p} style={{ ...cellStyle, color: p === currentPeriod && !includeCurrent ? '#9ca3af' : undefined }} title={p}>
                           {label(p)}{p === currentPeriod && !includeCurrent ? '*' : ''}
@@ -507,7 +521,7 @@ export default function SkuTrendPage() {
                       <th style={cellStyle}>합계</th>
                       <th style={cellStyle}>최근{win}{unitWord}</th>
                       <th style={cellStyle}>직전{win}{unitWord}</th>
-                      <th style={{ ...cellStyle, textAlign: 'center' }}>발주 판정</th>
+                      <th style={{ ...cellStyle, textAlign: 'center' }}>{channel === NAVER ? '출고' : '발주'} 판정</th>
                       {cur?.hasSales && (
                         <>
                           <th style={{ ...cellStyle, textAlign: 'center', borderLeft: '2px solid #e5e7eb' }}>판매 추이</th>

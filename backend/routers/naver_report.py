@@ -317,8 +317,16 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
 
     dates = sorted({r["date"] for r in out} | set(order_days))
     data_from, data_to = (dates[0], dates[-1]) if dates else ("", "")
-    # 자료 마지막 주문일과 기준일 중 빠른 쪽까지를 '경과일'로 본다 (자료가 어제까지면 어제까지)
+    # 자료 마지막 주문일과 기준일 중 빠른 쪽까지를 '경과일'로 본다 (자료가 어제까지면 어제까지).
+    # 주문 목록을 내보낸 당일의 주문은 오전 일부만 담기므로 그날은 미완료로 보고 하루 앞까지만 집계 창에 넣는다
     eff_to = min(as_of, data_to) if data_to else as_of
+    partial_last = False
+    ofiles = _orders().get("files") or []
+    if data_to and ofiles and data_to in order_days:
+        exported = max((f.get("uploaded_at") or "")[:10] for f in ofiles)
+        if exported == data_to and data_to > (min(order_days) if order_days else data_to):
+            partial_last = True
+            eff_to = min(eff_to, (datetime.fromisoformat(data_to).date() - timedelta(days=1)).isoformat())
     prev_month = (datetime.fromisoformat(month + "-01") - timedelta(days=1)).strftime("%Y-%m")
 
     by_day: dict = defaultdict(int)
@@ -369,6 +377,8 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         a14_from = a14_to = p14_from = p14_to = ""
     q14_all = rng_sum(a14_from, a14_to) if data_to else 0
     p14_all = rng_sum(p14_from, p14_to) if data_to else 0
+    w7_pay = sum(v.get("pay", 0) for d, v in order_days.items() if w1_from <= d <= w1_to) if data_to else 0
+    w0_pay = sum(v.get("pay", 0) for d, v in order_days.items() if w0_from <= d <= w0_to) if data_to else 0
 
     # 주별 (최근 8주, 월~일)
     weeks = []
@@ -497,7 +507,8 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         "month_qty": m_qty, "month_elapsed": m_elapsed, "month_avg": round(m_avg, 1), "month_batches": m_batches, "month_returns": m_ret,
         "prev_qty": p_qty, "prev_avg": round(p_avg, 1), "month_pct": _pct(m_avg, p_avg),
         "w1": w1, "w0": w0, "w1_avg": round(w1 / 7, 1), "w1_pct": _pct(w1, w0), "w1_from": w1_from, "w1_to": w1_to,
-        "a14_from": a14_from, "a14_to": a14_to, "q14": q14_all, "p14": p14_all,
+        "a14_from": a14_from, "a14_to": a14_to, "q14": q14_all, "p14": p14_all, "partial_last": partial_last,
+        "w1_pay": w7_pay, "w0_pay": w0_pay,
         "avg14": round(q14_all / 14, 1), "avg14_prev": round(p14_all / 14, 1), "pct14": _pct(q14_all, p14_all),
         "last_day": last_day, "last_day_md": (f"{int(last_day[5:7])}/{int(last_day[8:10])}" if last_day else ""),
         "last_day_qty": last_day_qty, "last_day_top": last_day_top,
@@ -554,8 +565,13 @@ def _render_text(s: dict) -> str:
         rng = f"{int(s['a14_from'][5:7])}/{int(s['a14_from'][8:10])}~{int(s['a14_to'][5:7])}/{int(s['a14_to'][8:10])}"
         L.append(f"* 최근 14일({rng}) 일평균 {_n(round(s['avg14']))}개" + (f" · 직전 14일 대비 {_pct_txt(s['pct14'])}" if s["pct14"] is not None else "")
                  + (f" · 결제 {_won(s['q14_pay'])}" + (f" ({_pct_txt(_pct(s['q14_pay'], s['p14_pay']))[1:-1]})" if s.get("p14_pay") else "") if s.get("q14_pay") else ""))
+    if s.get("w1"):
+        rng7 = f"{int(s['w1_from'][5:7])}/{int(s['w1_from'][8:10])}~{int(s['w1_to'][5:7])}/{int(s['w1_to'][8:10])}"
+        L.append(f"* 최근 7일({rng7}) 출고 {_n(s['w1'])}개" + (f" · 직전 7일 대비 {_pct_txt(s['w1_pct'])}" if s["w1_pct"] is not None else "")
+                 + (f" · 결제 {_won(s['w1_pay'])}" + (f" ({_pct_txt(_pct(s['w1_pay'], s['w0_pay']))[1:-1]})" if s.get("w0_pay") else "") if s.get("w1_pay") else ""))
     if s["last_day"]:
-        L.append(f"* 마지막 주문일 {s['last_day_md']} — {_n(s['last_day_qty'])}개" + (f" · {s['last_day_top']}" if s["last_day_top"] else ""))
+        L.append(f"* 마지막 주문일 {s['last_day_md']} — {_n(s['last_day_qty'])}개" + (f" · {s['last_day_top']}" if s["last_day_top"] else "")
+                 + (" (내보낸 당일 · 미완료라 평균에서 제외)" if s.get("partial_last") else ""))
     if s.get("gift_month"):
         L.append(f"* {ml} 사은품 출고 {_n(s['gift_month'])}개 (위 출고에 포함 · 주문 관리 목록 기준)")
     if s["month_returns"]:

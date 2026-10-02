@@ -1562,7 +1562,7 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         "notes": _load_state(sp).get("notes", ""),
         "all_groups": [{"date": g["date"], "md": g["md"], "qty": g["qty"], "amt": g["amt"], "supply": g["supply"], "status": g["status"]}
                        for g in groups],
-        "history": _build_history(sp, rows, month, bh_monthly=bh_monthly),
+        "history": _build_history(sp, rows, month, bh_monthly=bh_monthly, vat=vat, unit_supply=unit_supply, label=label),
         "history_order_basis": ("order_date" if sp.history_by_order_date else "due"),   # 월별 추이 발주 수량 귀속 기준
         "unit_basis": sp.unit_basis,   # 세트 상품을 단품으로 풀어 집계했는지 (쿠팡)
         "exec_metric": sp.exec_metric,
@@ -1609,8 +1609,11 @@ def _build_trend(sp: ChannelSpec, up: dict, amap: dict, as_of: str, month: str) 
     return _build_trend_daily(up, amap)
 
 
+AVG_WINDOW_DAYS = 14   # 일평균 창. 7일은 주간 변화율 중앙값 19%·최대 70% 로 등락이 커서 14일(9%·32%)로 — 재고일수·전기간 비교 모두 이 창 기준
+
+
 def _build_trend_daily(up: dict, amap: dict) -> dict:
-    """쿠팡: 일별 판매/재고(rocket) + 주간 예측(forecast)."""
+    """쿠팡: 일별 판매/재고(rocket) + 주간 예측(forecast). 일평균은 최근 AVG_WINDOW_DAYS 일, 비교는 그 직전 같은 길이 창."""
     rocket = up.get("rocket") or {}
     days = sorted(rocket.keys())
     per_label: dict = defaultdict(lambda: {"sales": defaultdict(int), "stock": defaultdict(int), "names": set()})
@@ -1629,14 +1632,15 @@ def _build_trend_daily(up: dict, amap: dict) -> dict:
         cur = fc_by_label[lb]
         fc_by_label[lb] = vals if cur is None else [a + b for a, b in zip(cur, vals)]
 
-    last7 = days[-7:]
+    W = AVG_WINDOW_DAYS
+    last7 = days[-W:]            # 이름은 7d 지만 창 길이는 W 일 (화면·보고문 필드명 호환)
     rows = []
     for lb, v in per_label.items():
         sales_series = [v["sales"].get(d, 0) for d in days]
         stock_series = [v["stock"].get(d, 0) for d in days]
         s7 = sum(v["sales"].get(d, 0) for d in last7)
         avg7 = round(s7 / len(last7), 1) if last7 else 0
-        prev7 = days[-14:-7]
+        prev7 = days[-2 * W:-W]
         p7 = sum(v["sales"].get(d, 0) for d in prev7)
         avgp = round(p7 / len(prev7), 1) if prev7 else None
         last_stock = stock_series[-1] if stock_series else 0
@@ -1658,9 +1662,13 @@ def _build_trend_daily(up: dict, amap: dict) -> dict:
                          "stock_last": None, "stock_first": None, "stock_delta": None,
                          "days_of_supply": None, "forecast_weekly": vals, "forecast_next": vals[0]})
     rows.sort(key=lambda x: -(x["sales_7d"] or 0))
+    prev7_all = days[-2 * W:-W]
     return {"mode": "daily", "days": days, "weeks": fc.get("weeks") or [], "rows": rows,
             "has_rocket": bool(days), "has_forecast": bool(fc_items),
-            "period_label": (f"{_md(days[0])}~{_md(days[-1])}" if days else "")}
+            "avg_days": len(last7), "avg_from": (last7[0] if last7 else ""), "avg_to": (last7[-1] if last7 else ""),
+            "prev_from": (prev7_all[0] if prev7_all else ""), "prev_to": (prev7_all[-1] if prev7_all else ""),
+            "data_range": (f"{_md(days[0])}~{_md(days[-1])}" if days else ""),
+            "period_label": (f"{_md(last7[0])}~{_md(last7[-1])}" if last7 else "")}
 
 
 def _period_bounds(key: str, as_of: str) -> tuple:
@@ -1992,6 +2000,17 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
         else:
             L.append(f"* {ml} 납품 실적 없음")
 
+    # 1-1) 지난달 마감 — 발주 금액·수량과 납품(입고확정) 금액·수량 한 줄
+    prev_ym = _prev_months(s["month"], 2)[0]
+    ph = next((h for h in (s.get("history") or []) if h["ym"] == prev_ym), None)
+    if ph and (ph.get("order_qty") or ph.get("delivered")):
+        bits = []
+        if ph.get("order_qty"):
+            bits.append("발주 " + (amt_qty(ph.get("order_supply"), ph["order_qty"]) if ph.get("order_supply") else f"{_n(ph['order_qty'])}개"))
+        if ph.get("delivered"):
+            bits.append(f"{sp.recv_word if sp.has_recv else '납품'} " + (amt_qty(ph.get("recv_supply"), ph["delivered"]) if ph.get("recv_supply") else f"{_n(ph['delivered'])}개"))
+        L.append(f"* {ph['label']} 마감 — " + " · ".join(bits))
+
     # 2) 남은 발주
     if o["groups"]:
         rng = f"{o['groups'][0]['md']}~{o['groups'][-1]['md']}" if len(o["groups"]) > 1 else o["groups"][0]["md"]
@@ -2045,7 +2064,7 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
                 L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + f" · 기간 {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
         else:
-            L += ["", f"■ {ch} 판매·재고 ({per} 일평균 · 전주 대비)"]
+            L += ["", f"■ {ch} 판매·재고 ({per} {t.get('avg_days') or 7}일 평균 · 직전 {t.get('avg_days') or 7}일 대비)"]
             for r in [x for x in t["rows"] if x["avg_7d"] or x.get("forecast_next")][:3]:
                 if r["avg_7d"]:
                     L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + stock_tail(r))
@@ -2077,12 +2096,14 @@ def _prev_months(month: str, n: int = 4) -> list:
     return out
 
 
-def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_monthly: Optional[dict] = None) -> list:
+def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_monthly: Optional[dict] = None,
+                   vat: float = 1.0, unit_supply: Optional[dict] = None, label=None) -> list:
     """최근 n개월 월별 발주·납품 수량 (납기일 기준). 저장소에 없는 달은 화면에서 입력한 수기 값(state.monthly)으로 보정.
     bh_monthly({ym: BH 거래처 출고 월합계}) 가 있으면 각 행에 bh_shipped 로 붙이고, 채널 입고확정 데이터가 없는 채널(컬리)은
     출고 = 입고 확정이므로 그 값을 auto_delivered 로 쓴다. has_recv 채널은 저장소 입고 합계가 auto_delivered, bh_shipped 는 참고값.
     [{ym, label, order_qty, delivered, auto_order_qty, auto_delivered, bh_shipped, override}]"""
-    agg: dict = defaultdict(lambda: {"order_qty": 0, "recv": 0, "recv_n": 0})
+    agg: dict = defaultdict(lambda: {"order_qty": 0, "recv": 0, "recv_n": 0, "order_supply": 0.0, "recv_supply": 0.0})
+    unit_supply = unit_supply or {}
     for r in rows:
         ym = (r["date"] or "")[:7]
         if not ym:
@@ -2090,14 +2111,23 @@ def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_month
         # 발주 수량의 귀속 월: 기본은 납기월. history_by_order_date 채널(올리브영)은 발주일 월 (없는 행은 납기월로 폴백)
         oym = ((r.get("order_date") or "")[:7] if sp.history_by_order_date else "") or ym
         agg[oym]["order_qty"] += int(r.get("order_qty", r["qty"]) or 0)
+        if r.get("amt") is not None:
+            agg[oym]["order_supply"] += int(r["amt"]) / vat   # 발주 금액 → 공급가
         a = agg[ym]
         if r.get("recv") is not None:
             a["recv"] += int(r["recv"]); a["recv_n"] += 1
+            # 납품(입고) 금액 — 요약의 이달 recv_supply 와 같은 규칙
+            if r.get("recv_amt") and not sp.qty_is_conf:
+                a["recv_supply"] += r["recv_amt"] / vat
+            elif sp.qty_is_conf and r.get("amt") and r["qty"]:
+                a["recv_supply"] += r["recv"] * (r["amt"] / r["qty"]) / vat
+            elif label is not None:
+                a["recv_supply"] += r["recv"] * unit_supply.get(label(r["name"]), 0)
     ov = _load_state(sp).get("monthly") or {}
     bh_monthly = bh_monthly or {}
     out = []
     for ym in _prev_months(month, n):
-        a = agg.get(ym) or {"order_qty": 0, "recv": 0, "recv_n": 0}
+        a = agg.get(ym) or {"order_qty": 0, "recv": 0, "recv_n": 0, "order_supply": 0.0, "recv_supply": 0.0}
         o = ov.get(ym) or {}
         bh_q = bh_monthly.get(ym)
         bh_q = None if bh_q is None else int(bh_q)
@@ -2107,7 +2137,9 @@ def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_month
             auto_recv = bh_q   # 입고확정 절차가 없는 채널: BH 출고 = 납품
         row = {"ym": ym, "label": f"{int(ym[5:7])}월",
                "auto_order_qty": a["order_qty"] or None, "auto_delivered": auto_recv, "bh_shipped": bh_q,
-               "order_qty": a["order_qty"] or None, "delivered": auto_recv, "override": False}
+               "order_qty": a["order_qty"] or None, "delivered": auto_recv, "override": False,
+               "order_supply": (int(round(a["order_supply"])) or None),
+               "recv_supply": (int(round(a["recv_supply"])) if a["recv_n"] else None)}
         for k in ("order_qty", "delivered"):
             if o.get(k) is not None:
                 row[k] = int(o[k]); row["override"] = True

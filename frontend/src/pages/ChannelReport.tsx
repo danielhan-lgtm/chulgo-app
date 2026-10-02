@@ -513,8 +513,8 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                     <thead><tr>
                       <th>품목</th>
                       <th>일별 판매</th>
-                      <th className="num">7일 평균</th>
-                      <th className="num">전주 대비</th>
+                      <th className="num">{data.trend.avg_days || 7}일 평균</th>
+                      <th className="num">직전 {data.trend.avg_days || 7}일 대비</th>
                       <th className="num">{cfg.name} 재고</th>
                       <th className="num">재고일수</th>
                       <th className="num">다음주 예측</th>

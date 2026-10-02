@@ -1319,7 +1319,7 @@ export interface CoupangReportSummary {
   ob_connected: boolean
   ob_error: string
   fulfil: { deliverable: number; shortage: number; need: number; rate: number; leftover: CpLabelQty[]; short_by_label: CpLabelQty[]; incoming: CpIncoming[]; incoming_total: number }
-  trend: { mode: 'daily' | 'monthly'; days: string[]; months?: string[]; periods?: { key: string; from: string; to: string; days: number; label: string }[]; latest?: string; elapsed_days?: number; period_label?: string; prev_label?: string; prev_days?: number; total_sales?: number; total_amount?: number; total_sales_prev?: number | null; weeks: { from: string; to: string }[]; rows: CpTrendRow[]; has_rocket: boolean; has_forecast: boolean }
+  trend: { mode: 'daily' | 'monthly'; days: string[]; months?: string[]; periods?: { key: string; from: string; to: string; days: number; label: string }[]; latest?: string; elapsed_days?: number; avg_days?: number; data_range?: string; period_label?: string; prev_label?: string; prev_days?: number; total_sales?: number; total_amount?: number; total_sales_prev?: number | null; weeks: { from: string; to: string }[]; rows: CpTrendRow[]; has_rocket: boolean; has_forecast: boolean }
   uploads: CpUploads
   notes: string
   all_groups: { date: string; md: string; qty: number; amt: number; supply: number; status: string }[]

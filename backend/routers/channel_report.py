@@ -2070,9 +2070,10 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
                 pct = round(((t['total_sales'] / el) / (pv / pdays) - 1) * 100)
                 head += f" · 전 조회기간({t.get('prev_label')}) 대비 {'+' if pct > 0 else ''}{pct}%"
             L += ["", head + ")"]
-            L.append(f"* 합계 {_n(t.get('total_sales'))}개 · 일 {_n(round(t['total_sales'] / el)) if el else '-'}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전 기간 {_n(pv)}개)" if pv else ""))
+            L.append(f"* 합계 {_n(t.get('total_sales'))}개 (매장 {_n(t.get('total_store'))} · 온라인 {_n(t.get('total_online'))}) · 일 {_n(round(t['total_sales'] / el)) if el else '-'}개"
+                     + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" · 전 기간 {_n(pv)}개" if pv else ""))
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
-                L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + f" · 기간 {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
+                L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + stock_tail(r))
         else:
             L += ["", f"■ {ch} 판매·재고 ({per} {t.get('avg_days') or 7}일 평균 · 직전 {t.get('avg_days') or 7}일 대비)"]
             for r in [x for x in t["rows"] if x["avg_7d"] or x.get("forecast_next")][:3]:

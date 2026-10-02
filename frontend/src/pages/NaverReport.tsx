@@ -8,7 +8,7 @@ import {
 } from '../services/api'
 import type { NaverReportSummary, NaverReportRow, ChannelExecReport } from '../services/api'
 
-/** 네이버 스마트스토어(도착보장) 출고 보고 — 박스히어로 거래 내역 xlsx 를 올려
+/** 네이버 스마트스토어(도착보장) 출고 보고 — 도착보장 주문 관리 목록 xlsx 를 올려
  *  '스마트스토어 … DJ&A' 거래처 출고를 일별 판매로 보고 의장 보고문을 만든다.
  *  - 도착보장 출고는 하루 한 회차씩 나가고 메모의 '9월 21일'이 주문일 → 주문일 기준 집계
  *  - 재고는 아워박스 가용재고(연동 시) → 박스히어로 재고 순으로 붙여 소진 예상일을 계산
@@ -207,7 +207,7 @@ export default function NaverReport() {
         <DatePicker value={dayjs(asOf)} onChange={d => { if (d) { setTextDirty(false); setAsOf(d.format('YYYY-MM-DD')) } }} allowClear={false} />
         <Button icon={<ReloadOutlined />} onClick={() => { setTextDirty(false); reload(true) }} loading={loading}>새로고침</Button>
         <Upload accept=".xlsx,.xls" multiple showUploadList={false} beforeUpload={queueUpload}>
-          <Tooltip title="박스히어로 > 거래 내역 > 엑셀 내보내기 (출고량), 또는 도착보장 주문 관리 목록 manageList_*.xlsx (사은품 분리). 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
+          <Tooltip title="도착보장 주문 관리 목록 manageList_*.xlsx (출고·사은품·반품 집계의 기준). 박스히어로 거래 내역 xlsx 는 주문 목록이 없는 과거 기간 보완용. 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
             <Button icon={<UploadOutlined />} loading={uploading}>거래 내역 · 주문 목록 업로드</Button>
           </Tooltip>
         </Upload>
@@ -226,7 +226,7 @@ export default function NaverReport() {
         <>
           {data.stale_days !== null && data.stale_days >= 2 && (
             <Alert type="warning" showIcon style={{ marginBottom: 12 }}
-              message={`자료가 ${data.last_day_md} 주문분까지입니다 (기준일보다 ${data.stale_days}일 전). 박스히어로 거래 내역을 다시 내보내 올리면 최신화됩니다.`} />
+              message={`자료가 ${data.last_day_md} 주문분까지입니다 (기준일보다 ${data.stale_days}일 전). 도착보장 주문 관리 목록을 다시 내려받아 올리면 최신화됩니다.`} />
           )}
           {!data.data_to && <Alert type="info" showIcon style={{ marginBottom: 12 }} message="아직 업로드한 거래 내역이 없습니다. 상단 '거래 내역 업로드'로 박스히어로 Transactions xlsx 를 올리세요." />}
 
@@ -341,7 +341,7 @@ export default function NaverReport() {
                       )
                     })}</tbody>
                   </table>
-                  <div className="hint" style={{ marginTop: 6 }}>출고 수량은 박스히어로 거래 내역, 사은품은 도착보장 주문 관리 목록(manageList xlsx)의 '이슈=사은품' 행입니다. 두 자료를 모두 올린 달만 사은품이 채워지고, 보고문에는 "사은품 출고 … (위 출고에 포함 · 별도 표기)" 줄로 들어갑니다.</div>
+                  <div className="hint" style={{ marginTop: 6 }}>출고 수량과 사은품 모두 도착보장 주문 관리 목록(manageList xlsx) 기준입니다 (사은품은 '이슈=사은품' 행). 주문 목록이 없는 과거 날짜만 박스히어로 거래 내역으로 보완되고, 보고문에는 "사은품 출고 … (위 출고에 포함 · 별도 표기)" 줄로 들어갑니다.</div>
                 </div>
               )}
 

@@ -287,6 +287,15 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         w1_from = w1_to = w0_from = w0_to = ""
     w1 = rng_sum(w1_from, w1_to) if data_to else 0
     w0 = rng_sum(w0_from, w0_to) if data_to else 0
+    # 14일 창 (쿠팡 보고와 같은 기준): 최근 14일 vs 직전 14일
+    if data_to:
+        e = datetime.fromisoformat(eff_to).date()
+        a14_from, a14_to = (e - timedelta(days=13)).isoformat(), e.isoformat()
+        p14_from, p14_to = (e - timedelta(days=27)).isoformat(), (e - timedelta(days=14)).isoformat()
+    else:
+        a14_from = a14_to = p14_from = p14_to = ""
+    q14_all = rng_sum(a14_from, a14_to) if data_to else 0
+    p14_all = rng_sum(p14_from, p14_to) if data_to else 0
 
     # 주별 (최근 8주, 월~일)
     weeks = []
@@ -339,16 +348,18 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
     rows = []
     for lb in labels:
         mq = rng_sum(m_from, m_to, lb); pq = rng_sum(p_from, p_to, lb)
-        a14_from = (datetime.fromisoformat(eff_to).date() - timedelta(days=13)).isoformat() if data_to else ""
-        q14 = rng_sum(a14_from, eff_to, lb) if data_to else 0
+        q14 = rng_sum(a14_from, a14_to, lb) if data_to else 0
         avg14 = q14 / 14
+        p14 = rng_sum(p14_from, p14_to, lb) if data_to else 0
+        avg14_prev = p14 / 14
         stock, basis = stock_of(lb)
         dos = (round(stock / avg14, 1) if (stock is not None and avg14 > 0) else None)
         spark = [rng_sum(w["from"], w["to"], lb) for w in weeks]
         rows.append({"label": lb, "names": sorted(name_of_label[lb]), "skus": sorted(sku_of_label[lb]),
                      "month_qty": mq, "prev_qty": pq,
                      "pct": _pct(mq / m_elapsed if mq else 0, pq / _month_days(prev_month) if pq else 0),
-                     "avg14": round(avg14, 1), "w1": rng_sum(w1_from, w1_to, lb) if data_to else 0,
+                     "avg14": round(avg14, 1), "avg14_prev": round(avg14_prev, 1), "pct14": _pct(avg14, avg14_prev),
+                     "w1": rng_sum(w1_from, w1_to, lb) if data_to else 0,
                      "stock": stock, "stock_basis": basis, "days_of_supply": dos, "spark": spark})
     rows = [r for r in rows if r["month_qty"] or r["prev_qty"] or r["w1"]]
 
@@ -361,13 +372,16 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
 
     summary = {
         "as_of": as_of, "as_of_md": f"{int(as_of[5:7])}/{int(as_of[8:10])}", "month": month, "month_label": f"{int(month[5:7])}월",
-        "prev_month_label": f"{int(prev_month[5:7])}월",
+        "prev_month_label": f"{int(prev_month[5:7])}월", "prev_month": prev_month,
+        "prev2_month": (datetime.fromisoformat(prev_month + "-01") - timedelta(days=1)).strftime("%Y-%m"),
         "partner_kw": kws, "partners": sorted({r["partner"] for r in tx}),
         "data_from": data_from, "data_to": data_to, "eff_to": eff_to, "tx_rows": len(tx),
         "stale_days": ((datetime.fromisoformat(as_of).date() - datetime.fromisoformat(data_to).date()).days if data_to else None),
         "month_qty": m_qty, "month_elapsed": m_elapsed, "month_avg": round(m_avg, 1), "month_batches": m_batches, "month_returns": m_ret,
         "prev_qty": p_qty, "prev_avg": round(p_avg, 1), "month_pct": _pct(m_avg, p_avg),
         "w1": w1, "w0": w0, "w1_avg": round(w1 / 7, 1), "w1_pct": _pct(w1, w0), "w1_from": w1_from, "w1_to": w1_to,
+        "a14_from": a14_from, "a14_to": a14_to, "q14": q14_all, "p14": p14_all,
+        "avg14": round(q14_all / 14, 1), "avg14_prev": round(p14_all / 14, 1), "pct14": _pct(q14_all, p14_all),
         "last_day": last_day, "last_day_md": (f"{int(last_day[5:7])}/{int(last_day[8:10])}" if last_day else ""),
         "last_day_qty": last_day_qty, "last_day_top": last_day_top,
         "weeks": weeks, "rows": rows,
@@ -402,13 +416,20 @@ def _render_text(s: dict) -> str:
         L.append("* 박스히어로 거래 내역이 아직 업로드되지 않았습니다")
         return "\n".join(L)
     if s["month_qty"]:
-        L.append(f"* {ml} 출고 {_n(s['month_qty'])}개 · 일평균 {_n(round(s['month_avg']))}개 {_pct_txt(s['month_pct'])}".rstrip()
-                 + (f" — {pl} 일평균 {_n(round(s['prev_avg']))}개" if s["prev_avg"] else ""))
+        L.append(f"* {ml} 출고 {_n(s['month_qty'])}개 · 일평균 {_n(round(s['month_avg']))}개"
+                 + (f" ({pl} 일평균 {_n(round(s['prev_avg']))}개 대비 {_pct_txt(s['month_pct'])[1:-1]})" if s["prev_avg"] and s["month_pct"] is not None else ""))
     else:
-        L.append(f"* {ml} 출고 없음" + (f" ({pl} {_n(s['prev_qty'])}개)" if s["prev_qty"] else ""))
-    if s["w1"]:
-        rng = f"{int(s['w1_from'][5:7])}/{int(s['w1_from'][8:10])}~{int(s['w1_to'][5:7])}/{int(s['w1_to'][8:10])}"
-        L.append(f"* 최근 7일({rng}) 일평균 {_n(round(s['w1_avg']))}개" + (f" · 전주 대비 {_pct_txt(s['w1_pct'])}" if s["w1_pct"] is not None else ""))
+        L.append(f"* {ml} 출고 없음")
+    # 지난달 마감 — 출고 수량 · 전월 대비 · 사은품 (월별 추이 history 기준)
+    hist = {h["ym"]: h for h in (s.get("history") or [])}
+    ph = hist.get(s["prev_month"]); pph = hist.get(s["prev2_month"])
+    if ph and ph.get("qty"):
+        pct = f" · 전월 대비 {_pct_txt(_pct(ph['qty'], pph['qty']))[1:-1]}" if (pph and pph.get("qty")) else ""
+        gift = f" · 사은품 {_n(ph['gift'])}개 포함" if ph.get("gift") else ""
+        L.append(f"* {ph['label']} 마감 — 출고 {_n(ph['qty'])}개{pct}{gift}")
+    if s.get("q14"):
+        rng = f"{int(s['a14_from'][5:7])}/{int(s['a14_from'][8:10])}~{int(s['a14_to'][5:7])}/{int(s['a14_to'][8:10])}"
+        L.append(f"* 최근 14일({rng}) 일평균 {_n(round(s['avg14']))}개" + (f" · 직전 14일 대비 {_pct_txt(s['pct14'])}" if s["pct14"] is not None else ""))
     if s["last_day"]:
         L.append(f"* 마지막 주문일 {s['last_day_md']} — {_n(s['last_day_qty'])}개" + (f" · {s['last_day_top']}" if s["last_day_top"] else ""))
     if s.get("gift_month"):
@@ -418,19 +439,14 @@ def _render_text(s: dict) -> str:
     if s.get("stale_days") and s["stale_days"] >= 2:
         L.append(f"* 자료는 {s['last_day_md']} 주문분까지 반영 (도착보장 주문 관리 목록 재업로드 시 갱신)")
 
-    # 품목별 — 이번 달 상위 6종, 한 줄에 일평균(최근 14일) · 전월 일평균 대비 · 재고(며칠분). 막대 없음
-    rows = [r for r in s["rows"] if r["month_qty"] > 0][:6]
-    use_month = bool(rows)
-    if not rows:   # 이달 출고가 아직 없으면(월초·자료 지연) 전월 출고 상위 품목으로
-        rows = sorted([r for r in s["rows"] if r["prev_qty"] > 0], key=lambda r: -r["prev_qty"])[:6]
+    # 품목별 — 최근 14일 일평균 상위 6종, 쿠팡·올영과 같은 한 줄: 일 N개 (직전 14일 대비) · 재고 N개 (며칠분)
+    rows = sorted([r for r in s["rows"] if r["avg14"] > 0], key=lambda r: -r["avg14"])[:6]
     if rows:
         basis = "아워박스 가용재고" if s["stock_basis"] == "ob" else "박스히어로 재고"
-        L += ["", f"■ 네이버 판매·재고 ({ml if use_month else pl} 출고{' · 전월 일평균 대비' if use_month else ''} · 최근 14일 일평균 · {basis})"]
+        rng = f"{int(s['a14_from'][5:7])}/{int(s['a14_from'][8:10])}~{int(s['a14_to'][5:7])}/{int(s['a14_to'][8:10])}"
+        L += ["", f"■ 네이버 판매·재고 ({rng} 14일 평균 · 직전 14일 대비 · {basis})"]
         for r in rows:
-            line = (f"* {r['label']} — {_n(r['month_qty'])}개 {_pct_txt(r['pct'])}".rstrip() if use_month
-                    else f"* {r['label']} — {_n(r['prev_qty'])}개")
-            if r["avg14"] > 0:
-                line += f" · 일 {_n(round(r['avg14']))}개"
+            line = f"* {r['label']} — 일 {_n(round(r['avg14']))}개 {_pct_txt(r['pct14'])}".rstrip()
             st = r.get("stock"); d = r.get("days_of_supply")
             if st is not None:
                 if st < 0 or d is None:

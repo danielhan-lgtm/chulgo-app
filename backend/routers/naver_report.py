@@ -63,7 +63,7 @@ def _is_order_list(df) -> bool:
 
 
 def _parse_order_list(df) -> dict:
-    """도착보장 주문 관리 목록(manageList_*.xlsx) → 주문일별 {total(정상 주문수량), gift(그중 사은품), returns(반품·교환·취소), gift_items}.
+    """도착보장 주문 관리 목록(manageList_*.xlsx) → 주문일별 {total(정상 주문수량), gift(그중 사은품), returns(반품·교환·취소), gift_items, items}.
     '이슈' 열에 '사은품' 이 있으면 사은품 행(주문금액 0). 주문상태 '정상' 만 출고로 본다."""
     days: dict = {}
     for r in df.itertuples(index=False):
@@ -78,15 +78,16 @@ def _parse_order_list(df) -> dict:
             continue
         if q <= 0:
             continue
-        e = days.setdefault(d, {"total": 0, "gift": 0, "returns": 0, "gift_items": {}})
+        e = days.setdefault(d, {"total": 0, "gift": 0, "returns": 0, "gift_items": {}, "items": {}})
         status = str(rec.get("주문상태") or "").strip()
         if status != "정상":
             e["returns"] += q
             continue
         e["total"] += q
+        nm = str(rec.get("상품명") or "").strip()
+        e["items"][nm] = e["items"].get(nm, 0) + q          # 상품별 정상 주문수량 (사은품 포함) — 출고 집계의 원천
         if "사은품" in str(rec.get("이슈") or ""):
             e["gift"] += q
-            nm = str(rec.get("상품명") or "").strip()
             e["gift_items"][nm] = e["gift_items"].get(nm, 0) + q
     return days
 
@@ -232,12 +233,16 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
     tx = _tx_all()
     kws = st["partner_kw"]
 
-    out = [r for r in tx if r["kind"] == "출고"]
-    ret = [r for r in tx if r["kind"] == "입고"]
+    # 출고 원천: 도착보장 주문 관리 목록(주문일별 상품별 정상 주문수량)이 있는 날은 그것을, 없는 날만 박스히어로 거래 내역을 쓴다.
+    # 주문 목록은 담당자가 올리는 유일한 자료라 이것만으로 판단되어야 한다 — 거래 내역은 과거(주문 목록 이전) 보완용.
+    order_days = {d: v for d, v in _orders().get("days", {}).items() if v.get("items")}
+    out = [r for r in tx if r["kind"] == "출고" and r["date"] not in order_days]
+    ret = [r for r in tx if r["kind"] == "입고" and r["date"] not in order_days]
     for r in tx:
         r["label"] = _label(r["name"], aliases)
+    sku_by_name = {r["name"]: r["sku"] for r in tx if r.get("sku")}   # 주문 목록엔 바코드가 없어 거래 내역의 제품명→SKU 로 보완
 
-    dates = sorted({r["date"] for r in out})
+    dates = sorted({r["date"] for r in out} | set(order_days))
     data_from, data_to = (dates[0], dates[-1]) if dates else ("", "")
     # 자료 마지막 주문일과 기준일 중 빠른 쪽까지를 '경과일'로 본다 (자료가 어제까지면 어제까지)
     eff_to = min(as_of, data_to) if data_to else as_of
@@ -251,6 +256,13 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
     for r in ret:   # 취소 보정(입고)은 주문일에서 차감
         by_day[r["date"]] += r["qty"]
         by_day_label[r["date"]][r["label"]] += r["qty"]
+    name_of_label: dict = defaultdict(set)
+    for d, v in order_days.items():   # 주문 목록: 상품별 정상 주문수량 (반품·취소·교환은 애초에 제외됨)
+        for nm, q in v["items"].items():
+            lb = _label(nm, aliases)
+            by_day[d] += q
+            by_day_label[d][lb] += q
+            name_of_label[lb].add(nm)
 
     def rng_sum(d1: str, d2: str, lb: Optional[str] = None) -> int:
         if lb is None:
@@ -293,11 +305,15 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
     bh = _bh_stock_by_sku(cfg.get("api_token") or "", force=refresh)
     ob = _ob_available_by_name(force=refresh)
     ob_connected = bool(ob)
-    sku_of_label: dict = defaultdict(set); name_of_label: dict = defaultdict(set)
+    sku_of_label: dict = defaultdict(set)
     for r in out:
         if r["sku"]:
             sku_of_label[r["label"]].add(r["sku"])
         name_of_label[r["label"]].add(r["name"])
+    for lb, nms in name_of_label.items():
+        for nm in nms:
+            if sku_by_name.get(nm):
+                sku_of_label[lb].add(sku_by_name[nm])
 
     def stock_of(lb: str) -> tuple[Optional[int], str]:
         if ob_connected:
@@ -319,7 +335,7 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         return None, ""
 
     # 품목별
-    labels = sorted({r["label"] for r in out}, key=lambda lb: -rng_sum(m_from, m_to, lb))
+    labels = sorted({r["label"] for r in out} | set(name_of_label), key=lambda lb: -rng_sum(m_from, m_to, lb))
     rows = []
     for lb in labels:
         mq = rng_sum(m_from, m_to, lb); pq = rng_sum(p_from, p_to, lb)
@@ -341,7 +357,7 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
     last_day = data_to
     last_day_qty = by_day.get(last_day, 0) if last_day else 0
     last_day_top = _top([{"label": lb, "qty": q} for lb, q in sorted(by_day_label.get(last_day, {}).items(), key=lambda kv: -kv[1])], "qty", 2) if last_day else ""
-    m_ret = -sum(r["qty"] for r in ret if m_from <= r["date"] <= m_to)
+    m_ret = -sum(r["qty"] for r in ret if m_from <= r["date"] <= m_to)         + sum(v["returns"] for d, v in order_days.items() if m_from <= d <= m_to)   # 주문 목록의 반품·취소·교환 (출고에 미포함)
 
     summary = {
         "as_of": as_of, "as_of_md": f"{int(as_of[5:7])}/{int(as_of[8:10])}", "month": month, "month_label": f"{int(month[5:7])}월",
@@ -361,6 +377,8 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         "history": _build_history(by_day, month, eff_to=eff_to, order_days=_orders().get("days")),
     }
     summary["gift_month"] = next((h["gift"] for h in summary["history"] if h["ym"] == month), None)
+    summary["order_days"] = len(order_days)
+    summary["order_from"], summary["order_to"] = (min(order_days), max(order_days)) if order_days else ("", "")
     summary["has_orders"] = bool(_orders().get("days"))
     summary["order_files"] = _orders().get("files", [])
     summary["text"] = _render_text(summary)
@@ -396,9 +414,9 @@ def _render_text(s: dict) -> str:
     if s.get("gift_month"):
         L.append(f"* {ml} 사은품 출고 {_n(s['gift_month'])}개 (위 출고에 포함 · 주문 관리 목록 기준)")
     if s["month_returns"]:
-        L.append(f"* {ml} 취소 보정 {_n(s['month_returns'])}개 (출고에서 차감)")
+        L.append(f"* {ml} 반품·취소·교환 {_n(s['month_returns'])}개 (출고에서 제외)")
     if s.get("stale_days") and s["stale_days"] >= 2:
-        L.append(f"* 자료는 {s['last_day_md']} 주문분까지 반영 (박스히어로 거래 내역 재업로드 시 갱신)")
+        L.append(f"* 자료는 {s['last_day_md']} 주문분까지 반영 (도착보장 주문 관리 목록 재업로드 시 갱신)")
 
     # 품목별 — 이번 달 상위 6종, 한 줄에 일평균(최근 14일) · 전월 일평균 대비 · 재고(며칠분). 막대 없음
     rows = [r for r in s["rows"] if r["month_qty"] > 0][:6]

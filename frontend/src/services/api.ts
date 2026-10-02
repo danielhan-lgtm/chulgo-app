@@ -1406,7 +1406,7 @@ export interface NaverReportSummary {
   weeks: { from: string; to: string; md: string; qty: number; partial: boolean }[]
   rows: NaverReportRow[]
   stock_basis: 'ob' | 'bh' | ''; ob_connected: boolean; bh_connected: boolean
-  uploads: { filename: string; uploaded_at: string; rows: number; added: number; from: string; to: string }[]
+  uploads: { filename: string; uploaded_at: string; rows: number; added: number; from?: string; to?: string; type?: 'orders' | 'products' }[]   // 상품 목록(products)은 날짜 범위 없음
   notes: string
   daily: { date: string; qty: number }[]
   text: string
@@ -1419,7 +1419,7 @@ export interface NaverReportSummary {
 export interface NaverHistoryRow { ym: string; label: string; qty: number | null; gift?: number | null; gift_total?: number | null; order_days?: number }
 export const getNaverReport =(asOf?: string, refresh = false): Promise<NaverReportSummary> =>
   api.get('/naver-report/summary', { params: { as_of: asOf || '', refresh: refresh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
-export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filename: string; rows: number; added: number; from: string; to: string; type?: 'orders'; total?: number; gift?: number }[]; errors: string[]; tx_rows: number; order_days?: number }> => {
+export const uploadNaverReportFiles = (files: File[]): Promise<{ added: { filename: string; rows: number; added: number; from?: string; to?: string; type?: 'orders' | 'products'; total?: number; gift?: number; status?: Record<string, number> }[]; errors: string[]; tx_rows: number; order_days?: number }> => {
   const fd = new FormData()
   files.forEach(f => fd.append('files', f, f.name))
   return api.post('/naver-report/upload', fd, { timeout: 180000 }).then(r => r.data)

@@ -148,8 +148,10 @@ export default function NaverReport() {
       try {
         const res = await uploadNaverReportFiles(files)
         if (res.added.length) message.success(`${res.added.map(a => a.type === 'orders'
-          ? `${a.filename} (주문 목록 ${a.from.slice(5)}~${a.to.slice(5)} · 사은품 ${n(a.gift)}개 분리)`
-          : `${a.filename} (${a.from.slice(5)}~${a.to.slice(5)} · ${n(a.added)}행 추가)`).join(', ')}`)
+          ? `${a.filename} (주문 목록 ${a.from?.slice(5)}~${a.to?.slice(5)} · 사은품 ${n(a.gift)}개 분리)`
+          : a.type === 'products'
+            ? `${a.filename} (상품 목록 ${n(a.rows)}개 리스팅 · 판매중 ${n(a.status?.['판매중'] || 0)} · 품절 ${n(a.status?.['품절'] || 0)})`
+            : `${a.filename} (${a.from?.slice(5)}~${a.to?.slice(5)} · ${n(a.added)}행 추가)`).join(', ')}`)
         res.errors.forEach(e => message.warning(e, 6))
         setTextDirty(false)
         await reload()
@@ -295,7 +297,7 @@ export default function NaverReport() {
                 </table>
                 {data.uploads.length > 0 && (
                   <div className="files" style={{ marginTop: 8 }}>
-                    업로드: {data.uploads.slice(-5).map(f => `${f.filename} (${f.from.slice(5)}~${f.to.slice(5)} · ${f.uploaded_at.slice(5, 16)})`).join(' · ')}
+                    업로드: {data.uploads.slice(-5).map(f => `${f.filename} (${f.type === 'products' ? `상품 목록 ${n(f.rows)}개` : `${f.from?.slice(5)}~${f.to?.slice(5)}`} · ${f.uploaded_at.slice(5, 16)})`).join(' · ')}
                     {' '}· 자료 범위 {data.data_from} ~ {data.data_to} · {n(data.tx_rows)}행
                   </div>
                 )}

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 import utils_core as U
 from routers.channel_report import (
-    _DATA_DIR, _load_json, _save_json, _nkey, _n, _pct1, _top, _prev_months,
+    _DATA_DIR, _load_json, _save_json, _nkey, _n, _won, _pct1, _top, _prev_months,
     _bh_stock_by_sku, _ob_available_by_name,
 )
 
@@ -26,7 +26,8 @@ router = APIRouter()
 
 STATE_PATH = os.path.join(_DATA_DIR, "naver_report_state.json")
 TX_PATH = os.path.join(_DATA_DIR, "naver_report_tx.json")
-ORDERS_PATH = os.path.join(_DATA_DIR, "naver_report_orders.json")   # 도착보장 주문 관리 목록(manageList xlsx) 일별 집계 — 사은품 분리용
+ORDERS_PATH = os.path.join(_DATA_DIR, "naver_report_orders.json")
+PRODUCTS_PATH = os.path.join(_DATA_DIR, "naver_report_products.json")   # 스마트스토어 상품 목록(Product_*.csv) — 리스팅 상태·가격·재고   # 도착보장 주문 관리 목록(manageList xlsx) 일별 집계 — 사은품 분리용
 DEFAULT_PARTNER_KW = ["스마트스토어", "DJ&A"]
 EXEC_NAME = "네이버 스마트스토어(도착보장)"   # 경영 요약(4채널 묶음) 표기
 
@@ -62,10 +63,25 @@ def _is_order_list(df) -> bool:
     return all(c in df.columns for c in _ORDER_COLS)
 
 
+def _num(v) -> float:
+    """'1,234원' / '12,500' / NaN → float"""
+    try:
+        t = str(v).replace(",", "").replace("원", "").strip()
+        return float(t) if t and t != "nan" else 0.0
+    except ValueError:
+        return 0.0
+
+
 def _parse_order_list(df) -> dict:
-    """도착보장 주문 관리 목록(manageList_*.xlsx) → 주문일별 {total(정상 주문수량), gift(그중 사은품), returns(반품·교환·취소), gift_items, items}.
-    '이슈' 열에 '사은품' 이 있으면 사은품 행(주문금액 0). 주문상태 '정상' 만 출고로 본다."""
+    """도착보장 주문 관리 목록(manageList_*.xlsx) → 주문일별 집계.
+    {total(정상 주문수량), gift(그중 사은품), returns(반품·교환·취소 수량), gift_items, items(상품별 수량),
+     listings({쇼핑몰 상품코드: {qty, pay}} — 리스팅별, 상품 목록과 연결), orders(주문 건수), buyers(구매자 수),
+     repeat(그중 자료 범위 안에서 이전에 산 적 있는 구매자 수), amt(주문금액), pay(결제 금액), disc(할인금액), return_orders}
+    '이슈' 열에 '사은품' 이 있으면 사은품 행(주문금액 0). 주문상태 '정상' 만 출고로 본다.
+    주문자 ID 는 재구매 수 계산에만 쓰고 저장하지 않는다."""
     days: dict = {}
+    order_ids: dict = defaultdict(set); buyer_ids: dict = defaultdict(set); ret_orders: dict = defaultdict(set)
+    first_seen: dict = {}
     for r in df.itertuples(index=False):
         rec = dict(zip(df.columns, r))
         ts = rec.get("주문일시")
@@ -78,18 +94,74 @@ def _parse_order_list(df) -> dict:
             continue
         if q <= 0:
             continue
-        e = days.setdefault(d, {"total": 0, "gift": 0, "returns": 0, "gift_items": {}, "items": {}})
+        e = days.setdefault(d, {"total": 0, "gift": 0, "returns": 0, "gift_items": {}, "items": {}, "listings": {},
+                                "orders": 0, "buyers": 0, "repeat": 0, "amt": 0.0, "pay": 0.0, "disc": 0.0, "return_orders": 0})
         status = str(rec.get("주문상태") or "").strip()
+        oid = str(rec.get("주문번호") or "").strip()
         if status != "정상":
             e["returns"] += q
+            if oid and oid != "nan":
+                ret_orders[d].add(oid)
             continue
         e["total"] += q
         nm = str(rec.get("상품명") or "").strip()
         e["items"][nm] = e["items"].get(nm, 0) + q          # 상품별 정상 주문수량 (사은품 포함) — 출고 집계의 원천
+        pay = _num(rec.get("결제 금액")); e["amt"] += _num(rec.get("주문금액")); e["pay"] += pay; e["disc"] += _num(rec.get("할인금액"))
+        code = rec.get("쇼핑몰 상품코드")
+        code = "" if code is None or (isinstance(code, float) and code != code) else str(code).strip()
+        if code.replace(".", "", 1).isdigit():
+            code = str(int(float(code)))
+        if code and code != "nan":
+            le = e["listings"].setdefault(code, {"qty": 0, "pay": 0.0})
+            le["qty"] += q; le["pay"] += pay
+        if oid and oid != "nan":
+            order_ids[d].add(oid)
+        bid = str(rec.get("주문자ID") or "").strip()
+        if bid and bid != "nan":
+            buyer_ids[d].add(bid)
+            if bid not in first_seen or d < first_seen[bid]:
+                first_seen[bid] = d
         if "사은품" in str(rec.get("이슈") or ""):
             e["gift"] += q
             e["gift_items"][nm] = e["gift_items"].get(nm, 0) + q
+    for d, e in days.items():
+        e["orders"] = len(order_ids[d]); e["buyers"] = len(buyer_ids[d])
+        e["repeat"] = sum(1 for bid in buyer_ids[d] if first_seen.get(bid, d) < d)
+        e["return_orders"] = len(ret_orders[d])
+        for k in ("amt", "pay", "disc"):
+            e[k] = int(round(e[k]))
+        for le in e["listings"].values():
+            le["pay"] = int(round(le["pay"]))
     return days
+
+
+# ── 스마트스토어 상품 목록 (판매자센터 > 상품관리 > 상품 목록 다운로드, Product_*.csv)
+_PRODUCT_COLS = ["상품번호(스마트스토어)", "상품명", "판매상태", "재고수량", "판매가", "할인가"]
+_BUNDLE_RE = re.compile(r"\+|세트|묶음|[xX×]\s*\d|\(\d+\s*개|증정|팩")   # 리스팅명으로 묶음·세트 판정
+
+
+def _is_product_list(df) -> bool:
+    return all(c in df.columns for c in _PRODUCT_COLS)
+
+
+def _parse_product_list(df) -> dict:
+    """→ {상품번호: {name, status(판매중/품절/판매중지/판매종료), display, stock(리스팅 재고수량), price, sale_price, updated, fulfil}}"""
+    out = {}
+    for r in df.itertuples(index=False):
+        rec = dict(zip(df.columns, r))
+        code = str(rec.get("상품번호(스마트스토어)") or "").strip()
+        if not code or code == "nan":
+            continue
+        code = code.split(".")[0]
+        out[code] = {"name": str(rec.get("상품명") or "").strip(), "status": str(rec.get("판매상태") or "").strip(),
+                     "display": str(rec.get("전시상태") or "").strip(), "stock": int(_num(rec.get("재고수량"))),
+                     "price": int(_num(rec.get("판매가"))), "sale_price": int(_num(rec.get("할인가"))),
+                     "updated": str(rec.get("최종수정일") or "")[:19], "fulfil": str(rec.get("풀필먼트사") or "").strip()}
+    return out
+
+
+def _products() -> dict:
+    return _load_json(PRODUCTS_PATH, {"items": {}, "filename": "", "uploaded_at": ""})
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -223,6 +295,7 @@ def _build_history(by_day: dict, month: str, n: int = 4, eff_to: str = "", order
         out.append({"ym": ym, "label": f"{int(ym[5:7])}월", "qty": (sum(by_day[d] for d in days) if days else None),
                     "gift": (sum(order_days[d]["gift"] for d in odays) if covered else None),
                     "gift_total": (sum(order_days[d]["total"] for d in odays) if covered else None),   # 주문 목록 기준 전체(대조용)
+                    "pay": (sum(order_days[d].get("pay", 0) for d in odays) if covered else None),      # 결제 금액(VAT 포함, 취소·반품 제외)
                     "order_days": len(odays), "gift_partial": bool(odays) and not covered})
     return out
 
@@ -343,6 +416,50 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
                 return tot, "bh"
         return None, ""
 
+    # 소비자 반응 근거 — 주문 관리 목록(신형 집계 키가 있는 날만) 창별 합계
+    odays = {d: v for d, v in order_days.items() if "orders" in v}
+    prods = _products(); pitems = prods.get("items") or {}
+
+    def owin(d1: str, d2: str) -> dict:
+        ds = [d for d in odays if d1 <= d <= d2]
+        w = {k: sum(odays[d].get(k, 0) for d in ds) for k in ("total", "gift", "returns", "orders", "buyers", "repeat", "amt", "pay", "disc", "return_orders")}
+        lq: dict = defaultdict(int)
+        for d in ds:
+            for c, le in odays[d].get("listings", {}).items():
+                lq[c] += le["qty"]
+        w["listings"] = dict(lq); w["days"] = len(ds)
+        o = w["orders"]
+        w["pay_per_order"] = round(w["pay"] / o) if o else None
+        w["qty_per_order"] = round(w["total"] / o, 1) if o else None
+        w["disc_rate"] = round(w["disc"] / w["amt"] * 100, 1) if w["amt"] else None
+        w["repeat_rate"] = round(w["repeat"] / w["buyers"] * 100, 1) if w["buyers"] else None
+        w["return_rate"] = round(w["returns"] / (w["total"] + w["returns"]) * 100, 1) if (w["total"] + w["returns"]) else None
+        w["gift_share"] = round(w["gift"] / w["total"] * 100, 1) if w["total"] else None
+        bt = sum(lq.values())
+        w["bundle_share"] = (round(sum(q for c, q in lq.items() if c in pitems and _BUNDLE_RE.search(pitems[c]["name"])) / bt * 100, 1)
+                             if (bt and pitems) else None)
+        return w
+
+    if data_to:
+        e28 = datetime.fromisoformat(eff_to).date()
+        w28 = owin((e28 - timedelta(days=27)).isoformat(), eff_to)
+        stockout = sorted([{"code": c, "name": pitems[c]["name"], "status": pitems[c]["status"], "qty": q}
+                           for c, q in w28["listings"].items() if c in pitems and pitems[c]["status"] in ("품절", "판매중지", "판매종료")],
+                          key=lambda x: -x["qty"])
+    else:
+        w28 = None; stockout = []
+    st_cnt: dict = defaultdict(int)
+    for v in pitems.values():
+        st_cnt[v["status"]] += 1
+    behavior = {
+        "has_detail": bool(odays), "has_products": bool(pitems),
+        "cur": owin(a14_from, a14_to) if data_to else None, "prev": owin(p14_from, p14_to) if data_to else None,
+        "month": owin(m_from, m_to), "prev_month": owin(p_from, p_to),
+        "stockout": stockout[:5], "stockout_count": len(stockout), "stockout_qty": sum(x["qty"] for x in stockout),
+        "stockout_share": (round(sum(x["qty"] for x in stockout) / sum(w28["listings"].values()) * 100) if (w28 and sum(w28["listings"].values())) else None),
+        "listing_status": dict(st_cnt), "products_at": prods.get("uploaded_at", ""), "products_file": prods.get("filename", ""),
+    }
+
     # 품목별
     labels = sorted({r["label"] for r in out} | set(name_of_label), key=lambda lb: -rng_sum(m_from, m_to, lb))
     rows = []
@@ -384,7 +501,9 @@ def _build_summary(as_of: str, month: str, refresh: bool = False) -> dict:
         "avg14": round(q14_all / 14, 1), "avg14_prev": round(p14_all / 14, 1), "pct14": _pct(q14_all, p14_all),
         "last_day": last_day, "last_day_md": (f"{int(last_day[5:7])}/{int(last_day[8:10])}" if last_day else ""),
         "last_day_qty": last_day_qty, "last_day_top": last_day_top,
-        "weeks": weeks, "rows": rows,
+        "weeks": weeks, "rows": rows, "behavior": behavior,
+        "month_pay": behavior["month"]["pay"], "prev_month_pay": behavior["prev_month"]["pay"],
+        "q14_pay": (behavior["cur"] or {}).get("pay", 0), "p14_pay": (behavior["prev"] or {}).get("pay", 0),
         "stock_basis": ("ob" if ob_connected else ("bh" if bh else "")), "ob_connected": ob_connected, "bh_connected": bool(bh),
         "uploads": st["uploads"], "notes": st.get("notes", ""),
         "daily": [{"date": d, "qty": by_day[d]} for d in sorted(by_day) if d >= (datetime.fromisoformat(eff_to).date() - timedelta(days=59)).isoformat()] if data_to else [],
@@ -416,7 +535,7 @@ def _render_text(s: dict) -> str:
         L.append("* 박스히어로 거래 내역이 아직 업로드되지 않았습니다")
         return "\n".join(L)
     if s["month_qty"]:
-        L.append(f"* {ml} 출고 {_n(s['month_qty'])}개 · 일평균 {_n(round(s['month_avg']))}개"
+        L.append(f"* {ml} 출고 {_n(s['month_qty'])}개" + (f" · 결제 {_won(s['month_pay'])}" if s.get("month_pay") else "") + f" · 일평균 {_n(round(s['month_avg']))}개"
                  + (f" ({pl} 일평균 {_n(round(s['prev_avg']))}개 대비 {_pct_txt(s['month_pct'])[1:-1]})" if s["prev_avg"] and s["month_pct"] is not None else ""))
     else:
         L.append(f"* {ml} 출고 없음")
@@ -426,10 +545,15 @@ def _render_text(s: dict) -> str:
     if ph and ph.get("qty"):
         pct = f" · 전월 대비 {_pct_txt(_pct(ph['qty'], pph['qty']))[1:-1]}" if (pph and pph.get("qty")) else ""
         gift = f" · 사은품 {_n(ph['gift'])}개 포함" if ph.get("gift") else ""
-        L.append(f"* {ph['label']} 마감 — 출고 {_n(ph['qty'])}개{pct}{gift}")
+        pay = ""
+        if ph.get("pay"):
+            pp = (pph or {}).get("pay")
+            pay = f" · 결제 {_won(ph['pay'])}" + (f" ({_pct_txt(_pct(ph['pay'], pp))[1:-1]})" if pp else "")
+        L.append(f"* {ph['label']} 마감 — 출고 {_n(ph['qty'])}개{pct}{pay}{gift}")
     if s.get("q14"):
         rng = f"{int(s['a14_from'][5:7])}/{int(s['a14_from'][8:10])}~{int(s['a14_to'][5:7])}/{int(s['a14_to'][8:10])}"
-        L.append(f"* 최근 14일({rng}) 일평균 {_n(round(s['avg14']))}개" + (f" · 직전 14일 대비 {_pct_txt(s['pct14'])}" if s["pct14"] is not None else ""))
+        L.append(f"* 최근 14일({rng}) 일평균 {_n(round(s['avg14']))}개" + (f" · 직전 14일 대비 {_pct_txt(s['pct14'])}" if s["pct14"] is not None else "")
+                 + (f" · 결제 {_won(s['q14_pay'])}" + (f" ({_pct_txt(_pct(s['q14_pay'], s['p14_pay']))[1:-1]})" if s.get("p14_pay") else "") if s.get("q14_pay") else ""))
     if s["last_day"]:
         L.append(f"* 마지막 주문일 {s['last_day_md']} — {_n(s['last_day_qty'])}개" + (f" · {s['last_day_top']}" if s["last_day_top"] else ""))
     if s.get("gift_month"):
@@ -454,6 +578,58 @@ def _render_text(s: dict) -> str:
                 else:
                     line += f" · 재고 {_n(st)}개 (" + ("90일 이상" if d > 90 else f"{d:g}일분") + (" · 부족" if d < 7 else "") + ")"
             L.append(line)
+
+    # 소비자 반응 근거 — 최근 14일 vs 직전 14일 (주문 관리 목록의 주문 건수·구매자·결제·할인·반품 + 상품 목록의 리스팅 상태)
+    bh = s.get("behavior") or {}
+    cur, prev = bh.get("cur"), bh.get("prev")
+    if bh.get("has_detail") and cur and cur.get("orders"):
+        rng = f"{int(s['a14_from'][5:7])}/{int(s['a14_from'][8:10])}~{int(s['a14_to'][5:7])}/{int(s['a14_to'][8:10])}"
+        L += ["", f"■ 소비자 반응 근거 ({rng} vs 직전 14일 · 도착보장 주문 관리 목록)"]
+        pv = prev or {}
+
+        def vs(cur_v, prev_v, fmt=lambda v: f"{v:g}%"):
+            return (f" (직전 {fmt(prev_v)})" if prev_v is not None else "")
+
+        L.append(f"* 주문 {_n(cur['orders'])}건 {_pct_txt(_pct(cur['orders'], pv.get('orders')))}".rstrip()
+                 + f" · 구매자 {_n(cur['buyers'])}명"
+                 + (f" · 재구매 {cur['repeat_rate']:g}%" + vs(cur['repeat_rate'], pv.get('repeat_rate')) if cur.get("repeat_rate") is not None else ""))
+        L.append(f"* 객단가 {_n(cur['pay_per_order'])}원" + vs(cur['pay_per_order'], pv.get('pay_per_order'), lambda v: f"{_n(v)}원")
+                 + f" · 건당 {cur['qty_per_order']:g}개" + vs(cur['qty_per_order'], pv.get('qty_per_order'), lambda v: f"{v:g}개")
+                 + (f" · 할인율 {cur['disc_rate']:g}%" + vs(cur['disc_rate'], pv.get('disc_rate')) if cur.get("disc_rate") is not None else ""))
+        rline = f"* 반품·취소·교환 {_n(cur['return_orders'])}건 · {_n(cur['returns'])}개"
+        if cur.get("return_rate") is not None:
+            rline += f" ({cur['return_rate']:g}%" + (f", 직전 {pv['return_rate']:g}%" if pv.get("return_rate") is not None else "") + ")"
+        if cur.get("gift_share"):
+            rline += f" · 사은품 비중 {cur['gift_share']:g}%" + vs(cur['gift_share'], pv.get('gift_share'))
+        L.append(rline)
+        if cur.get("bundle_share") is not None:
+            L.append(f"* 묶음·세트 비중 {cur['bundle_share']:g}% (수량 기준)" + vs(cur['bundle_share'], pv.get('bundle_share')))
+        if bh.get("has_products"):
+            ls = bh.get("listing_status") or {}
+            so = bh.get("stockout") or []
+            line = f"* 리스팅 판매중 {ls.get('판매중', 0)} · 품절 {ls.get('품절', 0)} · 판매중지 {ls.get('판매중지', 0)}"
+            if so:
+                short = lambda nm: re.sub(r"디제이앤에이\s*|영양 건강 간식 야채칩\s*|아보카도오일 팝콘\s*", "", nm).strip()[:24]
+                share = f", 28일 판매의 {bh['stockout_share']}%" if bh.get("stockout_share") else ""
+                line += f" — 최근 28일 판매 있던 품절·중지 {bh['stockout_count']}개 ({_n(bh['stockout_qty'])}개{share}): " + " · ".join(f"{short(x['name'])} {_n(x['qty'])}" for x in so[:3])
+            L.append(line)
+        # 판정 — 숫자에서 바로 읽히는 것만
+        hints = []
+        op = _pct(cur["orders"], pv.get("orders")); pp = _pct(cur.get("pay_per_order") or 0, pv.get("pay_per_order") or 0)
+        if op is not None and op <= -15 and pp is not None and abs(pp) <= 10:
+            hints.append("주문 건수 감소가 주도, 객단가는 유지 → 유입·전환 약화")
+        elif op is not None and op >= 15 and pp is not None and abs(pp) <= 10:
+            hints.append("주문 건수 증가가 주도, 객단가 유지 → 유입 확대")
+        if cur.get("disc_rate") is not None and pv.get("disc_rate") is not None and cur["disc_rate"] - pv["disc_rate"] <= -3:
+            hints.append(f"할인율 축소({pv['disc_rate']:g}% → {cur['disc_rate']:g}%)와 겹침")
+        if cur.get("disc_rate") is not None and pv.get("disc_rate") is not None and cur["disc_rate"] - pv["disc_rate"] >= 2 and op is not None and op <= -15:
+            hints.append(f"할인율은 커졌는데({pv['disc_rate']:g}% → {cur['disc_rate']:g}%) 주문은 줄어 가격보다 유입 문제")
+        if cur.get("repeat_rate") is not None and pv.get("repeat_rate") is not None and cur["repeat_rate"] - pv["repeat_rate"] >= 3:
+            hints.append(f"재구매 비중 상승({pv['repeat_rate']:g}% → {cur['repeat_rate']:g}%) → 신규 구매자 유입 감소")
+        if bh.get("stockout_qty"):
+            hints.append(f"품절·판매중지 리스팅이 최근 28일 판매의 {bh.get('stockout_share') or 0}%({_n(bh['stockout_qty'])}개) → 행사 종료·품절에 따른 기회손실")
+        if hints:
+            L.append("* 판정: " + " / ".join(hints))
 
     # 주별 추이 (최근 6주)
     wk = [w for w in s["weeks"] if w["qty"]][-6:]
@@ -562,10 +738,30 @@ async def upload(files: list[UploadFile] = File(...)):
     for f in files:
         data = await f.read()
         # 1) 도착보장 주문 관리 목록(manageList_*.xlsx) — 사은품 분리용. 같은 날짜 범위는 새 파일로 교체(재업로드 중복 방지)
+        low = (f.filename or "").lower()
         try:
-            df0 = pd.read_excel(io.BytesIO(data), sheet_name=0)
+            if low.endswith(".csv"):
+                try:
+                    df0 = pd.read_csv(io.BytesIO(data), encoding="utf-8-sig")
+                except UnicodeDecodeError:
+                    df0 = pd.read_csv(io.BytesIO(data), encoding="cp949")
+            else:
+                df0 = pd.read_excel(io.BytesIO(data), sheet_name=0)
         except Exception as e:
             errors.append(f"{f.filename}: 읽기 오류 {str(e)[:80]}")
+            continue
+        # 0) 스마트스토어 상품 목록 (Product_*.csv) — 리스팅 상태·가격·재고. 통째로 교체
+        if _is_product_list(df0):
+            items = _parse_product_list(df0)
+            if not items:
+                errors.append(f"{f.filename}: 상품 행이 없습니다")
+                continue
+            _save_json(PRODUCTS_PATH, {"items": items, "filename": f.filename, "uploaded_at": now})
+            st["uploads"].append({"filename": f.filename, "uploaded_at": now, "rows": len(items), "added": len(items), "type": "products"})
+            cnt = defaultdict(int)
+            for v in items.values():
+                cnt[v["status"]] += 1
+            added_files.append({"filename": f.filename, "rows": len(items), "added": len(items), "type": "products", "status": dict(cnt)})
             continue
         if _is_order_list(df0):
             days = _parse_order_list(df0)
@@ -611,6 +807,7 @@ def clear_uploads():
     _save_json(STATE_PATH, st)
     _save_json(TX_PATH, [])
     _save_json(ORDERS_PATH, {"days": {}, "files": []})
+    _save_json(PRODUCTS_PATH, {"items": {}, "filename": "", "uploaded_at": ""})
     return {"ok": True}
 
 

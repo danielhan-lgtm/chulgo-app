@@ -206,8 +206,8 @@ export default function NaverReport() {
         <span className="hint">기준일</span>
         <DatePicker value={dayjs(asOf)} onChange={d => { if (d) { setTextDirty(false); setAsOf(d.format('YYYY-MM-DD')) } }} allowClear={false} />
         <Button icon={<ReloadOutlined />} onClick={() => { setTextDirty(false); reload(true) }} loading={loading}>새로고침</Button>
-        <Upload accept=".xlsx,.xls" multiple showUploadList={false} beforeUpload={queueUpload}>
-          <Tooltip title="도착보장 주문 관리 목록 manageList_*.xlsx (출고·사은품·반품 집계의 기준). 박스히어로 거래 내역 xlsx 는 주문 목록이 없는 과거 기간 보완용. 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
+        <Upload accept=".xlsx,.xls,.csv" multiple showUploadList={false} beforeUpload={queueUpload}>
+          <Tooltip title="도착보장 주문 관리 목록 manageList_*.xlsx (출고·사은품·반품·결제·주문 건수 집계의 기준) + 스마트스토어 상품 목록 Product_*.csv (리스팅 판매상태·가격·재고, 소비자 반응 근거용). 박스히어로 거래 내역 xlsx 는 주문 목록이 없는 과거 기간 보완용. 누적 파일을 다시 올려도 중복은 자동 제거됩니다.">
             <Button icon={<UploadOutlined />} loading={uploading}>거래 내역 · 주문 목록 업로드</Button>
           </Tooltip>
         </Upload>

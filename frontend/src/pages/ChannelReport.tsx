@@ -126,7 +126,8 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   const [incQty, setIncQty] = useState<number | null>(null)
   const [incDate, setIncDate] = useState<string>(dayjs().add(2, 'day').format('YYYY-MM-DD'))
   const [incMemo, setIncMemo] = useState('')
-  const [uploadPeriod, setUploadPeriod] = useState(dayjs().format('YYYY-MM'))
+  // 올리브영 매출·재고 파일의 포털 매출조회기간 (시작일~종료일). 기본은 최근 30일~오늘
+  const [uploadRange, setUploadRange] = useState<[string, string]>([dayjs().subtract(30, 'day').format('YYYY-MM-DD'), dayjs().format('YYYY-MM-DD')])
   const [incSaving, setIncSaving] = useState(false)
   const pendingFiles = useRef<File[]>([])
   const uploadTimer = useRef<number | null>(null)
@@ -201,7 +202,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
       const files = pendingFiles.current.splice(0)
       setUploading(true)
       try {
-        const res = await uploadCoupangReportFiles(files, B, cfg.monthly ? uploadPeriod : undefined)
+        const res = await uploadCoupangReportFiles(files, B, cfg.monthly ? uploadRange : undefined)
         res.errors.forEach(e => message.error(e))
         if (res.added.length) message.success(`${res.added.map(a => a.filename).join(', ')} 반영`)
         await reload()
@@ -333,8 +334,9 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
             <Button icon={<ReloadOutlined />} loading={loading} onClick={() => { setTextDirty(false); load(true) }}>새로고침</Button>
           </Tooltip>
           {cfg.monthly && (
-            <Tooltip title="업로드하는 매출·재고 파일이 어느 달 것인지">
-              <DatePicker picker="month" value={dayjs(uploadPeriod + '-01')} allowClear={false} onChange={d => d && setUploadPeriod(d.format('YYYY-MM'))} style={{ width: 110 }} />
+            <Tooltip title="올리브영 포털에서 조회한 '매출조회기간' 시작일~종료일. 매출은 이 기간 합계, 재고는 종료일 시점으로 봅니다">
+              <DatePicker.RangePicker value={[dayjs(uploadRange[0]), dayjs(uploadRange[1])]} allowClear={false}
+                onChange={v => { if (v && v[0] && v[1]) setUploadRange([v[0].format('YYYY-MM-DD'), v[1].format('YYYY-MM-DD')]) }} style={{ width: 240 }} />
             </Tooltip>
           )}
           {!cfg.noUpload && (
@@ -459,7 +461,7 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                 <h3>■ {cfg.name} {cfg.monthly ? '매출·재고 현황' : '판매·재고 추이'}
                   <span className="sub">
                     {cfg.monthly
-                      ? (data.uploads.months?.length ? `업로드 월: ${data.uploads.months.join(', ')}${data.trend.period_label ? ` · 최신 ${data.trend.period_label}` : ''}` : '매출·재고 파일 미업로드')
+                      ? (data.uploads.periods?.length ? `조회기간: ${data.uploads.periods.map(p => p.label).join(', ')}${data.trend.period_label ? ` · 최신 ${data.trend.period_label}` : ''}` : '매출·재고 파일 미업로드')
                       : <>{data.trend.has_rocket ? `판매 리포트 ${data.uploads.rocket_range?.[0]} ~ ${data.uploads.rocket_range?.[1]} (${data.uploads.rocket_days}일)` : '판매 리포트 미업로드'}
                          {data.trend.has_forecast ? ` · 예측 ${data.uploads.forecast?.weeks?.[0]?.from}~ (${data.uploads.forecast?.weeks?.length}주)` : ' · 예측 미업로드'}</>}
                   </span>
@@ -475,16 +477,16 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                   <>
                     <div className="hint" style={{ marginBottom: 6 }}>
                       {data.trend.period_label} 매출 <b>{n(data.trend.total_sales)}</b>개 · 공급가(행사원가) <b>{won(data.trend.total_amount)}</b>
-                      {data.trend.total_sales_prev != null ? ` · 전월 ${n(data.trend.total_sales_prev)}개` : ''} · 일평균은 경과 {data.trend.elapsed_days}일 기준
+                      {data.trend.total_sales_prev != null ? ` · 전 기간(${data.trend.prev_label}) ${n(data.trend.total_sales_prev)}개` : ''} · 일평균은 조회기간 {data.trend.elapsed_days}일 기준
                     </div>
                     <table>
                       <thead><tr>
                         <th>품목</th>
-                        <th>{(data.trend.months || []).map(m => m.slice(5) + '월').join(' → ')} 매출</th>
-                        <th className="num">이달 매출</th>
+                        <th>{(data.trend.periods || []).map(p => p.label).join(' → ')} 매출</th>
+                        <th className="num">{data.trend.period_label} 매출</th>
                         <th className="num">매장 / 온라인</th>
                         <th className="num">일평균</th>
-                        <th className="num">전월 대비</th>
+                        <th className="num">전 기간 대비</th>
                         <th className="num">재고 센터 / 매장</th>
                         <th className="num">재고일수</th>
                         <th className="num">매출액</th>

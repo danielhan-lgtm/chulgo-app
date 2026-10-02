@@ -953,9 +953,11 @@ def _parse_oy_monthly(df: pd.DataFrame) -> dict:
 def _upload_meta(sp: ChannelSpec, up: dict) -> dict:
     days = sorted((up.get("rocket") or {}).keys())
     fc = up.get("forecast") or None
-    months = sorted((up.get("monthly") or {}).keys())
+    today = date.today().isoformat()
+    months = sorted((up.get("monthly") or {}).keys(), key=lambda k: (_period_bounds(k, today)[1], _period_bounds(k, today)[0]))
     return {
         "mode": sp.upload_mode,
+        "periods": [{"key": k, "label": _period_bounds(k, today)[3]} for k in months],
         "rocket_days": len(days), "rocket_range": [days[0], days[-1]] if days else None,
         "forecast": ({"filename": fc.get("filename"), "uploaded_at": fc.get("uploaded_at"),
                       "weeks": fc.get("weeks")} if fc else None),
@@ -1661,21 +1663,34 @@ def _build_trend_daily(up: dict, amap: dict) -> dict:
             "period_label": (f"{_md(days[0])}~{_md(days[-1])}" if days else "")}
 
 
-def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
-    """올리브영: 월별 매출(매장/온라인/계)·재고(센터/매장) 스냅샷. 최신 월(보통 이달 MTD) 기준 일평균·재고일수."""
-    monthly = up.get("monthly") or {}
-    months = sorted(monthly.keys())
-    if not months:
-        return {"mode": "monthly", "days": [], "months": [], "weeks": [], "rows": [],
-                "has_rocket": False, "has_forecast": False, "period_label": ""}
-    latest = months[-1]
-    # 최신 월의 경과 일수 (이달이면 기준일까지, 지난 달이면 그 달 일수)
-    if latest == as_of[:7]:
-        elapsed = max(1, int(as_of[8:10]))
+def _period_bounds(key: str, as_of: str) -> tuple:
+    """업로드 키 → (from, to, days, label).
+    'YYYY-MM-DD~YYYY-MM-DD' 는 올리브영 포털의 매출조회기간 그대로. 옛 'YYYY-MM' 키는 그 달 1일~말일(이달이면 기준일)로 본다."""
+    if "~" in key:
+        f, t = key.split("~", 1)
     else:
-        y, m = int(latest[:4]), int(latest[5:7])
-        nxt = datetime(y + (m // 12), (m % 12) + 1, 1)
-        elapsed = (nxt - timedelta(days=1)).day
+        f = key + "-01"
+        y, m = int(key[:4]), int(key[5:7])
+        last = (datetime(y + (m // 12), (m % 12) + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+        t = min(last, as_of) if key == as_of[:7] else last
+    try:
+        days = max(1, (datetime.fromisoformat(t) - datetime.fromisoformat(f)).days + 1)
+    except ValueError:
+        days = 1
+    return f, t, days, f"{_md(f)}~{_md(t)}"
+
+
+def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
+    """올리브영: 조회기간별 매출(매장/온라인/계)·재고(센터/매장) 스냅샷. 가장 최근 기간 기준 일평균(= 매출 ÷ 기간 일수)·재고일수.
+    기간은 담당자가 포털에서 조회한 시작일~종료일 그대로라 달력 월과 무관하고, 서로 겹쳐도 된다 (비교는 일평균끼리)."""
+    monthly = up.get("monthly") or {}
+    if not monthly:
+        return {"mode": "monthly", "days": [], "months": [], "periods": [], "weeks": [], "rows": [],
+                "has_rocket": False, "has_forecast": False, "period_label": ""}
+    bounds = {k: _period_bounds(k, as_of) for k in monthly}
+    months = sorted(monthly.keys(), key=lambda k: (bounds[k][1], bounds[k][0]))   # 종료일 순
+    latest = months[-1]
+    elapsed = bounds[latest][2]
     per_label: dict = defaultdict(lambda: {"sales": defaultdict(int), "sales_store": defaultdict(int), "sales_online": defaultdict(int),
                                            "amount": defaultdict(float), "retail": defaultdict(float), "stock_center": 0, "stock_store": 0,
                                            "cost": 0, "price": 0, "names": set(), "promo": ""})
@@ -1697,16 +1712,12 @@ def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
                 e["promo"] = v.get("promo") or e["promo"]
     rows = []
     prev = months[-2] if len(months) >= 2 else None
+    pdays = bounds[prev][2] if prev else None
     for lb, e in per_label.items():
         cur = e["sales"].get(latest, 0)
         avg = round(cur / elapsed, 1) if elapsed else 0
         stock_total = e["stock_center"] + e["stock_store"]
-        prev_avg = None
-        if prev:
-            y, m = int(prev[:4]), int(prev[5:7])
-            nxt = datetime(y + (m // 12), (m % 12) + 1, 1)
-            pdays = (nxt - timedelta(days=1)).day
-            prev_avg = round(e["sales"].get(prev, 0) / pdays, 1)
+        prev_avg = round(e["sales"].get(prev, 0) / pdays, 1) if prev else None
         rows.append({
             "label": lb, "names": sorted(e["names"]),
             "sales_series": [e["sales"].get(p, 0) for p in months],
@@ -1725,13 +1736,15 @@ def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
         })
     rows.sort(key=lambda x: -(x["sales_7d"] or 0))
     return {"mode": "monthly", "days": [], "months": months, "latest": latest, "elapsed_days": elapsed,
+            "periods": [{"key": k, "from": bounds[k][0], "to": bounds[k][1], "days": bounds[k][2], "label": bounds[k][3]} for k in months],
             "weeks": [], "rows": rows, "has_rocket": True, "has_forecast": False,
-            "period_label": f"{int(latest[5:7])}월" + (f" 1~{elapsed}일" if latest == as_of[:7] else ""),
+            "period_label": bounds[latest][3], "latest_from": bounds[latest][0], "latest_to": bounds[latest][1],
             "total_sales": sum(r["sales_7d"] for r in rows),
             "total_amount": sum(r["sales_amount"] for r in rows),
             "total_retail": sum(r["sales_retail"] for r in rows),
             "total_store": sum(r["sales_store"] for r in rows), "total_online": sum(r["sales_online"] for r in rows),
-            "prev": prev, "total_sales_prev": (sum(r["sales_series"][-2] for r in rows) if prev else None)}
+            "prev": prev, "prev_days": pdays, "prev_label": (bounds[prev][3] if prev else ""),
+            "total_sales_prev": (sum(r["sales_series"][-2] for r in rows) if prev else None)}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1903,7 +1916,7 @@ def _render_text_detail(sp: ChannelSpec, s: dict) -> str:
         if t.get("mode") == "monthly":
             L += ["", f"■ {ch} 판매 현황 ({t.get('period_label', '')} · {ch} 매장·온라인 소비자 판매)", ""]
             L.append(f"* 판매 {_n(t.get('total_sales'))}개 (매장 {_n(t.get('total_store'))} · 온라인 {_n(t.get('total_online'))}) · 소비자가 {_won(t.get('total_retail'))} (행사매가) · 공급가 {_won(t.get('total_amount'))} (행사원가)"
-                     + (f" · 전월 {_n(t.get('total_sales_prev'))}개" if t.get("total_sales_prev") is not None else ""))
+                     + (f" · 전 기간({t.get('prev_label')}) {_n(t.get('total_sales_prev'))}개" if t.get("total_sales_prev") is not None else ""))
             for r in t["rows"][:6]:
                 if not r["sales_7d"] and not r["stock_last"]:
                     continue
@@ -2022,17 +2035,15 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
             return (" · " + " · ".join(bits)) if bits else ""
 
         if t.get("mode") == "monthly":
-            pv = t.get("total_sales_prev"); el = t.get("elapsed_days") or 0; pm = t.get("prev") or ""
-            head = f"■ {ch} 판매 ({per}"
-            if pv and el and t.get("total_sales") and len(pm) >= 7:
-                import calendar
-                pdays = calendar.monthrange(int(pm[:4]), int(pm[5:7]))[1]
+            pv = t.get("total_sales_prev"); el = t.get("elapsed_days") or 0; pdays = t.get("prev_days") or 0
+            head = f"■ {ch} 판매·재고 ({per} 일평균"
+            if pv and el and pdays and t.get("total_sales"):
                 pct = round(((t['total_sales'] / el) / (pv / pdays) - 1) * 100)
-                head += f" · 일평균 전월 대비 {'+' if pct > 0 else ''}{pct}%"
-            L += ["", head.replace(" 판매 (", " 판매·재고 (", 1) + ")"]
-            L.append(f"* 합계 {_n(t.get('total_sales'))}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전월 {_n(pv)}개)" if pv else ""))
+                head += f" · 전 조회기간({t.get('prev_label')}) 대비 {'+' if pct > 0 else ''}{pct}%"
+            L += ["", head + ")"]
+            L.append(f"* 합계 {_n(t.get('total_sales'))}개 · 일 {_n(round(t['total_sales'] / el)) if el else '-'}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전 기간 {_n(pv)}개)" if pv else ""))
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
-                L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
+                L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + f" · 기간 {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
         else:
             L += ["", f"■ {ch} 판매·재고 ({per} 일평균 · 전주 대비)"]
             for r in [x for x in t["rows"] if x["avg_7d"] or x.get("forecast_next")][:3]:
@@ -2289,12 +2300,19 @@ def make_router(sp: ChannelSpec) -> APIRouter:
                 "rows": rows, "labels": labels, "uploads": _upload_meta(sp, up)}
 
     @router.post("/upload")
-    async def upload_files(files: list[UploadFile] = File(...), period: str = Form("")):
-        """판매/재고 파일 업로드. 쿠팡: rocket csv / forecast xlsx. 올리브영: 상품별 매출_재고 xlsx (period=YYYY-MM 필수, 미지정 시 이달)."""
+    async def upload_files(files: list[UploadFile] = File(...), period: str = Form(""), from_date: str = Form(""), to_date: str = Form("")):
+        """판매/재고 파일 업로드. 쿠팡: rocket csv / forecast xlsx.
+        올리브영: 상품별 매출_재고 xlsx — 포털에서 조회한 매출조회기간 from_date~to_date 를 함께 보낸다 (키 'YYYY-MM-DD~YYYY-MM-DD').
+        옛 방식 period=YYYY-MM 도 받는다 (그 달 1일~말일로 간주)."""
         up = _load_uploads(sp)
         added, errors = [], []
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        period = (period or date.today().strftime("%Y-%m"))[:7]
+        if from_date and to_date:
+            if from_date > to_date:
+                from_date, to_date = to_date, from_date
+            period = f"{from_date[:10]}~{to_date[:10]}"
+        else:
+            period = (period or date.today().strftime("%Y-%m"))[:7]
         for f in files:
             fname = f.filename or "file"
             data = await f.read()

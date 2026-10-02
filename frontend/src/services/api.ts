@@ -515,6 +515,7 @@ export interface OutboundTargetsBlock {
   teams?: string[]
   team_labels?: Record<string, string>
   months?: string[]
+  periods?: { key: string; label: string }[]   // 올리브영 조회기간 (종료일 순)
   uploaded_at?: string
   rows?: OutboundTargetRow[]
   totals_by_team?: Record<string, { target: number; actual: number }>
@@ -1292,7 +1293,7 @@ export interface CpTrendRow {
 }
 export interface CpIncoming { id: string; label: string; qty: number; date: string; md?: string; memo: string; applied?: boolean; unknown?: boolean }
 export interface CpUploads {
-  mode?: 'daily' | 'monthly'; months?: string[]
+  mode?: 'daily' | 'monthly'; months?: string[]; periods?: { key: string; label: string }[]
   rocket_days: number; rocket_range: [string, string] | null
   forecast: { filename: string; uploaded_at: string; weeks: { from: string; to: string }[] } | null
   files: { filename: string; uploaded_at: string; type: string; period?: string }[]
@@ -1318,7 +1319,7 @@ export interface CoupangReportSummary {
   ob_connected: boolean
   ob_error: string
   fulfil: { deliverable: number; shortage: number; need: number; rate: number; leftover: CpLabelQty[]; short_by_label: CpLabelQty[]; incoming: CpIncoming[]; incoming_total: number }
-  trend: { mode: 'daily' | 'monthly'; days: string[]; months?: string[]; latest?: string; elapsed_days?: number; period_label?: string; total_sales?: number; total_amount?: number; total_sales_prev?: number | null; weeks: { from: string; to: string }[]; rows: CpTrendRow[]; has_rocket: boolean; has_forecast: boolean }
+  trend: { mode: 'daily' | 'monthly'; days: string[]; months?: string[]; periods?: { key: string; from: string; to: string; days: number; label: string }[]; latest?: string; elapsed_days?: number; period_label?: string; prev_label?: string; prev_days?: number; total_sales?: number; total_amount?: number; total_sales_prev?: number | null; weeks: { from: string; to: string }[]; rows: CpTrendRow[]; has_rocket: boolean; has_forecast: boolean }
   uploads: CpUploads
   notes: string
   all_groups: { date: string; md: string; qty: number; amt: number; supply: number; status: string }[]
@@ -1343,10 +1344,10 @@ export const saveChannelMonthly = (monthly: CpMonthlyOverride, base: ChannelRepo
 export type ChannelReportBase = '/coupang-report' | '/oliveyoung-report' | '/kurly-report'
 export const getCoupangReport = (asOf?: string, month?: string, refreshBh = false, base: ChannelReportBase = '/coupang-report'): Promise<CoupangReportSummary> =>
   api.get(`${base}/summary`, { params: { as_of: asOf || '', month: month || '', refresh_bh: refreshBh ? 1 : 0 }, timeout: 180000 }).then(r => r.data)
-export const uploadCoupangReportFiles = (files: File[], base: ChannelReportBase = '/coupang-report', period?: string): Promise<{ added: { filename: string; type: string }[]; errors: string[]; uploads: CpUploads }> => {
+export const uploadCoupangReportFiles = (files: File[], base: ChannelReportBase = '/coupang-report', range?: [string, string]): Promise<{ added: { filename: string; type: string }[]; errors: string[]; uploads: CpUploads }> => {
   const fd = new FormData()
   files.forEach(f => fd.append('files', f, f.name))
-  if (period) fd.append('period', period)
+  if (range) { fd.append('from_date', range[0]); fd.append('to_date', range[1]) }   // 올리브영: 포털 매출조회기간
   return api.post(`${base}/upload`, fd, { timeout: 120000 }).then(r => r.data)
 }
 export const clearCoupangReportUploads = (base: ChannelReportBase = '/coupang-report'): Promise<{ ok: boolean }> =>
@@ -1446,6 +1447,8 @@ export interface SalesTrendRow {
 export interface SalesTrend {
   channel: string; mode: 'daily' | 'monthly'
   days: string[]; months: string[]; weeks: { from: string; to: string }[]
+  periods?: { key: string; from: string; to: string; days: number; label: string }[]
+  prev_label?: string
   period_label: string; latest?: string | null; elapsed_days?: number | null
   rows: SalesTrendRow[]
   labels: Record<string, string>   // 발주 캘린더 raw 상품명 → 라벨

@@ -434,6 +434,7 @@ def _channel_rows(sp: ChannelSpec) -> tuple[list, str]:
             if conf is None and sp.derive_conf_from_amt and amt and qty and recv_amt is not None:
                 # 올리브영 납품확인서: 원가금액 = 납품예정수량 × 원단가, 발주금액 = 발주수량 × 원단가
                 conf = int(round(recv_amt / (amt / qty)))
+            order_amt = amt   # 발주서 원금액 (월별 추이의 발주 금액용)
             if sp.qty_is_conf and conf is not None:
                 # 납품예정수량만 납품하므로 발주잔량·금액을 그 기준으로 (발주수량은 order_qty에 보관)
                 order_qty, qty = qty, conf
@@ -457,10 +458,11 @@ def _channel_rows(sp: ChannelSpec) -> tuple[list, str]:
                                  "conf": (None if conf is None else conf * k),
                                  "recv": (None if recv is None else recv * k),
                                  "amt": (None if amt is None else int(round(amt * share))),
+                                 "order_amt": (None if order_amt is None else int(round(order_amt * share))),
                                  "recv_amt": (None if recv_amt is None else int(round(recv_amt * share)))})
             else:
                 rows.append({**base, "name": name, "qty": qty, "order_qty": order_qty, "conf": conf, "recv": recv,
-                             "amt": amt, "recv_amt": recv_amt})
+                             "amt": amt, "order_amt": order_amt, "recv_amt": recv_amt})
     return rows, last_ingest
 
 
@@ -2001,14 +2003,22 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
             L.append(f"* {ml} 납품 실적 없음")
 
     # 1-1) 지난달 마감 — 발주 금액·수량과 납품(입고확정) 금액·수량 한 줄
-    prev_ym = _prev_months(s["month"], 2)[0]
-    ph = next((h for h in (s.get("history") or []) if h["ym"] == prev_ym), None)
+    prev_ym, prev2_ym = _prev_months(s["month"], 3)[1], _prev_months(s["month"], 3)[0]
+    hist_by = {h["ym"]: h for h in (s.get("history") or [])}
+    ph, pph = hist_by.get(prev_ym), hist_by.get(prev2_ym)
     if ph and (ph.get("order_qty") or ph.get("delivered")):
+        def closed(word, qty_key, sup_key):
+            """'발주 3,932만원 (8,331개 · 전월 대비 +10%)' — 금액이 있으면 금액으로, 없으면 수량으로 전월과 비교"""
+            q, a = ph.get(qty_key), ph.get(sup_key)
+            pq, pa = (pph or {}).get(qty_key), (pph or {}).get(sup_key)
+            base, pbase = (a, pa) if (a and has_amt) else (q, pq)
+            pct = f" · 전월 대비 {'+' if base > pbase else ''}{round((base - pbase) / pbase * 100)}%" if (base and pbase) else ""
+            return f"{word} " + (f"{_won(a)} ({_n(q)}개{pct})" if (a and has_amt) else f"{_n(q)}개{(' (' + pct[3:] + ')') if pct else ''}")
         bits = []
         if ph.get("order_qty"):
-            bits.append("발주 " + (amt_qty(ph.get("order_supply"), ph["order_qty"]) if ph.get("order_supply") else f"{_n(ph['order_qty'])}개"))
+            bits.append(closed("발주", "order_qty", "order_supply"))
         if ph.get("delivered"):
-            bits.append(f"{sp.recv_word if sp.has_recv else '납품'} " + (amt_qty(ph.get("recv_supply"), ph["delivered"]) if ph.get("recv_supply") else f"{_n(ph['delivered'])}개"))
+            bits.append(closed(sp.recv_word if sp.has_recv else "납품", "delivered", "recv_supply"))
         L.append(f"* {ph['label']} 마감 — " + " · ".join(bits))
 
     # 2) 남은 발주
@@ -2111,8 +2121,11 @@ def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_month
         # 발주 수량의 귀속 월: 기본은 납기월. history_by_order_date 채널(올리브영)은 발주일 월 (없는 행은 납기월로 폴백)
         oym = ((r.get("order_date") or "")[:7] if sp.history_by_order_date else "") or ym
         agg[oym]["order_qty"] += int(r.get("order_qty", r["qty"]) or 0)
-        if r.get("amt") is not None:
-            agg[oym]["order_supply"] += int(r["amt"]) / vat   # 발주 금액 → 공급가
+        oamt = r.get("order_amt")
+        if oamt is None:   # 단가표로 금액을 나중에 채우는 채널(컬리)은 amt 만 있다
+            oamt = r.get("amt")
+        if oamt is not None:
+            agg[oym]["order_supply"] += int(oamt) / vat   # 발주서 원금액 → 공급가
         a = agg[ym]
         if r.get("recv") is not None:
             a["recv"] += int(r["recv"]); a["recv_n"] += 1
@@ -2140,6 +2153,9 @@ def _build_history(sp: ChannelSpec, rows: list, month: str, n: int = 4, bh_month
                "order_qty": a["order_qty"] or None, "delivered": auto_recv, "override": False,
                "order_supply": (int(round(a["order_supply"])) or None),
                "recv_supply": (int(round(a["recv_supply"])) if a["recv_n"] else None)}
+        if row["recv_supply"] is None and not sp.has_recv and auto_recv and a["order_qty"] and a["order_supply"]:
+            # 입고확정이 없는 채널(컬리): 납품 = BH 출고 수량이라 금액이 따로 없다 → 그 달 발주 평균 공급단가 × 출고 수량으로 추정
+            row["recv_supply"] = int(round(auto_recv * a["order_supply"] / a["order_qty"]))
         for k in ("order_qty", "delivered"):
             if o.get(k) is not None:
                 row[k] = int(o[k]); row["override"] = True

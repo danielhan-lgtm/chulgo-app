@@ -2015,28 +2015,18 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
     if (t.get("has_rocket") or t.get("has_forecast")) and t.get("rows"):
         per = t.get("period_label", "")
 
-        deliv = {d["label"]: d["qty"] for d in (dv.get("delivered_by_label") or [])}   # 이달 쿠팡 납품(입고) 수량
+        deliv = {d["label"]: d["qty"] for d in (dv.get("delivered_by_label") or [])}   # 이달 쿠팡 출고 수량
 
-        def weekly_txt(r):
-            """최근 4주 주간 판매 합계 — '9,800 → 8,900 → 7,400 → 7,100' (오래된 주 → 최근 주)"""
-            ser = r.get("sales_series") or []
-            wk = [sum(ser[i:i + 7]) for i in range(len(ser) - 7, -1, -7)][:4][::-1]
-            return " → ".join(_n(w) for w in wk) if len(wk) >= 2 else ""
-
-        def stock_line(r):
-            """'  납품 10,000개 · 재고 33,500개 · 일 1,062개 → 31.5일분' — 우리 납품과 쿠팡 보유 재고를 한 줄에"""
-            st = r.get("stock_last")
+        def stock_tail(r):
+            """' · 재고 33,456개 (31.5일분) · 10월 출고 180개' — 재고·출고 정보가 없으면 빈 문자열"""
             bits = []
-            if deliv.get(r["label"]):
-                bits.append(f"{ml} 출고 {_n(deliv[r['label']])}개")
+            st = r.get("stock_last")
             if st is not None:
                 dos = r.get("days_of_supply")
-                avg = r.get("avg_7d") or (r["sales_7d"] / (t.get("elapsed_days") or 1) if r.get("sales_7d") else 0)
-                b = f"{ch} 재고 {_n(st)}개"
-                if dos is not None and avg:
-                    b += f" · 일 {_n(round(avg))}개 → {dos:g}일분" + (" — 부족" if dos < 7 else "")
-                bits.append(b)
-            return "  " + " · ".join(bits) if bits else ""
+                bits.append(f"재고 {_n(st)}개" + (f" ({dos:g}일분{' · 부족' if dos < 7 else ''})" if dos is not None else ""))
+            if deliv.get(r["label"]):
+                bits.append(f"{ml} 출고 {_n(deliv[r['label']])}개")
+            return (" · " + " · ".join(bits)) if bits else ""
 
         if t.get("mode") == "monthly":
             pv = t.get("total_sales_prev"); el = t.get("elapsed_days") or 0; pm = t.get("prev") or ""
@@ -2049,17 +2039,12 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
             L += ["", head + ")"]
             L.append(f"* 합계 {_n(t.get('total_sales'))}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전월 {_n(pv)}개)" if pv else ""))
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
-                L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})")
-                if (sl := stock_line(r)):
-                    L.append(sl)
+                L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))
         else:
-            L += ["", f"■ {ch} 판매·납품·재고 ({per} 일평균 · 전주 대비 · 주간 판매 추이)"]
+            L += ["", f"■ {ch} 판매·재고 ({per} 일평균 · 전주 대비)"]
             for r in [x for x in t["rows"] if x["avg_7d"] or x.get("forecast_next")][:3]:
                 if r["avg_7d"]:
-                    wk = weekly_txt(r)
-                    L.append(f"* {r['label']} — {_n(round(r['avg_7d']))}개/일 {_pct_txt(r['trend_pct'])}".rstrip() + (f" · 주간 {wk}" if wk else ""))
-                    if (sl := stock_line(r)):
-                        L.append(sl)
+                    L.append(f"* {r['label']} — 일 {_n(round(r['avg_7d']))}개 {_pct_txt(r['trend_pct'])}".rstrip() + stock_tail(r))
                 elif r.get("forecast_next") is not None:
                     L.append(f"* {r['label']} — 다음주 예측 {_n(round(r['forecast_next']))}개")
 

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 import utils_core as U
 from routers.channel_report import (
-    _DATA_DIR, _load_json, _save_json, _nkey, _n, _pct1, _bar, _top, _prev_months,
+    _DATA_DIR, _load_json, _save_json, _nkey, _n, _pct1, _top, _prev_months,
     _bh_stock_by_sku, _ob_available_by_name,
 )
 
@@ -400,36 +400,33 @@ def _render_text(s: dict) -> str:
     if s.get("stale_days") and s["stale_days"] >= 2:
         L.append(f"* 자료는 {s['last_day_md']} 주문분까지 반영 (박스히어로 거래 내역 재업로드 시 갱신)")
 
-    # 품목별 — 이번 달 상위 6종, 막대는 1위 대비
+    # 품목별 — 이번 달 상위 6종, 한 줄에 일평균(최근 14일) · 전월 일평균 대비 · 재고(며칠분). 막대 없음
     rows = [r for r in s["rows"] if r["month_qty"] > 0][:6]
+    use_month = bool(rows)
+    if not rows:   # 이달 출고가 아직 없으면(월초·자료 지연) 전월 출고 상위 품목으로
+        rows = sorted([r for r in s["rows"] if r["prev_qty"] > 0], key=lambda r: -r["prev_qty"])[:6]
     if rows:
-        top = rows[0]["month_qty"]
-        L += ["", f"■ 품목별 {ml} 출고 (전월 일평균 대비)"]
-        for r in rows:
-            line = f"* {r['label']} — {_n(r['month_qty'])}개 {_pct_txt(r['pct'])}".rstrip() + f"  {_bar(r['month_qty'] / top)}"
-            L.append(line)
-
-    # 재고 소진 예상일 — 재고가 붙는 품목만, 최근 14일 판매 속도 기준
-    # 이번 달 상위 품목 중 재고가 붙는 것만. 음수 재고(박스히어로 오차)는 '확인 필요'로, 90일 넘으면 숫자 대신 '90일 이상'
-    srows = [r for r in s["rows"] if r["month_qty"] > 0 and r.get("stock") is not None and r["avg14"] > 0][:6]
-    if srows:
         basis = "아워박스 가용재고" if s["stock_basis"] == "ob" else "박스히어로 재고"
-        L += ["", f"■ 재고 소진 예상일 ({basis} ÷ 최근 14일 일평균 · 막대 1칸 = 5일)"]
-        for r in sorted(srows, key=lambda r: (r["days_of_supply"] if r["stock"] >= 0 else -1)):
-            d = r["days_of_supply"]
-            if r["stock"] < 0 or d is None:
-                L.append(f"* {r['label']} — 재고 {_n(r['stock'])}개 · 확인 필요")
-                continue
-            dtxt = "90일 이상" if d > 90 else f"{d:g}일분"
-            L.append(f"* {r['label']} — 재고 {_n(r['stock'])}개 · {_n(round(r['avg14']))}개/일 → {dtxt}" + (" — 부족" if d < 7 else "") + f"  {_bar(d / 50)}")
+        L += ["", f"■ 네이버 판매·재고 ({ml if use_month else pl} 출고{' · 전월 일평균 대비' if use_month else ''} · 최근 14일 일평균 · {basis})"]
+        for r in rows:
+            line = (f"* {r['label']} — {_n(r['month_qty'])}개 {_pct_txt(r['pct'])}".rstrip() if use_month
+                    else f"* {r['label']} — {_n(r['prev_qty'])}개")
+            if r["avg14"] > 0:
+                line += f" · 일 {_n(round(r['avg14']))}개"
+            st = r.get("stock"); d = r.get("days_of_supply")
+            if st is not None:
+                if st < 0 or d is None:
+                    line += f" · 재고 {_n(st)}개 (확인 필요)"
+                else:
+                    line += f" · 재고 {_n(st)}개 (" + ("90일 이상" if d > 90 else f"{d:g}일분") + (" · 부족" if d < 7 else "") + ")"
+            L.append(line)
 
     # 주별 추이 (최근 6주)
     wk = [w for w in s["weeks"] if w["qty"]][-6:]
     if len(wk) >= 2:
-        top = max(w["qty"] for w in wk) or 1
         L += ["", "■ 주별 출고 (최근 6주)"]
         for w in wk:
-            L.append(f"* {w['md']} — {_n(w['qty'])}개" + (" (진행 중)" if w["partial"] else "") + f"  {_bar(w['qty'] / top)}")
+            L.append(f"* {w['md']} — {_n(w['qty'])}개" + (" (진행 중)" if w["partial"] else ""))
 
     notes = [ln.strip().lstrip("*-•■ ").strip() for ln in (s.get("notes") or "").splitlines() if ln.strip()]
     if notes:

@@ -1952,13 +1952,6 @@ def _pct_txt(tp) -> str:
 
 
 
-def _bar(ratio: float, width: int = 10) -> str:
-    """0~1 비율 → ▰▰▰▱▱ 막대 (네이버 보고에서 사용)"""
-    ratio = max(0.0, min(1.0, ratio or 0.0))
-    filled = width if ratio >= 1 else min(width - 1, int(ratio * width))
-    return "▰" * filled + "▱" * (width - filled)
-
-
 def _render_text(sp: ChannelSpec, s: dict) -> str:
     """슬랙 본문용 보고문 — 담당자가 직접 쓰던 양식(인사 1줄 · ■ 요약 · * 항목 · 마무리 1줄)을 그대로 따른다.
     이모지·특수 기호 없이, 요약 3줄(납품 / 남은 발주 / 진행률)과 채널 판매(막대 포함)만. 상세는 '상세' 양식으로."""
@@ -2036,7 +2029,7 @@ def _render_text(sp: ChannelSpec, s: dict) -> str:
                 pdays = calendar.monthrange(int(pm[:4]), int(pm[5:7]))[1]
                 pct = round(((t['total_sales'] / el) / (pv / pdays) - 1) * 100)
                 head += f" · 일평균 전월 대비 {'+' if pct > 0 else ''}{pct}%"
-            L += ["", head + ")"]
+            L += ["", head.replace(" 판매 (", " 판매·재고 (", 1) + ")"]
             L.append(f"* 합계 {_n(t.get('total_sales'))}개" + (f" · 소비자가 {_won(t.get('total_retail'))}" if has_amt else "") + (f" (전월 {_n(pv)}개)" if pv else ""))
             for r in [x for x in t["rows"] if x["sales_7d"] or x["stock_last"]][:4]:
                 L.append(f"* {r['label']} — {_n(r['sales_7d'])}개 (매장 {_n(r['sales_store'])} · 온라인 {_n(r['sales_online'])})" + stock_tail(r))

@@ -831,6 +831,7 @@ export type TraceCause = {
   memo?: string; channel?: string; ev_type?: string; partner?: string; desc: string
 }
 export type UnavEvent = { date: string; delta: number }
+export type TracePair = { bh: TraceEvent[]; ob: TraceEvent[]; qty: number; qty_diff?: number; day_gap: number; kind: string }
 export type StockDiffTrace = {
   name: string; from: string; to: string
   bh_stock: number | null; ob_total: number | null; ob_unav: number
@@ -840,6 +841,8 @@ export type StockDiffTrace = {
   causes: TraceCause[]
   matched_in: number; matched_out: number
   unmatched: { bh_in: TraceEvent[]; ob_in: TraceEvent[]; bh_out: TraceEvent[]; ob_out: TraceEvent[] }
+  matched_pairs?: { in: TracePair[]; out: TracePair[] }
+  cancelled?: { kind: string; qty: number; bh: TraceEvent[]; ob: TraceEvent[] }[]
   // 참고(−가용) 기준 분해: BH−OB가용 = (BH−OB총재고) + 가용외
   avail_basis?: {
     diff_avail: number | null; ob_unav: number
@@ -1338,6 +1341,18 @@ export interface CpHistoryRow { ym: string; label: string; order_qty: number | n
 export interface ChannelExecReport { as_of: string; as_of_md: string; month: string; text: string; channels: { key: string; name: string; text: string; history: unknown[] | null; error: string }[] }
 export const getChannelExecReport = (asOf?: string, month?: string): Promise<ChannelExecReport> =>
   api.get('/channel-report/exec', { params: { as_of: asOf || '', month: month || '' }, timeout: 300000 }).then(r => r.data)
+export interface ChannelSkuTrend {
+  as_of: string; month: string
+  months: { ym: string; label: string; current: boolean }[]
+  windows: { mtd: SkuWin; mtd_prev: SkuWin; w1: SkuWin; w0: SkuWin; day: number }   // 이달 비교 창 (같은 날짜 기준)
+  channels: { key: string; name: string; metric: string; error: string }[]
+  rows: { key: string; sku: string; label: string; by: Record<string, Record<string, number>>; total: Record<string, number>; sum: number
+    win: SkuWinQty; win_by: Record<string, Partial<SkuWinQty>> }[]
+}
+export interface SkuWin { from: string; to: string; label: string }
+export interface SkuWinQty { mtd: number; mtd_prev: number; w1: number; w0: number }
+export const getChannelSkuTrend = (asOf?: string, month?: string): Promise<ChannelSkuTrend> =>
+  api.get('/channel-report/exec/sku-trend', { params: { as_of: asOf || '', month: month || '' }, timeout: 120000 }).then(r => r.data)
 export type CpMonthlyOverride = Record<string, { order_qty?: number | null; delivered?: number | null } | null>
 export const saveChannelMonthly = (monthly: CpMonthlyOverride, base: ChannelReportBase): Promise<{ monthly: CpMonthlyOverride }> =>
   api.put(`${base}/monthly`, { monthly }).then(r => r.data)

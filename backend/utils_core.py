@@ -7,8 +7,13 @@ import datetime
 import functools
 import shutil
 import threading
+import time
 import email.utils
 import requests
+
+# 공용 HTTP 세션 — HTTP.get() 을 매번 쓰면 호출마다 TLS 인증서 번들을 다시 읽어(load_verify_locations, 2초+)
+# BoxHero 상세 조회 수십 번이 수 분으로 늘어난다. 세션을 재사용하면 연결·인증서 컨텍스트가 유지된다.
+HTTP = requests.Session()
 from typing import Optional
 from rapidfuzz import fuzz
 
@@ -178,7 +183,7 @@ def fetch_all_items(token: str) -> dict:
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
-        r = requests.get(f"{BASE_URL}/v1/items", headers=api_headers(token), params=params, timeout=15)
+        r = HTTP.get(f"{BASE_URL}/v1/items", headers=api_headers(token), params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
         for item in data.get("items", []):
@@ -198,7 +203,7 @@ def fetch_all_items_list(token: str) -> list:
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
-        r = requests.get(f"{BASE_URL}/v1/items", headers=api_headers(token), params=params, timeout=15)
+        r = HTTP.get(f"{BASE_URL}/v1/items", headers=api_headers(token), params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
         items.extend(data.get("items", []))
@@ -209,7 +214,7 @@ def fetch_all_items_list(token: str) -> list:
 
 
 def fetch_locations(token: str) -> list:
-    r = requests.get(f"{BASE_URL}/v1/locations", headers=api_headers(token), timeout=15)
+    r = HTTP.get(f"{BASE_URL}/v1/locations", headers=api_headers(token), timeout=15)
     r.raise_for_status()
     return r.json().get("items", [])
 
@@ -220,7 +225,7 @@ def fetch_partners(token: str) -> list:
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
-        r = requests.get(f"{BASE_URL}/v1/partners", headers=api_headers(token), params=params, timeout=15)
+        r = HTTP.get(f"{BASE_URL}/v1/partners", headers=api_headers(token), params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
         items.extend(data.get("items", []))
@@ -231,7 +236,7 @@ def fetch_partners(token: str) -> list:
 
 
 def post_transaction(token: str, payload: dict) -> dict:
-    r = requests.post(f"{BASE_URL}/v1/location-txs", headers=api_headers(token), json=payload, timeout=15)
+    r = HTTP.post(f"{BASE_URL}/v1/location-txs", headers=api_headers(token), json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -254,7 +259,7 @@ def fetch_bh_adjust(token: str, from_date: str, to_date: str) -> list:
         if cursor: params["cursor"] = cursor
         for attempt in range(5):
             try:
-                r = requests.get(f"{BASE_URL}/v1/txs", headers=api_headers(token), params=params, timeout=20)
+                r = HTTP.get(f"{BASE_URL}/v1/txs", headers=api_headers(token), params=params, timeout=20)
                 if r.status_code == 429:
                     _time.sleep(2.0 * (2 ** attempt))
                     continue
@@ -301,7 +306,7 @@ def _fetch_bh_txs_paginated(token: str, tx_type: str, from_date: str, to_date: s
         # 429 레이트 리밋 재시도 (최대 5회, 지수 백오프)
         for attempt in range(5):
             try:
-                r = requests.get(f"{BASE_URL}/v1/location-txs", headers=api_headers(token), params=params, timeout=20)
+                r = HTTP.get(f"{BASE_URL}/v1/location-txs", headers=api_headers(token), params=params, timeout=20)
                 if r.status_code == 429:
                     wait = 2.0 * (2 ** attempt)  # 2s, 4s, 8s, 16s, 32s
                     _time.sleep(wait)
@@ -520,18 +525,24 @@ def fetch_slack_channels(token: str) -> dict:
 
 # 슬랙 사용자 ID → 표시 이름 캐시 (프로세스 생존 동안 유지; users:read 스코프 없으면 ID 그대로)
 _slack_user_names: dict = {}
+_slack_user_fail: dict = {}  # uid → 마지막 실패 시각
 
 def _resolve_slack_user(client, uid: str) -> str:
     if uid in _slack_user_names:
         return _slack_user_names[uid]
+    if time.time() - _slack_user_fail.get(uid, 0) < 600:
+        return uid
     try:
         info = client.users_info(user=uid)
         u = info.get("user", {}) or {}
         prof = u.get("profile", {}) or {}
         name = prof.get("display_name") or prof.get("real_name") or u.get("real_name") or u.get("name") or uid
-        _slack_user_names[uid] = name  # 성공만 캐시 — users:read 스코프 추가 즉시 반영되도록
+        _slack_user_names[uid] = name  # 성공만 영구 캐시 — users:read 스코프 추가 즉시 반영되도록
+        _slack_user_fail.pop(uid, None)
         return name
     except Exception:
+        # 실패도 10분간 기억 — 멘션마다 users_info를 반복 호출해 조회가 느려지고 rate limit에 걸리는 것 방지
+        _slack_user_fail[uid] = time.time()
         return uid
 
 
@@ -544,7 +555,10 @@ def _replace_user_mentions(client, text: str) -> str:
 def fetch_slack_orders(token: str, channel_id: str) -> tuple:
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
+    from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
     client = WebClient(token=token)
+    # 429(ratelimited)면 Retry-After만큼 기다렸다가 재시도 (빈 목록으로 떨어지지 않도록)
+    client.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=3))
     orders = []
     debug = ""
     try:
@@ -594,13 +608,17 @@ def fetch_slack_orders(token: str, channel_id: str) -> tuple:
             })
     except SlackApiError as e:
         err = e.response["error"]
+        # not_in_channel은 화면에서 "채널 참여" 안내로 쓰므로 정상 응답으로 유지.
+        # 그 외(ratelimited 등)는 오류로 올려서 화면이 기존 목록을 빈 목록으로 덮어쓰지 않게 한다.
+        if err != "not_in_channel":
+            raise RuntimeError(f"slack_error:{err}")
         debug = err
     orders.sort(key=lambda x: x["ts"], reverse=True)
     return orders, debug
 
 
 def download_slack_file(url: str, token: str) -> bytes:
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    resp = HTTP.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     resp.raise_for_status()
     return resp.content
 

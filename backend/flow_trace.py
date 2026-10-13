@@ -14,6 +14,7 @@
 FastAPI 의존성 없음 — 단독 테스트 가능.
 """
 from datetime import datetime, timedelta
+import re
 from itertools import combinations
 from typing import Optional
 
@@ -25,6 +26,47 @@ def _d(s: str) -> Optional[datetime]:
         return datetime.strptime(str(s)[:10], DATE_FMT)
     except Exception:
         return None
+
+
+_MEMO_DATE_RE = re.compile(r"(\d{1,2})월\s*(\d{1,2})일")
+
+
+def _alt_dates(ev: dict) -> list:
+    """메모의 'N월 M일'(BH가 주문일 기준으로 묶어 출고 처리할 때 적는 날짜)을 날짜 후보로 추가."""
+    cached = ev.get("_alt")
+    if cached is not None:
+        return cached
+    out = []
+    base = _d(ev.get("date", ""))
+    memo = str(ev.get("memo") or "")
+    if base and memo:
+        for mm, dd in _MEMO_DATE_RE.findall(memo):
+            for yr in (base.year, base.year - 1):
+                try:
+                    cand = datetime(yr, int(mm), int(dd))
+                except ValueError:
+                    continue
+                # 처리일보다 뒤거나 60일 넘게 앞서면 다른 의미의 날짜 → 제외
+                if -1 <= (base - cand).days <= 60:
+                    out.append(cand.strftime("%Y-%m-%d"))
+                    break
+    ev["_alt"] = out
+    return out
+
+
+def _ev_gap(b: dict, o: dict) -> int:
+    """두 이벤트의 날짜 거리 — 처리일뿐 아니라 메모 주문일 후보 중 가장 가까운 것."""
+    g = _day_gap(b["date"], o["date"])
+    for ad in _alt_dates(b):
+        g = min(g, _day_gap(ad, o["date"]))
+    for ad in _alt_dates(o):
+        g = min(g, _day_gap(b["date"], ad))
+    return g
+
+
+def _approx_tol(q: int) -> int:
+    """근사 일치 허용 수량: 최소 3개 또는 3%."""
+    return max(3, int(round(q * 0.03)))
 
 
 def _day_gap(a: str, b: str) -> int:
@@ -56,7 +98,7 @@ def match_events(bh_events: list, ob_events: list, tol_days: int = 3,
     for i, b in enumerate(bh):
         for j, o in enumerate(ob):
             if b["qty"] == o["qty"]:
-                g = _day_gap(b["date"], o["date"])
+                g = _ev_gap(b, o)
                 if g <= tol_days:
                     pairs.append((g, i, j))
     pairs.sort()
@@ -77,7 +119,7 @@ def match_events(bh_events: list, ob_events: list, tol_days: int = 3,
                 continue
             cand = [j for j, m in enumerate(multi_side)
                     if not multi_used[j] and m["qty"] < s["qty"]
-                    and _day_gap(s["date"], m["date"]) <= tol_days]
+                    and _ev_gap(s, m) <= tol_days]
             if not cand:
                 continue
             # 조합 폭발 방지: 후보가 많으면 날짜 가까운 순 상위 12개만 탐색
@@ -110,6 +152,31 @@ def match_events(bh_events: list, ob_events: list, tol_days: int = 3,
 
     _combo_pass(ob, used_o, bh, used_b, "ob1")   # OB 1건 = BH 여러 건 (예: OB 805 = BH 651+154)
     _combo_pass(bh, used_b, ob, used_o, "bh1")   # BH 1건 = OB 여러 건
+
+    # ── 3단계: 근사 1:1 (수량 ±3개/3%, 날짜 ±7일) ──
+    # BH는 주문 수집 수량으로, OB는 실제 발송 수량으로 기록해 몇 개씩 어긋나는 거래를
+    # 같은 거래로 묶고, 남는 수량차만 원인으로 넘긴다 (안 묶으면 양쪽 '한쪽만 기록'으로 흩어짐).
+    approx = []
+    for i, b in enumerate(bh):
+        if used_b[i]:
+            continue
+        for j, o in enumerate(ob):
+            if used_o[j]:
+                continue
+            dq = abs(b["qty"] - o["qty"])
+            if dq == 0 or dq > _approx_tol(max(b["qty"], o["qty"])):
+                continue
+            g = _ev_gap(b, o)
+            if g <= max(tol_days, 7):
+                approx.append((dq * 10 + g, i, j, dq, g))
+    approx.sort()
+    for _, i, j, dq, g in approx:
+        if used_b[i] or used_o[j]:
+            continue
+        used_b[i] = True; used_o[j] = True
+        matched.append({"bh": [bh[i]], "ob": [ob[j]], "qty": ob[j]["qty"],
+                        "qty_diff": bh[i]["qty"] - ob[j]["qty"],
+                        "day_gap": g, "kind": f"근사(±{dq})"})
 
     bh_only = [b for i, b in enumerate(bh) if not used_b[i]]
     ob_only = [o for j, o in enumerate(ob) if not used_o[j]]
@@ -359,8 +426,8 @@ def trace_item(bh_in: list, bh_out: list, ob_in: list, ob_out: list,
         base = {"impact": impact, "qty": q, "date": ev["date"],
                 "memo": ev.get("memo", ""), "channel": ev.get("channel", ""),
                 "ev_type": ev.get("type", "")}
-        # 1) 교차기록: 다른 품목이 같은 날 정반대로 어긋남
-        if daily_out_by_prod is not None:
+        # 1) 교차기록: 다른 품목이 같은 날 정반대로 어긋남 (소량 수기 출고는 우연 일치가 많아 20개 이상만)
+        if daily_out_by_prod is not None and q >= 20:
             p = find_cross_partner(ev, direction, side, daily_out_by_prod,
                                    daily_in_by_prod or {}, target_label)
             if p:
@@ -398,6 +465,23 @@ def trace_item(bh_in: list, bh_out: list, ob_in: list, ob_out: list,
         return {**base, "type": f"{who}만 기록",
                 "desc": f"{ev['date']} {who}에만 {'입고' if direction=='in' else '출고'} {q:,} "
                         f"({ev.get('memo') or ev.get('channel') or ''}) — 반대쪽 누락 또는 별도 처리(직배송·세트변경·조정) 확인"}
+
+    # 근사 짝의 남는 수량차 — 등식이 맞도록 원인으로 올림
+    for direction, m in (("in", m_in), ("out", m_out)):
+        for p in m["matched"]:
+            qd = int(p.get("qty_diff") or 0)
+            if not qd:
+                continue
+            b, o = p["bh"][0], p["ob"][0]
+            impact = qd if direction == "in" else -qd
+            causes.append({
+                "type": "근사일치 수량차", "impact": impact, "qty": abs(qd), "date": b["date"],
+                "memo": b.get("memo", ""), "channel": o.get("channel", "") or b.get("channel", ""),
+                "ev_type": "입고" if direction == "in" else "출고",
+                "desc": f"{b['date']} BH {'입고' if direction=='in' else '출고'} {b['qty']:,} ↔ "
+                        f"{o['date']} OB {o['qty']:,} — 같은 거래로 보이나 BH가 {qd:+,}개 "
+                        f"{'많음' if qd > 0 else '적음'} (주문 취소·품절 반려분이 BH에서 되돌려지지 않았을 가능성)",
+            })
 
     for ev in m_in["bh_only"]:
         causes.append(_classify(ev, "in", "bh_only"))

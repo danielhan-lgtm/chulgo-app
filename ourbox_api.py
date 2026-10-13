@@ -20,6 +20,9 @@ OURBOX_API = "https://api.ourbox.co.kr"
 
 # 페이지당 최대 건수 (API 기본값으로 추정, 실제 응답에 따라 조정)
 _PAGE_SIZE = 100
+# 커넥션 풀 공유 (요청마다 SSL 핸드셰이크 반복 방지). 병렬 수집용으로 풀 크기 넉넉히.
+_SESSION = requests.Session()
+_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=32))
 
 
 class OurboxApiClient:
@@ -40,7 +43,7 @@ class OurboxApiClient:
         last_exc = None
         for attempt in range(3):  # ReadTimeout/일시오류 재시도 (병렬 throttle 대비)
             try:
-                r = requests.post(url, headers=self._headers, json=body, timeout=45)
+                r = _SESSION.post(url, headers=self._headers, json=body, timeout=45)
                 if r.status_code == 401:
                     try:
                         detail = r.json()
@@ -156,15 +159,40 @@ class OurboxApiClient:
         Request body:
           out_dt_type: "1" (출고일 기준)
           out_dt_from / out_dt_to: YYYY-MM-DD
+
+        긴 기간은 7일 구간으로 나눠 병렬 수집 (45일 한 번에 = 300페이지 × 3초 → 분 단위 소요).
         """
-        return self._paginate(
-            "/api/wms/out/out_perf_period",
-            {
-                "out_dt_type": "1",
-                "out_dt_from": from_date,
-                "out_dt_to": to_date,
-            },
-        )
+        from datetime import datetime, timedelta
+        import concurrent.futures as _cf
+        start = datetime.fromisoformat(from_date)
+        end = datetime.fromisoformat(to_date)
+        if (end - start).days < 7:
+            return self._paginate(
+                "/api/wms/out/out_perf_period",
+                {"out_dt_type": "1", "out_dt_from": from_date, "out_dt_to": to_date},
+            )
+        chunks = []
+        cur = start
+        while cur <= end:
+            chunk_end = min(cur + timedelta(days=6), end)
+            chunks.append((cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+            cur = chunk_end + timedelta(days=1)
+
+        def _fetch_chunk(rng):
+            f, t = rng
+            try:
+                return self._paginate("/api/wms/out/out_perf_period",
+                                      {"out_dt_type": "1", "out_dt_from": f, "out_dt_to": t})
+            except Exception as e:
+                logger.warning(f"출고 구간 {f}~{t} 실패: {e}")
+                raise
+
+        all_items: list = []
+        with _cf.ThreadPoolExecutor(max_workers=min(4, len(chunks) or 1)) as ex:
+            for items in ex.map(_fetch_chunk, chunks):
+                all_items.extend(items)
+        logger.info(f"출고 전체 {len(all_items)}건 수집 ({len(chunks)}구간 병렬)")
+        return all_items
 
     def _get_ob_code_to_name(self) -> dict:
         """OB sales_product_company_code → product_name 매핑 (캐시)."""

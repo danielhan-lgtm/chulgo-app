@@ -15,6 +15,7 @@ from pydantic import BaseModel
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import utils_core as U
 import state
+from utils_core import HTTP as _HTTP
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
@@ -74,61 +75,131 @@ def _save_tx_file_cache_entry(tx_id: int, items: list):
 
 # ── 영구 파일 캐시 (OB 수집 데이터) ─────────────────────────────────────────
 # 날짜 범위별 OB in/out/adj 원시 데이터 캐시. 과거 날짜 → 영구, 오늘 포함 → 1시간 TTL.
-_OB_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "ob_txs_cache.json")
-_ob_file_cache: dict = {}
+# OB 거래 캐시: 날짜범위 키마다 별도 파일 (data/ob_txs_cache/{from}_{to}.json).
+# 예전엔 단일 ob_txs_cache.json(1GB+)을 통째로 읽고(수십 초) 키 하나 추가할 때마다 통째로 다시 써서
+# 재고 대사 조회가 분 단위로 걸렸음. 지금은 필요한 키만 읽고, 그 키 파일만 쓴다.
+_OB_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "ob_txs_cache.json")  # legacy (1회 분할 후 .migrated로 개명)
+_OB_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "ob_txs_cache")
+_ob_file_cache: dict = {}        # 메모리 LRU (최근 사용 키 몇 개만)
+_OB_MEM_MAX = 6
 _ob_file_cache_loaded = False
+_ob_cache_lock = _threading.Lock()
+
+
+def _ob_cache_fname(cache_key: str) -> str:
+    return os.path.join(_OB_CACHE_DIR, re.sub(r"[^0-9A-Za-z_.-]", "_", cache_key) + ".json")
+
+
+def _ob_cache_keys() -> list:
+    """저장된 모든 캐시 키 (파일 목록 기준)."""
+    _load_ob_file_cache()
+    keys = []
+    try:
+        for fn in os.listdir(_OB_CACHE_DIR):
+            if fn.endswith(".json"):
+                keys.append(fn[:-5].replace("_", "|", 1) if "_" in fn else fn[:-5])
+    except Exception:
+        pass
+    return keys
+
+
+def _ob_cache_read(cache_key: str) -> Optional[dict]:
+    """키 하나의 엔트리를 파일에서 읽음 (만료 검사 없음). 메모리 LRU에도 보관."""
+    e = _ob_file_cache.get(cache_key)
+    if e is not None:
+        return e
+    fn = _ob_cache_fname(cache_key)
+    if not os.path.exists(fn):
+        return None
+    try:
+        with open(fn, "r", encoding="utf-8") as f:
+            e = json.load(f)
+    except Exception:
+        return None
+    with _ob_cache_lock:
+        _ob_file_cache[cache_key] = e
+        while len(_ob_file_cache) > _OB_MEM_MAX:
+            _ob_file_cache.pop(next(iter(_ob_file_cache)))
+    return e
+
+
+def _ob_cache_delete(cache_key: str):
+    _ob_file_cache.pop(cache_key, None)
+    try:
+        os.remove(_ob_cache_fname(cache_key))
+    except Exception:
+        pass
 
 
 def _load_ob_file_cache():
-    global _ob_file_cache, _ob_file_cache_loaded
+    """1회: legacy 단일 파일이 있으면 키별 파일로 분할. 이후엔 아무것도 안 함."""
+    global _ob_file_cache_loaded
     if _ob_file_cache_loaded:
         return
-    try:
-        if os.path.exists(_OB_CACHE_PATH):
-            with open(_OB_CACHE_PATH, "r", encoding="utf-8") as f:
-                _ob_file_cache = json.load(f)
-    except Exception:
-        _ob_file_cache = {}
-    _ob_file_cache_loaded = True
+    with _ob_cache_lock:
+        if _ob_file_cache_loaded:
+            return
+        try:
+            os.makedirs(_OB_CACHE_DIR, exist_ok=True)
+            if os.path.exists(_OB_CACHE_PATH):
+                with open(_OB_CACHE_PATH, "r", encoding="utf-8") as f:
+                    legacy = json.load(f)
+                for k, v in (legacy or {}).items():
+                    fn = _ob_cache_fname(k)
+                    if os.path.exists(fn):
+                        continue
+                    with open(fn, "w", encoding="utf-8") as f:
+                        json.dump(v, f, ensure_ascii=False)
+                del legacy
+                os.replace(_OB_CACHE_PATH, _OB_CACHE_PATH + ".migrated")
+        except Exception:
+            pass
+        _ob_file_cache_loaded = True
 
 
 def _save_ob_file_cache_entry(cache_key: str, in_list: list, out_list: list, adj_list: list, source: str):
-    """OB 수집 결과를 파일 캐시에 저장."""
-    global _ob_file_cache
-    _ob_file_cache[cache_key] = {
+    """OB 수집 결과를 키별 파일에 저장 (해당 키 파일만 씀)."""
+    _load_ob_file_cache()
+    entry = {
         "in": in_list, "out": out_list, "adj": adj_list,
         "source": source,
         "ts": datetime.now().isoformat(),
     }
+    with _ob_cache_lock:
+        _ob_file_cache[cache_key] = entry
+        while len(_ob_file_cache) > _OB_MEM_MAX:
+            _ob_file_cache.pop(next(iter(_ob_file_cache)))
     try:
-        os.makedirs(os.path.dirname(_OB_CACHE_PATH), exist_ok=True)
-        with open(_OB_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(_ob_file_cache, f, ensure_ascii=False)
+        os.makedirs(_OB_CACHE_DIR, exist_ok=True)
+        tmp = _ob_cache_fname(cache_key) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+        os.replace(tmp, _ob_cache_fname(cache_key))
     except Exception:
         pass
 
 
 def _get_ob_cache(cache_key: str) -> Optional[dict]:
-    """OB 캐시 조회. to_date가 오늘 이전이면 영구, 오늘 포함이면 1시간 TTL."""
-    entry = _ob_file_cache.get(cache_key)
+    """OB 캐시 조회. 범위가 끝난 뒤(to_date 다음날 이후)에 수집한 것이면 영구, 아니면 1시간 TTL."""
+    _load_ob_file_cache()
+    entry = _ob_cache_read(cache_key)
     if not entry:
         return None
-    today = datetime.now().strftime("%Y-%m-%d")
     # 키 형식: "{from_date}|{to_date}"  →  마지막 파이프 뒤
     try:
         to_date_part = cache_key.split("|")[-1]
     except Exception:
-        to_date_part = today
-    if to_date_part < today:
-        # 완전한 과거 범위 → 영구 캐시
-        return entry
-    # 오늘 포함 → 1시간 TTL
+        to_date_part = "9999-99-99"
     try:
         ts = datetime.fromisoformat(entry.get("ts", ""))
-        if (datetime.now() - ts).seconds < 3600:
-            return entry
     except Exception:
-        pass
+        return None
+    if ts.strftime("%Y-%m-%d") > to_date_part:
+        # 범위가 완전히 지난 뒤 수집 → 완전한 데이터, 영구 캐시
+        return entry
+    # 범위 진행 중에 수집 → 1시간 TTL
+    if (datetime.now() - ts).total_seconds() < 3600:
+        return entry
     return None
 
 
@@ -170,7 +241,7 @@ def _fetch_bh_tx_items(token: str, tx_id: int, tx_type: str = "location") -> lis
         endpoint = f"{BH_BASE}/v1/location-txs/{tx_id}"
     for attempt in range(4):
         try:
-            r = _req.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            r = _HTTP.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
             if r.ok:
                 _detail = r.json().get("item", {})
                 items = _detail.get("items", [])
@@ -216,7 +287,7 @@ def _get_bh_tx_loc_id(token: str, tx_id: int, tx_type: str = "location", prefer_
         endpoint = f"{BH_BASE}/v1/location-txs/{tx_id}"
     for attempt in range(4):
         try:
-            r = _req.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            r = _HTTP.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
             if r.ok:
                 _detail = r.json().get("item", {})
                 _from_obj = _detail.get("from_location") or {}
@@ -1354,21 +1425,10 @@ def clear_cache(from_date: str = Query(""), to_date: str = Query("")):
     """BH TX 목록 캐시 + OB 캐시 무효화 → 다음 조회 시 API에서 새로 수집."""
     import utils_core as U2
     U2.invalidate_bh_txlist_cache(from_date, to_date)
-    # OB 캐시도 초기화
-    global _ob_file_cache
-    if from_date and to_date:
-        keys = [k for k in _ob_file_cache if from_date in k or to_date in k]
-        for k in keys:
-            del _ob_file_cache[k]
-    else:
-        _ob_file_cache = {}
-    try:
-        import os as _os
-        if _os.path.exists(_OB_CACHE_PATH):
-            with open(_OB_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump(_ob_file_cache, f, ensure_ascii=False)
-    except Exception:
-        pass
+    # OB 캐시도 초기화 (키별 파일 삭제)
+    for k in _ob_cache_keys():
+        if not (from_date and to_date) or from_date in k or to_date in k:
+            _ob_cache_delete(k)
     # full_match 메모리 캐시 초기화
     state.full_match_cache = {}
     # full_match 파일 캐시 초기화
@@ -3614,7 +3674,7 @@ def get_stock(
         while True:
             params: dict = {"limit": 100}
             if cursor: params["cursor"] = cursor
-            r = _req.get("https://rest.boxhero-app.com/v1/items",
+            r = _HTTP.get("https://rest.boxhero-app.com/v1/items",
                          headers={"Authorization": f"Bearer {token}"},
                          params=params, timeout=20)
             if not r.ok: break
@@ -6795,7 +6855,7 @@ async def _stream_gemini(api_key: str, prompt: str):
         "generationConfig": {"maxOutputTokens": 2500},
     }
     try:
-        resp = _req.post(url, json=payload, stream=True, timeout=120)
+        resp = _HTTP.post(url, json=payload, stream=True, timeout=120)
         if not resp.ok:
             err = resp.text[:200]
             yield f"data: {json.dumps({'error': f'Gemini API 오류 {resp.status_code}: {err}'}, ensure_ascii=False)}\n\n"
@@ -7173,11 +7233,10 @@ def suggest_mapping(
     # ── OB 미매핑 상품 수집 (캐시에서) ────────────────────────
     ob_unmapped: list = []
     try:
-        _load_ob_file_cache()
-        cached_keys = list(_ob_file_cache.keys())
+        cached_keys = _ob_cache_keys()
         ob_seen: set = set()
         for ck in cached_keys:
-            entry = _ob_file_cache.get(ck, {})
+            entry = _ob_cache_read(ck) or {}
             for rec in entry.get("in", []) + entry.get("out", []):
                 cd = str(rec.get("product_code") or rec.get("prod_cd") or "").strip()
                 nm_= html.unescape(str(rec.get("product_name") or rec.get("prod_nm") or "").strip())

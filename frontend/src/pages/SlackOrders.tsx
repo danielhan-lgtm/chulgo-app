@@ -6,6 +6,7 @@ import {
   getSlackMessages, downloadSlackFile, toggleSlackReaction, joinSlackChannel,
   base64ToBlob, convertGeneral, getGeneralColumns, convertNaver, sendToBoxhero, downloadBlob, updateConfig
 } from '../services/api'
+import { persistGet, persistSetDebounced } from '../lib/persist'
 
 interface Props {
   config: AppConfig
@@ -105,20 +106,57 @@ function getSummary(parsed: Record<string, string>) {
   }
 }
 
+// 페이지를 벗어났다 돌아와도 조회 결과가 남도록 모듈 단위로 보관 (채널별)
+interface ChannelCache {
+  orders: SlackOrder[]
+  debug: string
+  fetchedAt: number
+  selectedIdx: number
+  statusFilter: string | null
+  fileBytes: Record<string, string>
+  matchData: Record<string, any>
+  staged: Record<string, any[]>
+}
+const _cache: Record<string, ChannelCache> = {}
+let _lastChannelName = ''
+const CACHE_STALE_MS = 10 * 60 * 1000  // 10분 지나면 돌아왔을 때 조용히 갱신
+// 탭이 내려가거나 새로고침돼도 목록이 남도록 IndexedDB에도 보관 (파일 바이트는 제외)
+const PERSIST_KEY = 'slack_orders_v1'
+let _persistLoaded: Promise<void> | null = null
+function loadPersisted(): Promise<void> {
+  if (!_persistLoaded) {
+    _persistLoaded = persistGet<{ cache: Record<string, ChannelCache>; last: string }>(PERSIST_KEY).then(saved => {
+      if (!saved?.cache) return
+      for (const [k, v] of Object.entries(saved.cache)) if (!_cache[k]) _cache[k] = { ...v, fileBytes: {}, matchData: {}, staged: {} }
+      if (!_lastChannelName && saved.last) _lastChannelName = saved.last
+    })
+  }
+  return _persistLoaded
+}
+function savePersisted() {
+  const slim: Record<string, ChannelCache> = {}
+  for (const [k, v] of Object.entries(_cache)) slim[k] = { ...v, fileBytes: {}, matchData: {}, staged: {} }
+  persistSetDebounced(PERSIST_KEY, { cache: slim, last: _lastChannelName })
+}
+
+function cacheOf(chId: string): ChannelCache | undefined { return chId ? _cache[chId] : undefined }
+
 export default function SlackOrders({ config, channels, locations }: Props) {
-  const [selectedChannel, setSelectedChannel] = useState<string>('')
-  const [orders, setOrders] = useState<SlackOrder[]>([])
-  const [debug, setDebug] = useState('')
+  const [selectedChannel, setSelectedChannel] = useState<string>(_lastChannelName)
+  const initCache = cacheOf(_lastChannelName ? channels[_lastChannelName] : '')
+  const [orders, setOrders] = useState<SlackOrder[]>(initCache?.orders || [])
+  const [debug, setDebug] = useState(initCache?.debug || '')
   const [loading, setLoading] = useState(false)
-  const [selectedIdx, setSelectedIdx] = useState(0)
-  const [fileBytes, setFileBytes] = useState<Record<string, string>>({})  // key → base64
+  const [selectedIdx, setSelectedIdx] = useState(initCache?.selectedIdx || 0)
+  const [fileBytes, setFileBytes] = useState<Record<string, string>>(initCache?.fileBytes || {})  // key → base64
   const [converting, setConverting] = useState<string | null>(null)
-  const [matchData, setMatchData] = useState<Record<string, any>>({})  // fileKey → match result
-  const [staged, setStaged] = useState<Record<string, any[]>>({})
+  const [matchData, setMatchData] = useState<Record<string, any>>(initCache?.matchData || {})  // fileKey → match result
+  const [staged, setStaged] = useState<Record<string, any[]>>(initCache?.staged || {})
   const [sendingKey, setSendingKey] = useState<string | null>(null)
   const [locationId, setLocationId] = useState<number | undefined>(config.selected_location_id)
   const [memo, setMemo] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string | null>(null)  // null = 전체
+  const [statusFilter, setStatusFilter] = useState<string | null>(initCache?.statusFilter ?? null)  // null = 전체
+  const [fetchedAt, setFetchedAt] = useState<number>(initCache?.fetchedAt || 0)
   const [notifyOn, setNotifyOn] = useState<boolean>(!!config.slack_outbound_notify)
   const [notifyChannel, setNotifyChannel] = useState<string>(config.slack_outbound_channel || '물류_출고')
   const [notifyTime, setNotifyTime] = useState<string>(config.bh_notify_time || '18:00')
@@ -129,41 +167,88 @@ export default function SlackOrders({ config, channels, locations }: Props) {
   const channelNames = Object.keys(channels)
   const channelId = selectedChannel ? channels[selectedChannel] : ''
   const order = orders[selectedIdx]
+  const [persistReady, setPersistReady] = useState(false)
+  useEffect(() => { loadPersisted().finally(() => setPersistReady(true)) }, [])
 
   useEffect(() => {
+    if (!persistReady) return
     if (channelNames.length > 0 && !selectedChannel) {
-      const def = channelNames.find(n => n === '물류_출고') || channelNames[0]
+      const def = (_lastChannelName && channels[_lastChannelName]) ? _lastChannelName
+        : channelNames.find(n => n === '물류_출고') || channelNames[0]
       setSelectedChannel(def)
     }
-  }, [channels])
+  }, [channels, persistReady])
 
   useEffect(() => {
-    if (selectedChannel && channels[selectedChannel]) {
-      fetchMessages(channels[selectedChannel])
+    if (!selectedChannel || !channels[selectedChannel]) return
+    _lastChannelName = selectedChannel
+    const chId = channels[selectedChannel]
+    const c = cacheOf(chId)
+    if (c) {
+      // 보관된 결과를 먼저 보여주고, 오래됐으면 뒤에서 조용히 갱신
+      setOrders(c.orders); setDebug(c.debug); setSelectedIdx(c.selectedIdx)
+      setStatusFilter(c.statusFilter); setFileBytes(c.fileBytes); setMatchData(c.matchData); setStaged(c.staged)
+      setFetchedAt(c.fetchedAt)
+      if (Date.now() - c.fetchedAt > CACHE_STALE_MS) fetchMessages(chId, { silent: true })
+    } else {
+      setOrders([]); setDebug(''); setSelectedIdx(0); setStatusFilter(null)
+      setFileBytes({}); setMatchData({}); setStaged({}); setFetchedAt(0)
+      fetchMessages(chId)
     }
-  }, [selectedChannel])
+  }, [selectedChannel, channels])
 
-  async function fetchMessages(chId: string) {
+  // 상태가 바뀔 때마다 캐시에 반영 (페이지 이동 후 복원용)
+  useEffect(() => {
+    if (!channelId || !fetchedAt) return
+    _cache[channelId] = { orders, debug, fetchedAt, selectedIdx, statusFilter, fileBytes, matchData, staged }
+    savePersisted()
+  }, [channelId, orders, debug, fetchedAt, selectedIdx, statusFilter, fileBytes, matchData, staged])
+
+  async function fetchMessages(chId: string, opts: { silent?: boolean } = {}) {
     if (!config.slack_token || !chId) return
-    setLoading(true)
+    if (!opts.silent) setLoading(true)
     try {
       const res = await getSlackMessages(config.slack_token, chId)
-      setOrders(res.orders || [])
+      const next: SlackOrder[] = res.orders || []
+      // 선택 중이던 메시지를 ts로 다시 찾아 유지
+      const prevTs = orders[selectedIdx]?.ts
+      const keepIdx = prevTs ? Math.max(0, next.findIndex(o => o.ts === prevTs)) : 0
+      setOrders(next)
       setDebug(res.debug || '')
-      setSelectedIdx(0)
-      setSelectedTs(new Set())
+      setSelectedIdx(keepIdx)
+      setFetchedAt(Date.now())
     } catch (e: any) {
-      message.error('메시지 로드 실패: ' + (e.response?.data?.detail || e.message))
+      // 실패해도 기존 목록은 그대로 둔다
+      const detail = e.response?.data?.detail || e.message
+      if (opts.silent) message.warning('목록 갱신 실패 (이전 결과 유지): ' + detail)
+      else message.error('메시지 로드 실패: ' + detail)
     } finally {
-      setLoading(false)
+      if (!opts.silent) setLoading(false)
     }
   }
 
-  async function handleChannelChange(name: string) {
+  function handleChannelChange(name: string) {
+    // 실제 조회는 selectedChannel useEffect에서 한 번만 수행
     setSelectedChannel(name)
-    setOrders([])
-    setStatusFilter(null)
-    await fetchMessages(channels[name])
+  }
+
+  // 리액션 결과를 목록에 바로 반영 (전체 재조회 없이)
+  function applyReactionLocally(ts: string, emoji: string, result: string) {
+    setOrders(prev => prev.map(o => {
+      if (o.ts !== ts) return o
+      const has = o.reactions.find(r => r.name === emoji)
+      let reactions
+      if (result === 'removed') {
+        reactions = has && has.count > 1
+          ? o.reactions.map(r => r.name === emoji ? { ...r, count: r.count - 1 } : r)
+          : o.reactions.filter(r => r.name !== emoji)
+      } else {
+        reactions = has
+          ? o.reactions.map(r => r.name === emoji ? { ...r, count: r.count + 1 } : r)
+          : [...o.reactions, { name: emoji, count: 1 }]
+      }
+      return { ...o, reactions }
+    }))
   }
 
   async function handleRefresh() {
@@ -208,7 +293,8 @@ export default function SlackOrders({ config, channels, locations }: Props) {
     let ok = 0, fail = 0
     for (const o of targets) {
       try {
-        await toggleSlackReaction(config.slack_token, channelId, o.ts, emoji)
+        const res = await toggleSlackReaction(config.slack_token, channelId, o.ts, emoji)
+        applyReactionLocally(o.ts, emoji, res.result)
         ok++
       } catch { fail++ }
     }
@@ -216,14 +302,13 @@ export default function SlackOrders({ config, channels, locations }: Props) {
     if (fail) message.warning(`${ok}건 적용 · ${fail}건 실패${skipped ? ` · ${skipped}건은 이미 적용됨` : ''}`)
     else message.success(`${ok}건 적용 완료${skipped ? ` (${skipped}건은 이미 적용됨)` : ''}`)
     setSelectedTs(new Set())
-    await handleRefresh()
   }
 
   async function handleReaction(emoji: string) {
     if (!order || !config.slack_token) return
     try {
-      await toggleSlackReaction(config.slack_token, channelId, order.ts, emoji)
-      await handleRefresh()
+      const res = await toggleSlackReaction(config.slack_token, channelId, order.ts, emoji)
+      applyReactionLocally(order.ts, emoji, res.result)
     } catch (e: any) {
       message.error('리액션 오류: ' + (e.response?.data?.detail || e.message))
     }
@@ -317,6 +402,7 @@ export default function SlackOrders({ config, channels, locations }: Props) {
         />
         <Button icon={<ReloadOutlined />} onClick={handleRefresh} loading={loading}>새로고침</Button>
         {debug && <span style={{ fontSize: '0.78rem', color: '#9ca3af' }}>{debug}</span>}
+        {fetchedAt > 0 && <span style={{ fontSize: '0.78rem', color: '#9ca3af' }}>· {new Date(fetchedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })} 조회</span>}
       </div>
 
       {/* BH 출고 → 슬랙 봇 알림 설정 */}

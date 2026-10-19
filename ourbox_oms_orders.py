@@ -34,15 +34,20 @@ def oms_session(ourbox_id: str, ourbox_pw: str):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context()
+        authed = False
         try:
             page = _login_and_get_page(ctx, ourbox_id, ourbox_pw)
+            authed = True
             yield page
         finally:
-            # 사용 중 서버가 세션ID를 회전시켰을 수 있음 — 최신 쿠키로 세션파일 갱신
-            try:
-                _save_session(ctx)
-            except Exception:
-                pass
+            # 사용 중 서버가 세션ID를 회전시켰을 수 있음 — 최신 쿠키로 세션파일 갱신.
+            # 단, 로그인에 실패한 컨텍스트(미인증 쿠키)로는 절대 덮어쓰지 않는다 —
+            # 그러면 사용자가 수동 저장한 세션이 무효 세션으로 바뀌어 버림.
+            if authed:
+                try:
+                    _save_session(ctx)
+                except Exception:
+                    pass
             browser.close()
 
 

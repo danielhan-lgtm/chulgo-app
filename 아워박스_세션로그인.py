@@ -75,6 +75,25 @@ def _pages():
         return None
 
 
+def _cookies_authed() -> bool:
+    """로그인 창(CDP)의 쿠키로 인증 필요한 ajax를 호출해 200이면 진짜 로그인 상태."""
+    try:
+        import requests
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
+            cookies = {c["name"]: c["value"] for c in browser.contexts[0].cookies()
+                       if "ourbox" in (c.get("domain") or "")}
+            browser.close()
+        if not cookies.get("JSESSIONID"):
+            return False
+        r = requests.get(f"{OURBOX_BASE}/om/sach/colct/ajax/selOdColctChList.do?mall_svc=order",
+                         cookies=cookies, headers={"AJAX": "true"}, timeout=15)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 logged_in = False
 for _ in range(TIMEOUT_SEC):
     time.sleep(1)
@@ -85,9 +104,12 @@ for _ in range(TIMEOUT_SEC):
             sys.exit(1)
         continue
     urls = [p.get("url", "") for p in pages if p.get("type") == "page"]
-    if any("oms.ourbox.co.kr" in u and "login" not in u for u in urls):
-        logged_in = True
-        break
+    # URL만 보면 error.do(미인증 리다이렉트)도 '로그인됨'으로 오감지됨 —
+    # 실제 쿠키로 인증 필요한 ajax를 호출해 200일 때만 로그인 완료로 본다.
+    if any("oms.ourbox.co.kr" in u and "login" not in u and "error" not in u for u in urls):
+        if _cookies_authed():
+            logged_in = True
+            break
 
 if not logged_in:
     print("시간 초과(10분): 로그인이 감지되지 않았습니다.")

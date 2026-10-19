@@ -296,14 +296,17 @@ def advance_orders(page, od_snos, current_state: str, direction: str = "next") -
     page.goto(OURBOX_BASE + "/om/order/order/orderList.do", wait_until="networkidle", timeout=20000)
     return page.evaluate(
         """async ({snos, cur, mode}) => {
+            // OMS UI와 동일하게 화주사 코드(pwn_cd)를 함께 보낸다 — 없으면 '화주사를 선택해 주십시오'로 거부됨
+            const pwn = (document.getElementById('pwn_header_change')||{}).value
+                     || (document.getElementById('search_pwn_cd')||{}).value || '';
             const r = await fetch('/om/order/odStateUpdtChkProc.do', {
                 method:'POST',
                 headers:{'Content-Type':'application/json; charset=UTF-8','AJAX':'true'},
                 body: JSON.stringify({od_prgrs_state: cur, updt_mode: mode,
-                                      od_snos: JSON.stringify(snos.map(String))})
+                                      od_snos: JSON.stringify(snos.map(String)), pwn_cd: pwn})
             });
             const t = await r.text(); let b; try{b=JSON.parse(t);}catch(e){b=t.slice(0,400);}
-            return {status:r.status, body:b};
+            return {status:r.status, body:b, pwn_cd: pwn};
         }""",
         {"snos": od_snos, "cur": str(current_state), "mode": direction},
     )

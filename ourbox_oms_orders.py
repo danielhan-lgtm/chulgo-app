@@ -512,8 +512,17 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=DEFAULT_CHAN
             chs = list_collect_channels(page)
             snos = [c["mall_acc_sno"] for c in chs if c.get("channel") in channels]
             if snos:
+                before = len(list_target_orders(page, "order", start, end, channels=channels))
                 out["collect"] = collect_orders(page, snos)
-                _t.sleep(4)  # 수집 반영 대기
+                # 수집은 비동기 — 실측상 주문이 목록에 뜨기까지 ~30초. 최대 60초까지 폴링
+                # (4초 고정 대기로는 첫 사이클이 0건으로 끝나고 다음 슬롯까지 밀렸음).
+                waited = 0
+                for _ in range(12):
+                    _t.sleep(5); waited += 5
+                    if len(list_target_orders(page, "order", start, end, channels=channels)) > before:
+                        _t.sleep(5); waited += 5  # 반영 중인 나머지 행 여유
+                        break
+                out["collect_wait_sec"] = waited
         for p in range(max_passes):
             moved = 0
             for stage, code in [("outReady", "30"), ("putOrder", "20"), ("order", "10")]:

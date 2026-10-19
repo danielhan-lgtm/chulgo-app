@@ -50,6 +50,8 @@ with db._conn() as _c:
 
 STAGES = oms.STAGES
 STAGE_LABELS = oms.STAGE_LABELS
+CHANNEL_DEFS = oms.CHANNEL_DEFS
+DEFAULT_CHANNELS_STR = ",".join(oms.DEFAULT_CHANNELS)
 _OMS_SCRIPT = os.path.join(_ROOT, "ourbox_oms_orders.py")
 
 _oms_lock = threading.Lock()
@@ -138,7 +140,7 @@ def get_channels():
 
 
 @router.get("/overview")
-def get_overview(days: int = 30, channels: str = "cafe24,kakao"):
+def get_overview(days: int = 30, channels: str = DEFAULT_CHANNELS_STR):
     oid, opw = _creds()
     start, end = _date_range(days)
     try:
@@ -151,7 +153,7 @@ def get_overview(days: int = 30, channels: str = "cafe24,kakao"):
 
 
 @router.get("/orders")
-def get_orders(stage: str = "shipReady", days: int = 30, channels: str = "cafe24,kakao"):
+def get_orders(stage: str = "shipReady", days: int = 30, channels: str = DEFAULT_CHANNELS_STR):
     if stage not in STAGES:
         raise HTTPException(400, f"알 수 없는 단계: {stage}")
     oid, opw = _creds()
@@ -172,7 +174,7 @@ def _bust_cache():
 
 
 class CollectReq(BaseModel):
-    channels: str = "cafe24,kakao"
+    channels: str = DEFAULT_CHANNELS_STR
     date_range: str | None = None
 
 
@@ -219,8 +221,21 @@ def advance(body: AdvanceReq):
         raise HTTPException(400, f"단계전환 실패: {e}")
 
 
-# 채널 → BH 거래처 이름 매칭 키워드
-_CHANNEL_PARTNER_KW = {"cafe24": ["카페24", "cafe24"], "kakao": ["카카오", "kakao"]}
+def _match_partner(partners: list, ch: str):
+    """채널 정의의 partner_kw를 앞에서부터 순서대로 시도 (정확한 이름 → 느슨한 키워드).
+    partner_exclude 키워드가 들어간 거래처는 후보에서 제외 ('쿠팡' ≠ '쿠팡그로스').
+    같은 키워드에 후보가 여럿이면 id가 작은(먼저 만든) 거래처."""
+    d = CHANNEL_DEFS.get(ch) or {}
+    excl = [k.lower() for k in d.get("partner_exclude", [])]
+    cands = [p for p in partners
+             if not any(k in str(p.get("name", "")).lower() for k in excl)]
+    for kw in d.get("partner_kw", []):
+        kw = kw.lower()
+        hits = [p for p in cands if kw in str(p.get("name", "")).lower().replace(" ", "")
+                or kw in str(p.get("name", "")).lower()]
+        if hits:
+            return sorted(hits, key=lambda p: int(p.get("id") or 0))[0]
+    return None
 
 
 def _resolve_partners(token, channels):
@@ -238,11 +253,25 @@ def _resolve_partners(token, channels):
                 partners = U.fetch_partners(token)
             except Exception:
                 partners = []
-        kws = [k.lower() for k in _CHANNEL_PARTNER_KW.get(ch, [])]
-        m = next((p for p in partners if any(k in str(p.get("name", "")).lower() for k in kws)), None)
+        m = _match_partner(partners, ch)
         if m:
             out[ch] = {"id": m["id"], "name": m.get("name")}
     return out
+
+
+@router.get("/channel-defs")
+def get_channel_defs():
+    """자동화 채널 정의 (키·라벨·판매처코드) + BH 거래처 자동매칭 결과 미리보기."""
+    cfg = _load_cfg()
+    token = cfg.get("api_token", "")
+    partners = {}
+    if token:
+        try:
+            partners = _resolve_partners(token, list(CHANNEL_DEFS))
+        except Exception:
+            partners = {}
+    return {"defs": {k: {"label": d["label"], "sach_cds": d["sach_cds"]} for k, d in CHANNEL_DEFS.items()},
+            "default": list(oms.DEFAULT_CHANNELS), "partners": partners}
 
 
 def _resolve_bh(conn, prod_cd, qty: int):
@@ -373,6 +402,9 @@ def _register_orders(orders, dry_run: bool) -> dict:
         items_payload = [{"sku": sku, "quantity": int(q)} for sku, q in agg["sku_qty"].items() if int(q) > 0]
         od_snos = [o["od_sno"] for o in agg["ods"]]
         partner = partner_map.get(ch)
+        if not partner and not dry_run:
+            state.add_log("warning", f"OB→BH [{ch}] 거래처 자동매칭 실패 — 거래처 없이 출고등록",
+                          "config.ob_channel_partner에 거래처 ID를 지정하면 해결", source="ob-orders")
         if dry_run:
             results["registered"].append({"channel": ch, "dry_run": True, "od_count": len(od_snos),
                                            "partner": partner, "items": items_payload})
@@ -421,7 +453,7 @@ def _register_orders(orders, dry_run: bool) -> dict:
 
 
 @router.post("/register-bh")
-def register_bh(days: int = 30, channels: str = "cafe24,kakao", dry_run: bool = True):
+def register_bh(days: int = 30, channels: str = DEFAULT_CHANNELS_STR, dry_run: bool = True):
     """발송준비(35) 단계 카페24/카카오 주문을 BH 출고등록.
 
     set_bom 전개 + product_mapping으로 SKU 해석, od_sno 단위 1 트랜잭션, 중복방지.
@@ -471,7 +503,7 @@ def _do_auto_run(channels: str, days: int, do_collect: bool, do_register: bool, 
 
 
 class AutoRunReq(BaseModel):
-    channels: str = "cafe24,kakao"
+    channels: str = DEFAULT_CHANNELS_STR
     days: int = 30
     do_collect: bool = True
     do_register: bool = True
@@ -497,7 +529,7 @@ def auto_run(body: AutoRunReq):
 #   ob_auto_interval_min(int) — interval 모드
 _AUTO_DEFAULTS = {"ob_auto_enabled": False, "ob_auto_mode": "times",
                   "ob_auto_times": "09:00,13:00,17:00", "ob_auto_interval_min": 30,
-                  "ob_auto_channels": "cafe24,kakao", "ob_auto_days": 30}
+                  "ob_auto_channels": DEFAULT_CHANNELS_STR, "ob_auto_days": 30}
 _auto_status = {"last_run": None, "last_result": None, "last_error": None,
                 "running": False, "next_runs": []}
 

@@ -11,9 +11,12 @@ import {
 // 단계 파이프라인 순서
 const STAGE_ORDER = ['order', 'putOrder', 'outReady', 'shipReady', 'shipWait']
 
-const CHANNEL_TAG: Record<string, { label: string; color: string }> = {
-  cafe24: { label: '카페24', color: 'magenta' },
-  kakao: { label: '카카오', color: 'gold' },
+// 자동화 대상 채널 (백엔드 CHANNEL_DEFS와 키 일치)
+const CHANNEL_TAG: Record<string, { label: string; color: string; hex: string; bg: string }> = {
+  cafe24: { label: '카페24', color: 'magenta', hex: '#c2185b', bg: '#fce4ec' },
+  cafe24_djna: { label: '자사몰 DJ&A', color: 'purple', hex: '#6d28d9', bg: '#ede9fe' },
+  kakao: { label: '카카오', color: 'gold', hex: '#a16207', bg: '#fef9c3' },
+  coupang: { label: '쿠팡', color: 'volcano', hex: '#c2410c', bg: '#ffedd5' },
 }
 
 // 30분 단위 시각 옵션 (00:00 ~ 23:30)
@@ -129,14 +132,21 @@ export default function OBOrders() {
     { title: '주문일', dataIndex: 'od_dtm', width: 150 },
   ]
 
-  const cafe24Count = data?.channels.find(c => c.is_cafe24)
-  const kakaoCount = data?.channels.find(c => c.is_kakao)
   const rows = data?.stages[stage] || []
+  // 자동화 대상 채널 카드: 백엔드가 분류한 channel 키 기준 (target_channels 순서)
+  const channelCards = (data?.target_channels || Object.keys(CHANNEL_TAG)).map(key => ({
+    key,
+    name: CHANNEL_TAG[key]?.label || key,
+    color: CHANNEL_TAG[key]?.hex || '#374151',
+    bg: CHANNEL_TAG[key]?.bg || '#f3f4f6',
+    ch: data?.channels.find(c => c.channel === key),
+    cnt: STAGE_ORDER.reduce((n, st) => n + (data?.stages[st] || []).filter(o => o.channel === key).length, 0),
+  }))
 
   return (
     <div>
       <div className="page-header">
-        <h1 className="page-title">OB 주문 (카페24·카카오)</h1>
+        <h1 className="page-title">OB 주문 (카페24·DJ&A·카카오·쿠팡)</h1>
         <p className="page-desc">아워박스 수집 주문을 단계별로 추적하고 발송준비 시 BoxHero로 자동 출고등록</p>
       </div>
 
@@ -244,15 +254,12 @@ export default function OBOrders() {
       {/* 채널 상태 */}
       {data && (
         <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
-          {[
-            { name: '카페24', ch: cafe24Count, color: '#c2185b', bg: '#fce4ec' },
-            { name: '카카오', ch: kakaoCount, color: '#a16207', bg: '#fef9c3' },
-          ].map(({ name, ch, color, bg }) => (
-            <div key={name} style={{ background: bg, border: `1px solid ${color}33`, borderRadius: 10, padding: '10px 16px', minWidth: 200 }}>
-              <div style={{ fontWeight: 800, color }}>{name}</div>
+          {channelCards.map(({ key, name, ch, color, bg, cnt }) => (
+            <div key={key} style={{ background: bg, border: `1px solid ${color}33`, borderRadius: 10, padding: '10px 16px', minWidth: 200 }}>
+              <div style={{ fontWeight: 800, color }}>{name} <span style={{ fontWeight: 500, fontSize: '0.78rem', color: '#6b7280' }}>· 기간 내 {cnt}건</span></div>
               {ch ? (
                 <div style={{ fontSize: '0.76rem', color: '#6b7280', marginTop: 2 }}>
-                  {ch.mall_nm} · 마지막 수집 {ch.colct_last_dtm || '-'}
+                  {ch.mall_nm}{ch.acc_alias_nm ? ` (${ch.acc_alias_nm})` : ''} · 마지막 수집 {ch.colct_last_dtm || '-'}
                 </div>
               ) : (
                 <div style={{ fontSize: '0.76rem', color: '#ef4444', marginTop: 2 }}>채널 미발견</div>

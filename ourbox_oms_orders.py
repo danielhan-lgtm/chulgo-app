@@ -107,30 +107,81 @@ def _date_range(days: int = 7):
     return start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
-# 카페24 / 카카오 채널 식별 키워드
-CAFE24_KW = ["카페24", "cafe24", "카페 24"]
-KAKAO_KW = ["카카오", "kakao", "톡스토어", "톡 스토어"]
+# ── 자동화 대상 채널 정의 ───────────────────────────────────────────
+# key: 앱/설정에서 쓰는 채널 키 (ob_auto_channels 콤마 목록)
+#   label      사람이 읽는 이름
+#   sach_cds   OMS 판매처코드 — 수집채널(mall_acc)과 주문행(sach_cd)이 같은 체계라 1순위 식별
+#   kw         이름 폴백 키워드 (sach_cd 못 찾을 때, 수집채널명+별칭 / 주문행 판매처명)
+#   partner_kw BoxHero 거래처 이름 매칭 (앞에 올수록 우선, 정확한 이름 먼저)
+#   partner_exclude 거래처 후보에서 제외할 키워드 (예: '쿠팡' ≠ '쿠팡그로스')
+# 순서 중요: 키워드 폴백은 위에서부터 매칭 → DJ&A(카페24)가 일반 카페24보다 먼저 와야 함.
+CHANNEL_DEFS = {
+    "cafe24_djna": {"label": "자사몰 DJ&A", "sach_cds": ["SACH1219"],
+                    "kw": ["디제이앤에이", "디제이엔에이", "dj&a", "dj&amp;a", "djna"],
+                    # DJ&A는 스마트스토어(도착보장) 계정에도 붙는 이름 → 카페24 표기도 함께 있어야 함
+                    "kw_require": ["카페24", "cafe24", "카페 24"],
+                    "partner_kw": ["자사몰 dj&a(카페24)", "자사몰 dj&a", "dj&a(카페24)"]},
+    "cafe24": {"label": "카페24", "sach_cds": ["SACH0768"],
+               "kw": ["카페24", "cafe24", "카페 24"],
+               "partner_kw": ["자사몰(카페24)", "카페24", "cafe24"], "partner_exclude": ["dj&a"]},
+    "kakao": {"label": "카카오", "sach_cds": ["SACH0331"],
+              "kw": ["카카오", "kakao", "톡스토어", "톡 스토어"],
+              "partner_kw": ["카카오쇼핑", "카카오", "kakao"]},
+    "coupang": {"label": "쿠팡", "sach_cds": ["SACH1162"],
+                "kw": ["쿠팡 api", "쿠팡api", "쿠팡", "coupang"],
+                "partner_kw": ["쿠팡", "coupang"], "partner_exclude": ["그로스", "growth"]},
+}
+DEFAULT_CHANNELS = tuple(CHANNEL_DEFS.keys())
+
+# 하위호환 (예전 코드/디버그 프로브용)
+CAFE24_KW = CHANNEL_DEFS["cafe24"]["kw"]
+KAKAO_KW = CHANNEL_DEFS["kakao"]["kw"]
+
+
+def classify_channel(sach_cd, *names) -> str | None:
+    """판매처코드 → 채널키.
+
+    코드가 있으면 코드로만 판정한다 (정의에 없는 코드 = 대상 아님). 이름 폴백은 코드가
+    비어 있을 때만 — 실측상 '스마트스토어(도착보장)-DJ&A'(SACH0567)처럼 이름만 보면
+    DJ&A 자사몰로 오분류되는 계정이 있기 때문.
+    """
+    code = str(sach_cd or "").strip().upper()
+    if code:
+        for key, d in CHANNEL_DEFS.items():
+            if code in d["sach_cds"]:
+                return key
+        return None
+    import html as _h
+    blob = " ".join(_h.unescape(str(n)) for n in names if n).lower()
+    if blob.strip():
+        for key, d in CHANNEL_DEFS.items():
+            if any(k in blob for k in d["kw"]) and                (not d.get("kw_require") or any(k in blob for k in d["kw_require"])):
+                return key
+    return None
 
 
 def list_collect_channels(page, mall_svc: str = "order") -> list:
     """주문 수집 대상 몰 계정 목록 (GET selOdColctChList).
 
-    반환: [{mall_acc_sno, sach_cd, mall_nm, acc_alias_nm, colct_last_dtm, is_cafe24, is_kakao}]
+    반환: [{mall_acc_sno, sach_cd, mall_nm, acc_alias_nm, colct_last_dtm, channel, is_cafe24, is_kakao}]
+    channel: CHANNEL_DEFS 키 또는 None (자동화 대상 아님)
     """
     raw = _get_json(page, f"/om/sach/colct/ajax/selOdColctChList.do?mall_svc={mall_svc}")
     if isinstance(raw, dict) and raw.get("_error"):
         return []
     out = []
     for c in raw if isinstance(raw, list) else []:
-        nm = f"{c.get('mall_nm','')} {c.get('acc_alias_nm','')}".lower()
+        ch = classify_channel(c.get("sach_cd"), c.get("mall_nm"), c.get("acc_alias_nm"))
         out.append({
             "mall_acc_sno": c.get("mall_acc_sno"),
             "sach_cd": c.get("sach_cd"),
             "mall_nm": c.get("mall_nm"),
             "acc_alias_nm": c.get("acc_alias_nm"),
             "colct_last_dtm": c.get("colct_last_dtm"),
-            "is_cafe24": any(k in nm for k in CAFE24_KW),
-            "is_kakao": any(k in nm for k in KAKAO_KW),
+            "channel": ch,
+            "channel_label": CHANNEL_DEFS[ch]["label"] if ch else None,
+            "is_cafe24": ch in ("cafe24", "cafe24_djna"),
+            "is_kakao": ch == "kakao",
         })
     return out
 
@@ -172,17 +223,12 @@ def list_orders(page, stage: str = "order", start_dt: str = "", end_dt: str = ""
 
 
 def channel_tag(row: dict):
-    """주문 행의 판매처/몰명으로 카페24/카카오 분류 → 'cafe24'|'kakao'|None.
+    """주문 행 → 채널키 (CHANNEL_DEFS) 또는 None.
 
-    주문그리드의 sach_cd(판매처코드)는 수집채널 mall_acc의 sach_cd와 체계가 달라
-    이름 기준 매칭이 가장 안전하다.
+    주문행의 sach_cd는 수집채널(mall_acc)의 sach_cd와 같은 체계(실측: 카페24 DJ&A=SACH1219 등)
+    → 코드 1순위, 이름(sach_nm/mall_nm)은 폴백.
     """
-    blob = f"{row.get('sach_nm','')} {row.get('mall_nm','')} {row.get('sach_prod_nm','')}".lower()
-    if any(k in blob for k in CAFE24_KW):
-        return "cafe24"
-    if any(k in blob for k in KAKAO_KW):
-        return "kakao"
-    return None
+    return classify_channel(row.get("sach_cd"), row.get("sach_nm"), row.get("mall_nm"))
 
 
 def normalize_order(row: dict) -> dict:
@@ -216,7 +262,7 @@ def normalize_order(row: dict) -> dict:
 
 
 def list_target_orders(page, stage: str = "shipReady", start_dt: str = "", end_dt: str = "",
-                       channels=("cafe24", "kakao")) -> list:
+                       channels=DEFAULT_CHANNELS) -> list:
     """카페24/카카오 등 대상 채널의 주문만 (미필터 조회 후 이름 분류)."""
     raw = list_orders(page, stage, start_dt, end_dt, size=500)
     rows = raw.get("data") or []
@@ -448,7 +494,7 @@ def collect_orders(page, mall_acc_snos, date_range: str = None) -> dict:
     )
 
 
-def do_full_auto(oid: str, opw: str, start: str, end: str, channels=("cafe24", "kakao"),
+def do_full_auto(oid: str, opw: str, start: str, end: str, channels=DEFAULT_CHANNELS,
                  do_collect: bool = True, max_passes: int = 5) -> dict:
     """한 세션에서 수집 → 다단계 전진(→발송준비)까지 자동 실행.
 
@@ -461,8 +507,7 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=("cafe24", "
     with oms_session(oid, opw) as page:
         if do_collect:
             chs = list_collect_channels(page)
-            snos = [c["mall_acc_sno"] for c in chs
-                    if (c["is_cafe24"] and "cafe24" in channels) or (c["is_kakao"] and "kakao" in channels)]
+            snos = [c["mall_acc_sno"] for c in chs if c.get("channel") in channels]
             if snos:
                 out["collect"] = collect_orders(page, snos)
                 _t.sleep(4)  # 수집 반영 대기
@@ -491,6 +536,15 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=("cafe24", "
                     gres = apply_gifts(page, rows)
                     out.setdefault("gifts", []).append({"pass": p, **{k: gres.get(k) for k in
                                                         ("ok", "skipped", "events", "orders", "event_names")}})
+                    if gres.get("ok") and not gres.get("skipped"):
+                        # 사은품 적용으로 새 라인(od_sno, gift_yn=Y)이 같은 box_pack_no에 생김.
+                        # 원주문만 먼저 올리면 사은품은 다음 패스에 뒤따라가 출고준비에서
+                        # 박스가 따로 WMS 등록될 수 있음 → 다시 조회해 같은 패스에 함께 전진.
+                        rows = list_target_orders(page, stage, start, end, channels=channels)
+                        added = sorted({str(r["od_sno"]) for r in rows} - set(osnos))
+                        if added:
+                            osnos = sorted(set(osnos) | set(added))
+                            out["gifts"][-1]["gift_lines_added"] = len(added)
                 res = advance_orders(page, osnos, code, "next")
                 ok = isinstance(res.get("body"), dict) and bool(res["body"].get("result"))
                 if ok:
@@ -504,17 +558,17 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=("cafe24", "
     return out
 
 
-def do_collect(oid: str, opw: str, channels=("cafe24", "kakao"), date_range: str = None) -> dict:
+def do_collect(oid: str, opw: str, channels=DEFAULT_CHANNELS, date_range: str = None) -> dict:
     """대상 채널(카페24/카카오) 몰계정을 자동 탐지해 수집 실행."""
     with oms_session(oid, opw) as page:
         chs = list_collect_channels(page)
         snos, picked = [], []
         for c in chs:
-            if (c["is_cafe24"] and "cafe24" in channels) or (c["is_kakao"] and "kakao" in channels):
+            if c.get("channel") in channels:
                 snos.append(c["mall_acc_sno"])
                 picked.append({"mall_acc_sno": c["mall_acc_sno"], "mall_nm": c["mall_nm"]})
         if not snos:
-            return {"ok": False, "error": "대상 채널(카페24/카카오)을 찾지 못함", "channels": chs}
+            return {"ok": False, "error": f"대상 채널({','.join(channels)})을 찾지 못함", "channels": chs}
         res = collect_orders(page, snos, date_range)
         ok = isinstance(res.get("body"), dict) and res["body"].get("result") in (True, "true")
         return {"ok": ok, "picked": picked, "result": res}
@@ -566,14 +620,16 @@ def run_cli():
         oid, opw = req["oid"], req["opw"]
         if cmd == "channels":
             data = fetch_channels(oid, opw)
+        elif cmd == "channel_defs":
+            data = {"defs": CHANNEL_DEFS, "default": list(DEFAULT_CHANNELS)}
         elif cmd == "overview":
             data = fetch_overview(oid, opw, req["start"], req["end"],
-                                  tuple(req.get("channels", ["cafe24", "kakao"])), STAGE_LABELS)
+                                  tuple(req.get("channels") or DEFAULT_CHANNELS), STAGE_LABELS)
         elif cmd == "orders":
             data = fetch_orders(oid, opw, req["stage"], req["start"], req["end"],
-                                tuple(req.get("channels", ["cafe24", "kakao"])))
+                                tuple(req.get("channels") or DEFAULT_CHANNELS))
         elif cmd == "collect":
-            data = do_collect(oid, opw, tuple(req.get("channels", ["cafe24", "kakao"])),
+            data = do_collect(oid, opw, tuple(req.get("channels") or DEFAULT_CHANNELS),
                               req.get("date_range"))
         elif cmd == "advance":
             with oms_session(oid, opw) as page:
@@ -581,7 +637,7 @@ def run_cli():
                                       req.get("direction", "next"))
         elif cmd == "auto":
             data = do_full_auto(oid, opw, req["start"], req["end"],
-                                tuple(req.get("channels", ["cafe24", "kakao"])),
+                                tuple(req.get("channels") or DEFAULT_CHANNELS),
                                 req.get("do_collect", True))
         else:
             raise ValueError(f"알 수 없는 명령: {cmd}")

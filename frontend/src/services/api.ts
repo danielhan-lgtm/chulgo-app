@@ -601,6 +601,8 @@ export interface OBChannel {
   mall_nm: string
   acc_alias_nm: string
   colct_last_dtm: string
+  channel: string | null         // 자동화 채널 키 (cafe24 | cafe24_djna | kakao | coupang) 또는 null
+  channel_label?: string | null
   is_cafe24: boolean
   is_kakao: boolean
 }
@@ -610,7 +612,7 @@ export interface OBOrder {
   stage_nm: string
   od_state: string
   od_state_nm: string
-  channel: 'cafe24' | 'kakao' | null
+  channel: 'cafe24' | 'cafe24_djna' | 'kakao' | 'coupang' | null
   sach_cd: string
   sach_nm: string
   mall_nm: string

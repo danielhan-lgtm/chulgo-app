@@ -100,6 +100,7 @@ export interface DispatchRunReq {
   bh_memo: string
   mail: { to: string[]; cc: string[]; subject: string; body: string; attach_slack_files: boolean }
   invoice: DispatchInvoice
+  merge_same_receiver: boolean   // 수취인·주소가 같은 주문행을 아워박스 주문 1건으로 (택배 1박스)
   force: boolean
 }
 

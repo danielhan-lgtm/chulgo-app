@@ -126,6 +126,7 @@ export default function DispatchPanel({ channelId, ts, title }: Props) {
   const [steps, setSteps] = useState<Steps>({ ourbox: true, oms: true, boxhero: true, mail: true, slack_done: true })
   const [force, setForce] = useState(false)
   const [invoice, setInvoice] = useState<DispatchInvoice>(EMPTY_INVOICE)
+  const [mergeSame, setMergeSame] = useState(true)
 
   // 메시지가 바뀌면 초안 초기화
   useEffect(() => { setPrep(null); setResult(null); setRows([]) }, [ts])
@@ -144,6 +145,7 @@ export default function DispatchPanel({ channelId, ts, title }: Props) {
       ob_channel_code: obChannel, order_prefix: orderPrefix, bh_partner_id: bhPartner, bh_location_id: bhLocation, bh_memo: bhMemo,
       mail: { to: mailTo, cc: mailCc, subject, body, attach_slack_files: attachSlack },
       invoice,
+      merge_same_receiver: mergeSame,
     }
   }
 
@@ -321,6 +323,9 @@ export default function DispatchPanel({ channelId, ts, title }: Props) {
             품목 {rows.length}줄 · 주문 {orderNos.length}건 · {totalQty.toLocaleString()}개
             <span style={{ fontWeight: 400, color: '#9ca3af' }}> · 출처: {prep.source === 'excel' ? '첨부 엑셀(주문내역)' : prep.source === 'text' ? '메시지 품목 섹션(추정)' : '없음'}</span>
             <Button size="small" type="link" onClick={addRow}>+ 줄 추가</Button>
+            <Tooltip title="수취인·주소가 같은 주문행을 아워박스 주문 1건(택배 1박스)으로 등록. 끄면 엑셀 주문번호대로 각각 등록">
+              <Checkbox checked={mergeSame} onChange={e => setMergeSame(e.target.checked)} style={{ fontWeight: 400, marginLeft: 8 }}>같은 수취인 주문 합치기</Checkbox>
+            </Tooltip>
           </div>
           <Table size="small" rowKey="idx" columns={columns} dataSource={rows} pagination={rows.length > 20 ? { pageSize: 20, size: 'small' } : false}
             scroll={{ x: 1300 }} style={{ background: '#fff', borderRadius: 8, marginBottom: 8 }} />

@@ -4,9 +4,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report, naver_report, erhana_report, stock_gap, ob_shipped, slack_dispatch
+from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report, naver_report, erhana_report, stock_gap, stock_gap_ext, ob_shipped, slack_dispatch
 
-app = FastAPI(title="출고 라몬 API", version="2.0.0")
+app = FastAPI(title="출고 라몽 API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +44,7 @@ app.include_router(kurly_report.router, prefix="/api/kurly-report", tags=["kurly
 app.include_router(naver_report.router, prefix="/api/naver-report", tags=["naver-report"])
 app.include_router(erhana_report.router, prefix="/api/erhana-report", tags=["erhana-report"])
 app.include_router(stock_gap.router, prefix="/api/stock-gap", tags=["stock-gap"])
+app.include_router(stock_gap_ext.router, prefix="/api/stock-gap", tags=["stock-gap"])
 app.include_router(ob_shipped.router, prefix="/api/ob-shipped", tags=["ob-shipped"])
 app.include_router(slack_dispatch.router, prefix="/api/slack-dispatch", tags=["slack-dispatch"])
 
@@ -122,7 +123,7 @@ def coupang_growth_sales(from_date: str = "", to_date: str = ""):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "출고 라몬 API v2"}
+    return {"status": "ok", "app": "출고 라몽 API v2"}
 
 
 # ── OB 가용외 스냅샷 자동 추적 (2시간 간격) ──────────────────────────────────

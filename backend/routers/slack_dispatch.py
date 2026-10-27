@@ -124,8 +124,13 @@ _DEFAULTS = {
         {"kw": "샘플", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
         {"kw": "마케팅", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
         {"kw": "PPL", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
+        {"kw": "파손", "ob": "SACH0728", "bh": "CS(무상)"},
         {"kw": "CS", "ob": "SACH0728", "bh": "CS(무상)"},
         {"kw": "누락", "ob": "SACH0728", "bh": "CS(무상)"},
+        {"kw": "크리에이터", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
+        {"kw": "시딩", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
+        {"kw": "인플루언서", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
+        {"kw": "촬영", "ob": "SACH0707", "bh": "마케팅(무상/샘플)"},
     ],
     "dispatch_tag_rules": [
         {"kw": "그로스", "tag": "쿠팡 그로스 밀크런"},
@@ -251,7 +256,12 @@ def _sections(text: str) -> OrderedDict:
         num, body = parts[i], parts[i + 1]
         lines = body.strip().split("\n")
         title = lines[0].strip()
-        rest = "\n".join(l for l in lines[1:]).strip()
+        rest_lines = lines[1:]
+        # '1) 목적 : 크리에이터 제공' 처럼 제목 줄에 값이 붙은 경우 → 제목 '목적', 값은 본문 첫 줄
+        m = re.match(r"^([^:：]{1,12})\s*[:：]\s*(.+)$", title)
+        if m and m.group(2).strip():
+            title, rest_lines = m.group(1).strip(), [m.group(2).strip()] + rest_lines
+        rest = "\n".join(rest_lines).strip()
         out[f"{num}) {title}"] = rest
     return out
 
@@ -302,9 +312,17 @@ def _fmt_date(d: Optional[date]) -> str:
     return f"{d.month}/{d.day}({WEEKDAY[d.weekday()]})"
 
 
-def _title_of(text: str) -> str:
-    first = _clean(text).split("\n")[0].strip()
+def _title_of(text: str, purpose: str = "") -> str:
+    # 멘션 치환 결과('@U0A2M…' 또는 '@이름')는 제목이 아니므로 떼고 본다
+    lines = [re.sub(r"@\S+", "", l).strip() for l in _clean(text).split("\n")]
+    first = next((l for l in lines if re.search(r"[가-힣A-Za-z0-9]", l)), "")
+    # 첫 줄이 인사말이거나 '1) 목적'으로 바로 시작하면 목적 값을 제목으로
+    if not first or first.startswith("1)") or first.startswith("안녕"):
+        first = (purpose or "").split("\n")[0]
+        first = re.sub(r"^(출고\s*목적|목적)\s*[:：]\s*", "", first).strip()
+    first = first.strip("_*~ ")
     first = re.sub(r"^\[[^\]]*\]\s*", "", first).strip()  # '[출고 요청]' 머리 제거
+    first = first.strip("_*~ ")
     first = re.sub(r"\s*(출고\s*요청|요청)?\s*(드립니다|의\s*건)?\s*$", "", first).strip()  # 꼬리 '출고 요청' 제거 (제목 템플릿이 붙임)
     first = first.strip("'\"“”‘’ ")
     return first[:60]
@@ -379,10 +397,16 @@ def _norm_key(s: str) -> str:
     return re.sub(r"[\s\-_()\[\]/·,.&]+", "", html.unescape(str(s or ""))).lower()
 
 
+# 요청자 표기 ↔ 아워박스/BH 상품명 동의어 (매칭 정규화 전에 치환)
+_SYNONYMS = [("복숭아", "피치"), ("딸기", "스트로베리"), ("머시룸", "머쉬룸"), ("크리스프스", "크리스프")]
+
+
 def _mnorm(s: str) -> str:
     """매칭용 정규화: 괄호→공백, '맛' 접미 제거, 영문-숫자 붙은 토큰 분리, 소문자
     — '세라모사이드 피치맛' ≈ '세라모사이드(피치)', 'ERr731' ≈ 'ERR 731'."""
     t = re.sub(r"[()\[\]]", " ", html.unescape(str(s or "")))
+    for a, b in _SYNONYMS:
+        t = t.replace(a, b)
     t = re.sub(r"(?<=[가-힣])맛\b", "", t)
     t = re.sub(r"([A-Za-z])(\d)", r"\1 \2", t)
     return U.normalize(t).lower()
@@ -713,13 +737,17 @@ def prepare(body: PrepareReq):
     text = msg.get("text") or ""
     secs = _sections(text)
     s = _settings()
-    title = _title_of(text)
     purpose = _field(secs, "목적")
+    title = _title_of(text, purpose)
     sched = _field(secs, "일정")
     items_blk = _field(secs, "품목")
     contact = _field(secs, "담당자")
     ship = _field(secs, "운송")
     req_date = _parse_req_date(sched)
+    if not req_date:
+        m = re.search(r"(?:출고\s*)?요청일\s*[:：]?\s*([^\n]{0,40})", _clean(text))
+        if m:
+            req_date = _parse_req_date(m.group(1))
 
     # 첨부 엑셀 → 주문행
     files, rows, warnings = [], [], []
@@ -790,7 +818,7 @@ def prepare(body: PrepareReq):
     finally:
         conn.close()
 
-    ctx = "\n".join([title, purpose, items_blk, ship])
+    ctx = "\n".join([title, purpose, items_blk, ship] + [f["name"] for f in files])
     sug = _suggest_channel(ctx, s, ob_channels, partners)
     tag = _suggest_tag(ship + "\n" + purpose + "\n" + title, s)
     date_txt = _fmt_date(req_date) or _fmt_date(date.today())
@@ -902,6 +930,7 @@ class RunReq(BaseModel):
     bh_memo: str = ""
     mail: MailIn = MailIn()
     invoice: InvoiceIn = InvoiceIn()
+    merge_same_receiver: bool = False   # True면 수취인·주소가 같은 주문행을 아워박스 주문 1건으로 합침 (택배 1박스)
     force: bool = False   # True면 이미 완료된 단계도 다시 실행
 
 
@@ -1012,8 +1041,12 @@ def _run_ourbox(cfg: dict, req: RunReq, out: dict):
     if bad:
         raise HTTPException(400, f"아워박스 상품 미매칭: {', '.join(bad[:3])}")
     groups = OrderedDict()
+    merged_keys = {}
     for r in req.rows:
         key = r.order_no or "1"
+        if req.merge_same_receiver:
+            rk = (_norm_key(r.receiver), _norm_key(r.addr), r.zip.strip())
+            key = merged_keys.setdefault(rk, key)   # 같은 수취인·주소 → 첫 주문번호로 묶음
         g = groups.setdefault(key, {"row": r, "items": []})
         g["items"].append(r)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

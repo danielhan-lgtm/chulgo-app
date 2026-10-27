@@ -112,7 +112,7 @@ export default function Sidebar({ page, onPageChange, bhConnected, slackConnecte
             display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.1rem', flexShrink: 0,
           }}>📦</div>
           <div>
-            <div style={{ color: '#fff', fontWeight: 800, fontSize: '0.95rem', letterSpacing: '-0.3px', lineHeight: 1.2 }}>출고 라몬</div>
+            <div style={{ color: '#fff', fontWeight: 800, fontSize: '0.95rem', letterSpacing: '-0.3px', lineHeight: 1.2 }}>출고 라몽</div>
             <div style={{ color: '#6b6e8a', fontSize: '0.68rem' }}>박스히어로 출고 변환기</div>
           </div>
         </div>

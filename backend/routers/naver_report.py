@@ -647,6 +647,29 @@ def _render_text(s: dict) -> str:
         if hints:
             L.append("* 판정: " + " / ".join(hints))
 
+    # 월별 추이 (최근 4개월) — 출고 수량 · 전월 대비 · 결제 · 사은품. 이달은 진행중
+    hist_rows = [h for h in (s.get("history") or []) if h.get("qty")]
+    if len(hist_rows) >= 2:
+        L += ["", f"■ 월별 출고 (최근 {len(s['history'])}개월 · 주문일 기준)"]
+        prev = None
+        for h in s["history"]:
+            if not h.get("qty"):
+                prev = h
+                continue
+            cur = h["ym"] == s["month"]
+            line = f"* {h['label']}{' (진행중)' if cur else ''} — 출고 {_n(h['qty'])}개"
+            if not cur and prev and prev.get("qty"):
+                line += f" {_pct_txt(_pct(h['qty'], prev['qty']))}"
+            if h.get("pay"):
+                line += f" · 결제 {_won(h['pay'])}"
+            if h.get("gift"):
+                line += f" · 사은품 {_n(h['gift'])}개 포함"
+            L.append(line)
+            prev = h
+        past = [h for h in s["history"] if h["ym"] != s["month"] and h.get("qty")]
+        if len(past) >= 2:
+            L.append("* 흐름: " + " → ".join(f"{h['label']} {_n(h['qty'])}" for h in past) + f"개 → {ml} {_n(s.get('month_qty') or 0)}개(진행중)")
+
     # 주별 추이 (최근 6주)
     wk = [w for w in s["weeks"] if w["qty"]][-6:]
     if len(wk) >= 2:
@@ -716,8 +739,142 @@ def build_exec_block(as_of: str, month: str, idx: Optional[int] = None) -> dict:
                 "history": None, "error": str(e)[:200]}
 
 
+def sku_monthly(months: list, win: Optional[dict] = None) -> list:
+    """전 채널 SKU 추이용 — 네이버 출고를 SKU(바코드)별 월(주문일)로. _build_summary 와 같은 원천 규칙:
+    주문 관리 목록이 있는 날은 그 상품별 수량, 없는 날만 박스히어로 거래 내역(출고 +, 취소 입고 −).
+    주문 목록엔 바코드가 없어 거래 내역의 제품명→SKU 로 보완하고, 없으면 라벨로 합친다."""
+    st = _state(); aliases = st["aliases"]
+    tx = _tx_all()
+    order_days = {d: v for d, v in _orders().get("days", {}).items() if v.get("items")}
+    sku_by_name = {r["name"]: r["sku"] for r in tx if r.get("sku")}
+    agg: dict = {}
+
+    def add(name: str, sku: str, dt: str, q: int):
+        label = _label(name, aliases)
+        key = sku or f"label:{label}"
+        e = agg.setdefault(key, {"sku": sku, "label": label, "by_month": {}, "win": {}})
+        ym = dt[:7]
+        e["by_month"][ym] = e["by_month"].get(ym, 0) + q
+        if win:
+            for k in ("mtd", "mtd_prev", "w1", "w0"):
+                a, b = win[k]
+                if a <= dt <= b:
+                    e["win"][k] = e["win"].get(k, 0) + q
+
+    for r in tx:
+        if r.get("kind") not in ("출고", "입고") or r["date"] in order_days:
+            continue
+        if r["date"][:7] not in months:
+            continue
+        q = int(r.get("qty") or 0)
+        add(str(r.get("name") or ""), str(r.get("sku") or "").strip(), r["date"][:10], q if r["kind"] == "출고" else -abs(q))
+    for d, v in order_days.items():
+        if d[:7] not in months:
+            continue
+        for nm, q in v["items"].items():
+            add(nm, str(sku_by_name.get(nm) or "").strip(), d[:10], int(q))
+    return [e for e in agg.values() if any(q > 0 for q in e["by_month"].values())]
+
+
 build_exec_block.exec_key = "naver"     # build_exec_text 가 예외 블록을 만들 때 쓰는 식별자
 build_exec_block.exec_name = EXEC_NAME
+
+
+def build_exec_brief_block(as_of: str, month: str) -> dict:
+    """channel_report.build_exec_brief 의 extra 용 — 네이버는 발주가 없으니 '이달 실출고(사은품 제외)·결제 vs 지난달 같은 기간 · 주요 품목 · 최근 7일'.
+    실출고 = 주문 목록 정상 주문수량 − 사은품(이슈 열 '사은품'). 주문 목록이 없는 날은 박스히어로 출고 그대로.
+    {key, head, short, metric, period, pct, mtd, mtd_prev, weekly, next, stock, direction, lines, auto_opinion, error}"""
+    from routers.channel_report import _week_windows, _top_sku_txt, sku_windows
+    month = (month or as_of[:7])[:7]
+    s = _build_summary(as_of, month)
+    ml = s["month_label"]; pl = s["prev_month_label"]; prev_month = s["prev_month"]
+    odays = _orders().get("days") or {}
+    by_day = {x["date"]: int(x["qty"] or 0) for x in (s.get("daily") or [])}
+    gift_day = {d: int(v.get("gift") or 0) for d, v in odays.items()}
+    real_day = {d: q - gift_day.get(d, 0) for d, q in by_day.items()}
+    pay_day = {d: float(v.get("pay") or 0) for d, v in odays.items()}
+
+    def rng(a, b, m):
+        return sum(q for d, q in m.items() if a <= d <= b)
+
+    def pct_txt(p):
+        return "" if p is None else f"{'+' if p > 0 else ''}{p}%"
+
+    # 이달 누계 — 완료된 마지막 주문일(eff_to)까지. 지난달은 같은 날짜까지
+    eff = s.get("eff_to") or as_of[:10]
+    if eff[:7] != month:
+        eff = _month_end_date(month)
+    day = int(eff[8:10])
+    m_from, m_to = f"{month}-01", eff
+    p_from, p_to = f"{prev_month}-01", f"{prev_month}-{min(day, _month_days(prev_month)):02d}"
+    period = f"{ml} 1~{day}일" if day > 1 else f"{ml} 1일"
+    mq, pq = rng(m_from, m_to, real_day), rng(p_from, p_to, real_day)
+    mg, pg = rng(m_from, m_to, gift_day), rng(p_from, p_to, gift_day)
+    mp, pp = rng(m_from, m_to, pay_day), rng(p_from, p_to, pay_day)
+    pct = _pct(mq, pq) if (mq and pq) else None
+    pay_pct = _pct(mp, pp) if (mp and pp) else None
+    lines = []
+    if mq:
+        line = f"{period} 실출고 {_n(mq)}개" + (f" (전월 동기 {pct_txt(pct)})" if pct is not None else "")
+        if mp:
+            line += f" · 결제 {_won(int(mp))}" + (f" ({pct_txt(pay_pct)})" if pay_pct is not None else "")
+        if mg:
+            line += f" · 사은품 {_n(mg)}개 별도"
+        lines.append(line)
+    else:
+        lines.append(f"{period} 출고 없음" + ("" if s.get("data_to") else " (주문 목록 미업로드)"))
+    # 주요 품목 — SKU별 이달 누계 vs 지난달 같은 기간, 사은품 수량은 라벨별로 뺀다
+    try:
+        win = sku_windows(eff, month)
+        items = sku_monthly([prev_month, month], win)
+        aliases = _state()["aliases"]
+        gift_win: dict = {}
+        for d, v in odays.items():
+            for k in ("mtd", "mtd_prev"):
+                a, b = win[k]
+                if a <= d <= b:
+                    for nm, q in (v.get("gift_items") or {}).items():
+                        lb = _label(nm, aliases)
+                        gift_win.setdefault(lb, {})[k] = gift_win.get(lb, {}).get(k, 0) + int(q)
+        for it in items:
+            g = gift_win.get(it["label"])
+            if g:
+                for k, q in g.items():
+                    it["win"][k] = max(0, int(it["win"].get(k, 0)) - q)
+        top = _top_sku_txt(items, pl, word="출고", ml=ml)
+        if top:
+            lines.append(f"주요 품목 — {top}")
+    except Exception as e:
+        lines.append(f"주요 품목 집계 실패 ({str(e)[:60]})")
+    # 최근 7일 vs 직전 7일 — 실출고
+    w1 = w0 = None
+    if s.get("w1_from") and s.get("w1_to"):
+        a1, b1 = s["w1_from"], s["w1_to"]
+        a0 = (datetime.fromisoformat(a1).date() - timedelta(days=7)).isoformat()
+        b0 = (datetime.fromisoformat(a1).date() - timedelta(days=1)).isoformat()
+        w1, w0 = rng(a1, b1, real_day), rng(a0, b0, real_day)
+        if w1:
+            r7 = f"{int(a1[5:7])}/{int(a1[8:10])}~{int(b1[5:7])}/{int(b1[8:10])}"
+            p7 = _pct(w1, w0) if w0 else None
+            lines.append(f"최근 7일({r7}) 실출고 {_n(w1)}개" + (f" (직전 7일 대비 {pct_txt(p7)})" if p7 is not None else ""))
+    # 주별 실출고 (API 용)
+    wk = []
+    for w_ in _week_windows(as_of, month):
+        to = min(w_["to"], eff)
+        wk.append({**w_, "qty": (rng(w_["from"], to, real_day) if w_["from"] <= eff else 0), "current": w_["current"] or w_["to"] > eff})
+    direction = "flat" if pct is None else ("up" if pct >= 10 else ("down" if pct <= -10 else "flat"))
+    auto_opinion = {"up": "출고 회복세, 현 재고 운영 유지", "down": "출고 둔화, 현 재고 운영 유지", "flat": "출고 보합, 현 재고 운영 유지"}[direction]
+    if pct is not None:
+        auto_opinion = f"실출고 {pct_txt(pct)} (전월 동기) · " + auto_opinion
+    return {"key": "naver", "head": "네이버", "short": "네이버", "metric": "출고", "period": period, "pct": pct,
+            "mtd": {"qty": mq, "gift": mg, "pay": int(mp), "w1": w1}, "mtd_prev": {"qty": pq, "gift": pg, "pay": int(pp), "w0": w0}, "weekly": wk,
+            "next": None, "stock": [], "direction": direction, "lines": lines, "auto_opinion": auto_opinion, "error": ""}
+
+
+def _month_end_date(ym: str) -> str:
+    return f"{ym}-{_month_days(ym):02d}"
+
+build_exec_brief_block.exec_key = "naver"
 
 
 # ─────────────────────────────────────────────────────────────────

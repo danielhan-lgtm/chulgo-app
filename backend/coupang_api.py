@@ -39,12 +39,20 @@ def call(cfg: dict, method: str, path: str, query: str = "") -> dict:
     host = (cfg.get("coupang_host") or DEFAULT_HOST).rstrip("/")
     if not (access_key and secret_key):
         raise RuntimeError("쿠팡 Access Key/Secret Key가 설정되지 않았습니다.")
-    auth = _gen_authorization(method, path, query, access_key, secret_key)
     url = host + path + (("?" + query) if query else "")
-    r = requests.request(method, url, headers={
-        "Authorization": auth,
-        "Content-Type": "application/json;charset=UTF-8",
-    }, timeout=30)
+    import time as _t
+    for attempt in range(4):
+        auth = _gen_authorization(method, path, query, access_key, secret_key)   # signed-date 는 매 시도마다 새로
+        r = requests.request(method, url, headers={
+            "Authorization": auth,
+            "Content-Type": "application/json;charset=UTF-8",
+        }, timeout=30)
+        if r.status_code == 429 and attempt < 3:
+            # 분당 호출 제한 — 'Try after N seconds' 만큼 기다렸다 재시도
+            m = re.search(r"after\s+(\d+)\s*seconds", r.text)
+            _t.sleep((int(m.group(1)) if m else 30) + 1)
+            continue
+        break
     if not r.ok:
         raise RuntimeError(f"쿠팡 API {r.status_code}: {r.text[:300]}")
     try:
@@ -155,3 +163,95 @@ def fetch_purchase_orders(cfg: dict, from_date: str, to_date: str) -> tuple:
     rows = parse_purchase_orders(data)
     raw_sample = json.dumps(data, ensure_ascii=False)[:1500]
     return rows, raw_sample
+
+
+# ─────────────────────────────────────────────────────────────────
+# 로켓그로스(RG) Open API — 판매자(윙) 키로 호출. 벤더 ID 는 'A…' (coupang_vendor_id)
+#   주문:  GET /v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/orders?paidDateFrom=yyyymmdd&paidDateTo=yyyymmdd[&nextToken]
+#          (결제일 기준, 한 번에 최대 30일 · data[].orderItems[].{vendorItemId, productName, salesQuantity, unitSalesPrice})
+#   재고:  GET /v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/inventory/summaries[?vendorItemId|nextToken]
+#          (data[].inventoryDetails.totalOrderableQuantity · salesCountMap.SALES_COUNT_LAST_THIRTY_DAYS, 분당 50회 이하)
+#   공통: 호출 PC 의 공인 IP 를 윙 > 판매자정보 > 추가판매정보 > OPEN API 키 발급 에 등록해야 한다 (미등록 시 403 FORBIDDEN)
+# ─────────────────────────────────────────────────────────────────
+_RG_BASE = "/v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg"
+
+
+def _vendor_id(cfg: dict) -> str:
+    vid = (cfg.get("coupang_vendor_id") or "").strip()
+    if not vid:
+        raise RuntimeError("쿠팡 벤더 ID(coupang_vendor_id, A로 시작)가 설정되지 않았습니다.")
+    return vid
+
+
+def _rg_paged(cfg: dict, path: str, base_query: str = "") -> list:
+    """nextToken 페이징을 끝까지 따라가며 data 를 모은다."""
+    out, token, guard = [], "", 0
+    while True:
+        q = base_query + (("&" if base_query else "") + f"nextToken={token}" if token else "")
+        r = call(cfg, "GET", path, q)
+        out.extend(r.get("data") or [])
+        token = str(r.get("nextToken") or "").strip()
+        guard += 1
+        if not token or guard > 500:
+            return out
+
+
+def fetch_rg_inventory(cfg: dict) -> list:
+    """로켓그로스 재고 요약 — [{vendorItemId, externalSkuId, orderable, sales_30d}]"""
+    path = _RG_BASE.format(vendorId=_vendor_id(cfg)) + "/inventory/summaries"
+    rows = []
+    for d in _rg_paged(cfg, path):
+        inv = d.get("inventoryDetails") or {}
+        sc = d.get("salesCountMap") or {}
+        rows.append({"vendorItemId": d.get("vendorItemId"), "externalSkuId": d.get("externalSkuId"),
+                     "orderable": _num(inv.get("totalOrderableQuantity")),
+                     "sales_30d": _num(sc.get("SALES_COUNT_LAST_THIRTY_DAYS"))})
+    return rows
+
+
+def fetch_rg_orders(cfg: dict, from_date: str, to_date: str) -> list:
+    """로켓그로스 주문(결제일 기준) — 30일 단위로 끊어 수집. [{orderId, paid_at(YYYY-MM-DD), vendorItemId, productName, qty, unit_price}]"""
+    from datetime import date as _date, timedelta as _td
+    vid = _vendor_id(cfg)
+    path = _RG_BASE.format(vendorId=vid) + "/orders"
+    a = _date.fromisoformat(from_date[:10]); b = _date.fromisoformat(to_date[:10])
+    out = []
+    cur = a
+    while cur <= b:
+        end = min(cur + _td(days=29), b)
+        q = f"paidDateFrom={cur.strftime('%Y%m%d')}&paidDateTo={end.strftime('%Y%m%d')}"
+        for o in _rg_paged(cfg, path, q):
+            paid = o.get("paidAt")
+            try:
+                paid_s = datetime.fromtimestamp(int(paid) / 1000).strftime("%Y-%m-%d") if isinstance(paid, (int, float)) or str(paid).isdigit() else _norm_date(paid)
+            except Exception:
+                paid_s = _norm_date(paid)
+            for it in (o.get("orderItems") or []):
+                out.append({"orderId": o.get("orderId"), "paid_at": paid_s, "vendorItemId": it.get("vendorItemId"),
+                            "productName": str(it.get("productName") or ""), "qty": _num(it.get("salesQuantity")),
+                            "unit_price": _num(it.get("unitSalesPrice"))})
+        cur = end + _td(days=1)
+    return out
+
+
+def rg_sales_summary(cfg: dict, from_date: str, to_date: str) -> dict:
+    """기간 판매량 요약 — 품목별 수량·매출, 일별 수량, 재고 요약(가능하면). 실패 원인은 errors 로."""
+    out = {"from": from_date, "to": to_date, "items": [], "daily": [], "inventory": [], "total_qty": 0, "total_amount": 0, "errors": []}
+    try:
+        orders = fetch_rg_orders(cfg, from_date, to_date)
+        by_item, by_day = {}, {}
+        for r in orders:
+            e = by_item.setdefault(r["vendorItemId"], {"vendorItemId": r["vendorItemId"], "productName": r["productName"], "qty": 0, "amount": 0})
+            e["qty"] += r["qty"]; e["amount"] += r["qty"] * r["unit_price"]
+            by_day[r["paid_at"]] = by_day.get(r["paid_at"], 0) + r["qty"]
+        out["items"] = sorted(by_item.values(), key=lambda x: -x["qty"])
+        out["daily"] = [{"date": d, "qty": q} for d, q in sorted(by_day.items())]
+        out["total_qty"] = sum(x["qty"] for x in out["items"]); out["total_amount"] = sum(x["amount"] for x in out["items"])
+        out["orders"] = len({r["orderId"] for r in orders})
+    except Exception as e:
+        out["errors"].append(f"주문: {str(e)[:200]}")
+    try:
+        out["inventory"] = fetch_rg_inventory(cfg)
+    except Exception as e:
+        out["errors"].append(f"재고: {str(e)[:200]}")
+    return out

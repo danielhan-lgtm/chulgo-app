@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import utils_core as U
 import receiving_db as db
 import state
+from utils_core import HTTP as _HTTP
 
 router = APIRouter()
 
@@ -126,7 +127,7 @@ def get_ob_channels(days: int = Query(30), refresh: bool = Query(False)):
     max_pages = 20  # 최대 페이지 (20*100=2000행, ~30초)
     while page <= max_pages:
         try:
-            r = _req.post(
+            r = _HTTP.post(
                 "https://api.ourbox.co.kr/api/wms/out/out_perf_period",
                 headers=headers,
                 json={"out_dt_type": "1", "out_dt_from": fr, "out_dt_to": to, "page": page},
@@ -405,7 +406,7 @@ async def _stream_ai_match(prompt: str, req: AiMatchRequest):
         payload = {"contents": [{"parts": [{"text": prompt}]}],
                    "generationConfig": {"maxOutputTokens": 3000}}
         try:
-            resp = _req.post(url, json=payload, stream=True, timeout=120)
+            resp = _HTTP.post(url, json=payload, stream=True, timeout=120)
             if resp.ok:
                 for raw in resp.iter_lines(decode_unicode=True):
                     if not raw or not raw.startswith("data:"): continue

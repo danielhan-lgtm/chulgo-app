@@ -4,7 +4,10 @@
 거래명세서의 품목표(순번/마스터코드/바코드/품명/총수량/유통기한/제조일자/수량/박스당입수…)를
 읽어 라벨 생성용 품목 배열로 변환한다. PPT(라벨지) 생성은 프론트(pptxgenjs)에서 수행한다.
 """
+import difflib
 import io
+import json
+import os
 import re
 
 import anyio.to_thread
@@ -40,6 +43,58 @@ def _norm(s: str) -> str:
     # 일부 PDF 폰트는 글자 사이에 NULL(\x00)을 삽입 → 공백 처리 후 정리
     t = str(s or "").replace("\x00", " ").replace("\n", " ")
     return re.sub(r"\s+", " ", t).strip()
+
+
+
+# ─── OCR 오인식 보정 ────────────────────────────────────────────────
+# 거래명세서가 이미지 PDF라 OCR로 읽히면 '시나몬랩→시나몬램', '표고버섯 크리스프→표고버'것 크리스 프'처럼
+# 글자가 깨진다. 공급사명은 고정 교정하고, 상품명은 컬리 보고 단가표(상품코드→정식 상품명)로 치환한다.
+_SUPPLIER_NAME = "(주)시나몬랩"
+_PRICE_STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "kurly_report_state.json")
+
+
+def _fix_supplier(s: str) -> str:
+    t = _norm(s)
+    if not t or "시나몬" in t.replace(" ", "") or difflib.SequenceMatcher(None, t, _SUPPLIER_NAME).ratio() >= 0.6:
+        return _SUPPLIER_NAME
+    return t
+
+
+def _load_kurly_master() -> dict[str, str]:
+    """컬리 단가표에서 {상품코드: 정식 상품명}. 파일이 없으면 빈 dict."""
+    try:
+        with open(_PRICE_STATE_PATH, encoding="utf-8") as f:
+            items = (json.load(f).get("prices") or {}).get("items") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for v in items.values():
+        if isinstance(v, dict) and v.get("code") and v.get("name"):
+            out[str(v["code"]).strip()] = _norm(v["name"])
+    return out
+
+
+def _squash(s: str) -> str:
+    return re.sub(r"[^0-9A-Za-z가-힣&]", "", s or "")
+
+
+def _fix_item_names(items: list[dict]) -> None:
+    master = _load_kurly_master()
+    if not master:
+        return
+    by_squash = {_squash(n): n for n in master.values()}
+    for it in items:
+        code = str(it.get("code") or "").strip()
+        if code in master:
+            it["name"] = master[code]
+            continue
+        # 코드도 오인식된 경우: 특수문자·공백 제거 후 정식 명칭과 유사도 매칭
+        q = _squash(it.get("name") or "")
+        if not q:
+            continue
+        best = difflib.get_close_matches(q, by_squash.keys(), n=1, cutoff=0.8)
+        if best:
+            it["name"] = by_squash[best[0]]
 
 
 def _date(s: str) -> str:
@@ -134,13 +189,24 @@ def _ocr_find_header(words: list[tuple[str, float, float]]) -> tuple[float, dict
             cols.setdefault("barcode", cx)
         elif "비고" in t:
             cols.setdefault("note", cx)
+    # OCR이 헤더 일부를 놓치는 경우 위치를 합성한다
+    if "total" not in cols:
+        # '총수량' 글자를 통째로 놓친 경우(2026-10 평택 명세서) — 품명과 유통기한 사이 본문의 정수 토큰 x중심 중앙값으로 복원
+        lo = cols.get("name", cols.get("barcode", cols["code"]))
+        hi = cols.get("expiry") or cols.get("made") or cols.get("boxCount")
+        if hi:
+            xs = sorted(cx for t, cx, cy in words
+                        if cy > hy + 60 and re.match(r"^\d{1,5}$", t) and lo + 60 < cx < hi - 60)
+            if xs:
+                cols["total"] = xs[len(xs) // 2]
     if "total" not in cols:
         return None
-    # OCR이 헤더 일부를 놓치는 경우 위치를 합성한다
     if "name" not in cols and "barcode" in cols:
         cols["name"] = (cols["barcode"] + cols["total"]) / 2
     if "perBox" not in cols and "boxCount" in cols and "spec" in cols:
-        cols["perBox"] = (cols["boxCount"] + cols["spec"]) / 2
+        xs = sorted(cx for t, cx, cy in words
+                    if cy > hy + 60 and re.match(r"^\d{1,4}$", t) and cols["boxCount"] + 40 < cx < cols["spec"] - 40)
+        cols["perBox"] = xs[len(xs) // 2] if xs else (cols["boxCount"] + cols["spec"]) / 2
     if "name" not in cols:
         return None
     return hy, cols
@@ -427,10 +493,11 @@ async def parse_docs(files: list[UploadFile] = File(...)):
             + ("(" + " / ".join(errors) + ")" if errors else ""),
         )
 
+    _fix_item_names(items)
     return {
         "orderCode": order_code,
         "orderCodes": order_codes,
-        "supplier": supplier or "(주)시나몬랩",
+        "supplier": _fix_supplier(supplier),
         "items": items,
         "parse_errors": errors,
     }

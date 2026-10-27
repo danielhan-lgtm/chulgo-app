@@ -13,6 +13,7 @@ import requests as _req
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import utils_core as U
+from utils_core import HTTP as _HTTP
 
 router = APIRouter()
 
@@ -438,7 +439,7 @@ def _fetch_stock_map(token: str, loc_ids: set) -> dict:
         if cursor:
             params["cursor"] = cursor
         try:
-            r = _req.get(f"{BH_BASE}/v1/items",
+            r = _HTTP.get(f"{BH_BASE}/v1/items",
                          headers={"Authorization": f"Bearer {token}"},
                          params=params, timeout=20)
         except Exception:

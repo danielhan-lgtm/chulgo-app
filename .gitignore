@@ -51,3 +51,9 @@ fm_sample.json
 fm_review.txt
 fm_verify.txt
 *fm_debug.json
+
+# 컬리 라벨지 배포 빌드 산출물
+컬리_라벨지_배포/dist/
+컬리_라벨지_배포/build/
+컬리_라벨지_배포/.venv/
+컬리_라벨지_배포*.zip

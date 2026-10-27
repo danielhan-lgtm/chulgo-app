@@ -8,9 +8,11 @@ import {
   getCoupangReport, uploadCoupangReportFiles, clearCoupangReportUploads, saveCoupangReportNotes,
   getCoupangReportAliases, saveCoupangReportAliases, saveCoupangIncoming, deleteCoupangIncoming,
   getChannelPrices, saveChannelPrices, uploadChannelPrices, clearChannelPrices,
-  getChannelExecReport, saveChannelMonthly,
+  getChannelExecReport, saveChannelMonthly, getExecBrief,
 } from '../services/api'
-import type { CoupangReportSummary, CpGroup, CpStockRow, CpTrendRow, ChannelReportBase, CpPrices, ChannelExecReport } from '../services/api'
+import SkuChannelTrend from '../components/SkuChannelTrend'
+import ExecBriefNotes from '../components/ExecBriefNotes'
+import type { CoupangReportSummary, CpGroup, CpStockRow, CpTrendRow, ChannelReportBase, CpPrices, ChannelExecReport, ExecBrief } from '../services/api'
 
 export interface ChannelCfg {
   base: ChannelReportBase
@@ -39,7 +41,8 @@ export interface ChannelCfg {
 const CSS = `
 .cpr { font-family: Inter, 'Malgun Gothic', sans-serif; color:#111827; }
 .cpr .grid { display:grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, 0.95fr); gap:16px; align-items:start; }
-@media (max-width: 1200px) { .cpr .grid { grid-template-columns: 1fr; } }
+@media (max-width: 1200px) { .cpr .grid { grid-template-columns: minmax(0, 1fr); } }
+.cpr .grid > * { min-width:0; }
 .cpr .panel { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:14px 16px; margin-bottom:14px; }
 .cpr .panel h3 { margin:0 0 10px; font-size:0.95rem; font-weight:800; display:flex; align-items:center; gap:8px; }
 .cpr .panel h3 .sub { font-weight:500; color:#6b7280; font-size:0.75rem; }
@@ -109,12 +112,17 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   const [error, setError] = useState<string | null>(null)
   const [text, setText] = useState('')
   const [textDirty, setTextDirty] = useState(false)
-  type Fmt = 'compact' | 'detail' | 'exec'
+  type Fmt = 'compact' | 'detail' | 'exec' | 'brief'
   const [fmt, setFmt] = useState<Fmt>(() => { try { return (localStorage.getItem('cpr_fmt') as Fmt) || 'compact' } catch { return 'compact' } })
   const [execRep, setExecRep] = useState<ChannelExecReport | null>(null)
   const [execLoading, setExecLoading] = useState(false)
+  const [brief, setBrief] = useState<ExecBrief | null>(null)        // 경영진보고(짧은 양식) — 4채널 묶음
+  const [briefLoading, setBriefLoading] = useState(false)
   // exec: 묶음 응답이 같은 기준일일 때만 쓰고, 아니면 이 채널 단독 text_exec 로 폴백 (기준일 변경 중 옛 텍스트 덮어쓰기 방지)
-  const pick = (d: CoupangReportSummary, f: Fmt) => f === 'detail' ? d.text_detail : f === 'exec' ? ((execRep && execRep.as_of === d.as_of ? execRep.text : undefined) ?? d.text_exec) : d.text
+  const pick = (d: CoupangReportSummary, f: Fmt) => f === 'detail' ? d.text_detail
+    : f === 'exec' ? ((execRep && execRep.as_of === d.as_of ? execRep.text : undefined) ?? d.text_exec)
+    : f === 'brief' ? ((brief && brief.as_of === d.as_of) ? brief.text : '')
+    : d.text
   const [monthlyEdit, setMonthlyEdit] = useState<Record<string, { order_qty?: number | null; delivered?: number | null }>>({})
   const [monthlySaving, setMonthlySaving] = useState(false)
   const [notes, setNotes] = useState('')
@@ -171,10 +179,26 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
   }
   useEffect(() => { if (fmt === 'exec') loadExec() }, [fmt, asOf])  // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 경영진보고(짧은 양식) — '한줄정리 / [채널] 의견·지난달 마감·다음 발주·재고 일수'. 의견 저장 뒤에도 다시 집계
+  async function loadBrief(force = false) {
+    if (briefLoading) return
+    if (!force && brief && brief.as_of === asOf) return
+    setBriefLoading(true)
+    try {
+      const r = await getExecBrief(asOf, asOf.slice(0, 7))
+      setBrief(r)
+      if (!textDirty) setText(r.text)
+      r.channels.filter(c => c.error).forEach(c => message.warning(`${c.head} 집계 실패: ${c.error}`))
+    } catch (e: unknown) { message.error(e instanceof Error ? e.message : '경영진보고 조회 실패') }
+    finally { setBriefLoading(false) }
+  }
+  useEffect(() => { if (fmt === 'brief') loadBrief() }, [fmt, asOf])  // eslint-disable-line react-hooks/exhaustive-deps
+
   // 저장·업로드 뒤 다시 읽기 — 경영 요약 모드면 4채널 묶음도 다시 집계 (아니면 저장 전 텍스트로 되돌아감)
   async function reload(refreshBh = false) {
     await load(refreshBh)
     if (fmt === 'exec') await loadExec(true)
+    if (fmt === 'brief') await loadBrief(true)
   }
 
   async function saveMonthly() {
@@ -546,12 +570,13 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
             <div>
               <div className="panel">
                 <h3 style={{ flexWrap: 'wrap' }}>보고문
-                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '상세', value: 'detail' }, { label: '경영 요약 (전 채널)', value: 'exec' }]}
+                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '상세', value: 'detail' }, { label: '경영 요약 (전 채널)', value: 'exec' }, { label: '경영진보고', value: 'brief' }]}
                     onChange={v => { const f = v as Fmt; setFmt(f); try { localStorage.setItem('cpr_fmt', f) } catch { /* ignore */ } if (!textDirty) setText(pick(data, f)) }} />
-                  <span className="sub">{textDirty ? '수정 중 (새로고침해도 유지)' : fmt === 'exec' ? (execLoading ? '전 채널 집계 중…' : '전 채널 자동 생성') : '자동 생성'}</span>
+                  <span className="sub">{textDirty ? '수정 중 (새로고침해도 유지)' : fmt === 'exec' ? (execLoading ? '전 채널 집계 중…' : '전 채널 자동 생성') : fmt === 'brief' ? (briefLoading ? '전 채널 집계 중…' : '전 채널 자동 생성 · 슬랙 붙이기용') : '자동 생성'}</span>
                   <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
                     {textDirty && <Button size="small" onClick={() => { setTextDirty(false); setText(pick(data, fmt)) }}>자동 생성으로 되돌리기</Button>}
                     {fmt === 'exec' && <Button size="small" icon={<ReloadOutlined />} loading={execLoading} onClick={() => loadExec(true)}>다시 집계</Button>}
+                    {fmt === 'brief' && <Button size="small" icon={<ReloadOutlined />} loading={briefLoading} onClick={() => loadBrief(true)}>다시 집계</Button>}
                     <Button size="small" type="primary" icon={<CopyOutlined />} onClick={copyText}>복사</Button>
                   </span>
                 </h3>
@@ -596,6 +621,9 @@ export default function ChannelReport({ cfg }: { cfg: ChannelCfg }) {
                     컬리는 BH 마켓컬리 출고를 납기(입고일) 월로 묶은 값이 납품 자동값입니다(메모 납기, 없으면 다음 거래명세서 입고일 · 이알하나 제외 · 취소 입고 상계). 쿠팡·올리브영은 발주 캘린더의 입고수량이 자동값이며 BH 출고는 참고용입니다.{data.history_order_basis === 'order_date' ? ` ${cfg.name} 발주 수량은 ${cfg.poWord}의 발주일자 월 기준으로 합칩니다(납기월이 아님).` : ''} 다른 채널의 월별 보정은 각 채널 보고 화면에서 입력하세요.</div>
                 </div>
               )}
+
+              {fmt === 'exec' && <SkuChannelTrend asOf={asOf} month={asOf.slice(0, 7)} />}
+              {fmt === 'brief' && <ExecBriefNotes brief={brief} onSaved={() => { setTextDirty(false); loadBrief(true) }} />}
 
               <div className="panel">
                 <h3>■ 입고 예정 (항공분 등) <span className="sub">도착일이 납기 이전이면 납품 가능 계산에 포함</span></h3>

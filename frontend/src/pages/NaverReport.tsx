@@ -4,9 +4,11 @@ import { ReloadOutlined, CopyOutlined, UploadOutlined, DeleteOutlined, SaveOutli
 import dayjs from 'dayjs'
 import {
   getNaverReport, uploadNaverReportFiles, clearNaverReportUploads, saveNaverReportSettings,
-  getNaverReportAliases, saveNaverReportAliases, getChannelExecReport,
+  getNaverReportAliases, saveNaverReportAliases, getChannelExecReport, getExecBrief,
 } from '../services/api'
-import type { NaverReportSummary, NaverReportRow, ChannelExecReport } from '../services/api'
+import SkuChannelTrend from '../components/SkuChannelTrend'
+import ExecBriefNotes from '../components/ExecBriefNotes'
+import type { NaverReportSummary, NaverReportRow, ChannelExecReport, ExecBrief } from '../services/api'
 
 /** 네이버 스마트스토어(도착보장) 출고 보고 — 도착보장 주문 관리 목록 xlsx 를 올려
  *  '스마트스토어 … DJ&A' 거래처 출고를 일별 판매로 보고 의장 보고문을 만든다.
@@ -17,7 +19,8 @@ import type { NaverReportSummary, NaverReportRow, ChannelExecReport } from '../s
 const CSS = `
 .nvr { font-family: Inter, 'Malgun Gothic', sans-serif; color:#111827; }
 .nvr .grid { display:grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, 0.95fr); gap:16px; align-items:start; }
-@media (max-width: 1200px) { .nvr .grid { grid-template-columns: 1fr; } }
+@media (max-width: 1200px) { .nvr .grid { grid-template-columns: minmax(0, 1fr); } }
+.nvr .grid > * { min-width:0; }
 .nvr .panel { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:14px 16px; margin-bottom:14px; }
 .nvr .panel h3 { margin:0 0 10px; font-size:0.95rem; font-weight:800; display:flex; align-items:center; gap:8px; }
 .nvr .panel h3 .sub { font-weight:500; color:#6b7280; font-size:0.75rem; }
@@ -82,12 +85,16 @@ export default function NaverReport() {
   const [text, setText] = useState('')
   const [textDirty, setTextDirty] = useState(false)
   // 보고문 형식 — 간결(네이버만) / 경영 요약(쿠팡·올리브영·컬리·네이버 4채널 묶음, 슬랙 붙이기용)
-  type Fmt = 'compact' | 'exec'
-  const [fmt, setFmt] = useState<Fmt>(() => { try { return localStorage.getItem('nvr_fmt') === 'exec' ? 'exec' : 'compact' } catch { return 'compact' } })
+  type Fmt = 'compact' | 'exec' | 'brief'
+  const [fmt, setFmt] = useState<Fmt>(() => { try { const v = localStorage.getItem('nvr_fmt'); return v === 'exec' || v === 'brief' ? v : 'compact' } catch { return 'compact' } })
   const [execLoading, setExecLoading] = useState(false)
   const execRef = useRef<ChannelExecReport | null>(null)   // load() 클로저가 최신 전 채널 결과를 보도록 ref 로 보관
+  const [brief, setBrief] = useState<ExecBrief | null>(null)   // 경영진보고(짧은 양식)
+  const briefRef = useRef<ExecBrief | null>(null)
+  const [briefLoading, setBriefLoading] = useState(false)
   // 형식별 본문 — 전 채널 묶음은 기준일이 같을 때만 쓰고, 아니면 네이버 블록(text_exec)으로 대체
   const pick = (d: NaverReportSummary, f: Fmt) => {
+    if (f === 'brief') { const b = briefRef.current; return (b && b.as_of === d.as_of) ? b.text : '' }
     if (f !== 'exec') return d.text
     const r = execRef.current
     return (r && r.as_of === d.as_of ? r.text : undefined) ?? d.text_exec ?? d.text
@@ -132,10 +139,27 @@ export default function NaverReport() {
   }
   useEffect(() => { if (fmt === 'exec') loadExec() }, [fmt, asOf])  // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 경영진보고(짧은 양식) — 4채널 '한줄정리 / 의견·지난달 마감·다음 발주·재고 일수'
+  async function loadBrief(force = false) {
+    if (briefLoading) return
+    const cur = briefRef.current
+    if (!force && cur && cur.as_of === asOf) return
+    setBriefLoading(true)
+    try {
+      const r = await getExecBrief(asOf, asOf.slice(0, 7))
+      briefRef.current = r; setBrief(r)
+      if (!textDirty) setText(r.text)
+      r.channels.filter(c => c.error).forEach(c => message.warning(`${c.head} 집계 실패: ${c.error}`))
+    } catch (e: unknown) { message.error((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || (e instanceof Error ? e.message : '경영진보고 조회 실패')) }
+    finally { setBriefLoading(false) }
+  }
+  useEffect(() => { if (fmt === 'brief') loadBrief() }, [fmt, asOf])  // eslint-disable-line react-hooks/exhaustive-deps
+
   // 자료가 바뀐 뒤 다시 읽기 — 전 채널 요약 형식이면 묶음도 다시 집계
   async function reload(refresh = false) {
     await load(refresh)
     if (fmt === 'exec') await loadExec(true)
+    if (fmt === 'brief') await loadBrief(true)
   }
 
   // 파일 여러 개 드롭 시 한 번에 업로드 (antd Upload 는 파일별로 beforeUpload 호출)
@@ -307,12 +331,13 @@ export default function NaverReport() {
             <div>
               <div className="panel">
                 <h3 style={{ flexWrap: 'wrap' }}>보고문
-                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '경영 요약 (전 채널)', value: 'exec' }]}
+                  <Segmented size="small" value={fmt} options={[{ label: '간결', value: 'compact' }, { label: '경영 요약 (전 채널)', value: 'exec' }, { label: '경영진보고', value: 'brief' }]}
                     onChange={v => { const f = v as Fmt; setFmt(f); try { localStorage.setItem('nvr_fmt', f) } catch { /* ignore */ } if (!textDirty) setText(pick(data, f)) }} />
-                  <span className="sub">{textDirty ? '수정 중' : fmt === 'exec' ? (execLoading ? '전 채널 집계 중…' : '전 채널 자동 생성') : '자동 생성'}</span>
+                  <span className="sub">{textDirty ? '수정 중' : fmt === 'exec' ? (execLoading ? '전 채널 집계 중…' : '전 채널 자동 생성') : fmt === 'brief' ? (briefLoading ? '전 채널 집계 중…' : '전 채널 자동 생성 · 슬랙 붙이기용') : '자동 생성'}</span>
                   <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
                     {textDirty && <Button size="small" onClick={() => { setTextDirty(false); setText(pick(data, fmt)) }}>자동 생성으로 되돌리기</Button>}
                     {fmt === 'exec' && <Button size="small" icon={<ReloadOutlined />} loading={execLoading} onClick={() => loadExec(true)}>다시 집계</Button>}
+                    {fmt === 'brief' && <Button size="small" icon={<ReloadOutlined />} loading={briefLoading} onClick={() => loadBrief(true)}>다시 집계</Button>}
                     <Button size="small" type="primary" icon={<CopyOutlined />} onClick={copyText}>복사</Button>
                   </span>
                 </h3>
@@ -346,6 +371,9 @@ export default function NaverReport() {
                   <div className="hint" style={{ marginTop: 6 }}>출고 수량과 사은품 모두 도착보장 주문 관리 목록(manageList xlsx) 기준입니다 (사은품은 '이슈=사은품' 행). 주문 목록이 없는 과거 날짜만 박스히어로 거래 내역으로 보완되고, 보고문에는 "사은품 출고 … (위 출고에 포함 · 별도 표기)" 줄로 들어갑니다.</div>
                 </div>
               )}
+
+              {fmt === 'exec' && <SkuChannelTrend asOf={asOf} month={asOf.slice(0, 7)} />}
+              {fmt === 'brief' && <ExecBriefNotes brief={brief} onSaved={() => { setTextDirty(false); loadBrief(true) }} />}
 
               <div className="panel">
                 <h3>■ 특이사항 <span className="sub">보고문 끝에 붙음</span>

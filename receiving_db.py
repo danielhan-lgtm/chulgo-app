@@ -156,6 +156,23 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_recon_status_period ON reconcile_status(period);
             CREATE INDEX IF NOT EXISTS idx_recon_status_status ON reconcile_status(status);
+
+            -- 재고 차이 추적: 양쪽(BH·OB) 재고 일별 스냅샷 (품목 키 단위, 하루 1행) ──────
+            -- 주간 리포트보다 촘촘하게 '언제 벌어졌는지'를 실측으로 남긴다.
+            CREATE TABLE IF NOT EXISTS stock_gap_daily (
+                date TEXT NOT NULL,
+                location_ids TEXT DEFAULT '',
+                key TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                bh_stock INTEGER,
+                ob_total INTEGER,
+                ob_avail INTEGER,
+                ob_unav INTEGER,
+                diff INTEGER,
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(date, location_ids, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stock_gap_daily_date ON stock_gap_daily(location_ids, date);
         """)
         _migrate_name_mapping_many_to_many(conn)
         _migrate_matched_pairs_ob_name(conn)
@@ -690,6 +707,50 @@ def delete_reconcile_status(row_key: str):
     """정리 상태 삭제 (다시 '미처리'로 되돌림)."""
     with _conn() as conn:
         conn.execute("DELETE FROM reconcile_status WHERE row_key=?", (row_key,))
+
+
+# ── 재고 차이 추적: 양쪽 재고 일별 스냅샷 ───────────────────────────────────
+
+def save_stock_gap_daily(date: str, location_ids: str, rows: list) -> int:
+    """get_stock 결과 rows를 날짜별로 upsert. 양쪽 재고가 모두 있는 행만 저장. 저장 건수 반환."""
+    recs = []
+    for r in rows or []:
+        bh, ob = r.get("bh_stock"), r.get("ob_stock_total")
+        if bh is None or ob is None or not r.get("key"):
+            continue
+        recs.append((date, location_ids or "", str(r["key"]), str(r.get("name") or ""),
+                     int(bh), int(ob), int(r.get("ob_stock_available") or 0), int(r.get("ob_unusable") or 0),
+                     int(bh) - int(ob)))
+    if not recs:
+        return 0
+    with _conn() as conn:
+        conn.executemany(
+            """INSERT INTO stock_gap_daily (date, location_ids, key, name, bh_stock, ob_total, ob_avail, ob_unav, diff)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(date, location_ids, key) DO UPDATE SET
+                 name=excluded.name, bh_stock=excluded.bh_stock, ob_total=excluded.ob_total,
+                 ob_avail=excluded.ob_avail, ob_unav=excluded.ob_unav, diff=excluded.diff""",
+            recs,
+        )
+    return len(recs)
+
+
+def has_stock_gap_daily(date: str, location_ids: str) -> bool:
+    with _conn() as conn:
+        r = conn.execute("SELECT 1 FROM stock_gap_daily WHERE date=? AND location_ids=? LIMIT 1",
+                         (date, location_ids or "")).fetchone()
+        return bool(r)
+
+
+def get_stock_gap_history(location_ids: str, since: str, key: str = "") -> list:
+    """일별 스냅샷 시계열(시간순). key를 주면 그 품목만."""
+    q = "SELECT date, key, name, bh_stock, ob_total, ob_avail, ob_unav, diff FROM stock_gap_daily WHERE location_ids=? AND date>=?"
+    params: list = [location_ids or "", since]
+    if key:
+        q += " AND key=?"; params.append(key)
+    q += " ORDER BY date ASC"
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
 
 
 # 앱 시작 시 DB 초기화

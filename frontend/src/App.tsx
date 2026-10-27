@@ -12,6 +12,7 @@ import Receiving from './pages/Receiving'
 import DocReview from './pages/DocReview'
 import InvoicePage from './pages/InvoicePage'
 import ReconcilePage from './pages/ReconcilePage'
+import StockGapPage from './pages/StockGapPage'
 import ChannelPage from './pages/ChannelPage'
 import MappingPage from './pages/MappingPage'
 import OrderPlannerPage from './pages/OrderPlannerPage'
@@ -28,6 +29,7 @@ import CoupangReport from './pages/CoupangReport'
 import OliveyoungReport from './pages/OliveyoungReport'
 import KurlyReport from './pages/KurlyReport'
 import NaverReport from './pages/NaverReport'
+import ErhanaReport from './pages/ErhanaReport'
 import type { Page, AppConfig, Location } from './types'
 import { getConfig, getMasterStatus, getLocations, slackConnect, getGmailStatus } from './services/api'
 
@@ -141,6 +143,7 @@ export default function App() {
       case 'docreview': return <DocReview />
       case 'invoice': return <InvoicePage />
       case 'reconcile': return <ReconcilePage config={config} />
+      case 'stockgap': return <StockGapPage config={config} />
       case 'channel': return <ChannelPage config={config} />
       case 'outbound': return <OutboundForecast config={config} />
       case 'inventory': return <InventoryAnalysis config={config} locations={locations} />
@@ -149,6 +152,7 @@ export default function App() {
       case 'oliveyoungreport': return <OliveyoungReport />
       case 'kurlyreport': return <KurlyReport />
       case 'naverreport': return <NaverReport />
+      case 'erhanareport': return <ErhanaReport />
       case 'mapping': return <MappingPage config={config} />
       case 'orderplan': return <OrderPlannerPage />
       case 'skutrend': return <SkuTrendPage />

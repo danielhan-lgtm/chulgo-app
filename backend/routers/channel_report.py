@@ -27,8 +27,12 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import utils_core as U
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _PROJECT_ROOT not in sys.path:   # ourbox_api.py 는 프로젝트 루트에 있다 (inventory·reconcile 과 같은 처리)
+    sys.path.insert(0, _PROJECT_ROOT)
 from routers import order_plan as OP
 from routers.inventory import _fetch_bh_items
+from utils_core import HTTP as _HTTP
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
@@ -575,7 +579,7 @@ def _tx_detail_strict(token: str, tx_id) -> list:
     last = None
     for i in range(3):
         try:
-            r = _rq.get(f"{BH_BASE}/v1/location-txs/{tx_id}", headers=_bh_headers(token), timeout=15)
+            r = _HTTP.get(f"{BH_BASE}/v1/location-txs/{tx_id}", headers=_bh_headers(token), timeout=15)
             if r.status_code == 429 or r.status_code >= 500:
                 last = RuntimeError(f"BH 상세 {tx_id}: HTTP {r.status_code}")
                 time.sleep(2 ** i)
@@ -952,6 +956,47 @@ def _parse_oy_monthly(df: pd.DataFrame) -> dict:
     return out
 
 
+_FN_RANGE_RE = re.compile(r"(?P<m1>\d{1,2})\s*월\s*(?P<d1>\d{1,2})\s*일?\s*[~\-–∼]\s*(?:(?P<m2>\d{1,2})\s*월\s*)?(?P<d2>\d{1,2})\s*일?")
+_FN_MONTH_RE = re.compile(r"(?<![\d월])(?P<m>\d{1,2})\s*월(?!\s*\d)")
+
+
+def _period_from_filename(fname: str, today: Optional[date] = None) -> Optional[str]:
+    """올리브영 매출_재고 파일명에서 조회기간을 읽는다 → 'YYYY-MM-DD~YYYY-MM-DD'. 못 읽으면 None.
+      '9월 상품별 매출_재고 조회 _2026...'         → 그 달 1일~말일
+      '10월 1일 ~ 11일 상품별 매출_재고 조회 _...' → 10/1~10/11
+      '9월 28일 ~ 10월 4일 ...'                  → 9/28~10/4
+    연도는 파일명에 없으므로 오늘 기준: 그 달이 이번 달보다 뒤면 작년으로 본다."""
+    today = today or date.today()
+    base = os.path.basename(fname or "")
+    base = re.sub(r"_?\d{8,}", " ", base)   # 꼬리의 조회 타임스탬프(20261011154126)는 월/일로 오인하지 않게 제거
+
+    def _year(m: int) -> int:
+        return today.year - 1 if m > today.month else today.year
+
+    mt = _FN_RANGE_RE.search(base)
+    if mt:
+        m1, d1, d2 = int(mt["m1"]), int(mt["d1"]), int(mt["d2"])
+        m2 = int(mt["m2"]) if mt["m2"] else m1
+        if not (1 <= m1 <= 12 and 1 <= m2 <= 12):
+            return None
+        try:
+            a = date(_year(m1), m1, d1)
+            b = date(_year(m1) if m2 >= m1 else _year(m1) + 1, m2, d2)
+        except ValueError:
+            return None
+        if a > b:
+            a, b = b, a
+        return f"{a.isoformat()}~{b.isoformat()}"
+    mt = _FN_MONTH_RE.search(base)
+    if mt:
+        m = int(mt["m"])
+        if not 1 <= m <= 12:
+            return None
+        ym = f"{_year(m):04d}-{m:02d}"
+        return f"{ym}-01~{_month_end(ym)}"
+    return None
+
+
 def _upload_meta(sp: ChannelSpec, up: dict) -> dict:
     days = sorted((up.get("rocket") or {}).keys())
     fc = up.get("forecast") or None
@@ -1111,6 +1156,17 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         out.sort(key=lambda x: -x["qty"])
         return out
 
+    # 납기일이 기준일(오늘)과 같으면: 채널 입고확정(recv)이 잡혀 있으면 이미 납품된 것 → past,
+    # 아직 입고확정이 없으면 당일 납품 대기 → pending. (예전엔 d >= as_of 를 모두 pending 으로 봐
+    # 10/8 납기분이 입고확정 뒤에도 '미납품 발주잔량'에 남았다)
+    def _is_pending(d: str) -> bool:
+        if d > as_of:
+            return True
+        if d == as_of:
+            return not by_date[d]["recv_n"]
+        return False
+    pending_dates = {d for d in by_date if _is_pending(d)}
+
     groups = []
     for d in sorted(by_date):
         g = by_date[d]
@@ -1120,16 +1176,15 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
             "amt": g["amt"], "supply": sup(g["amt"]),
             "po_count": len(g["pos"]) if g["pos"] else len(g["files"]),
             "items": _items_out(g["items"]),
-            "status": "pending" if d >= as_of else "past",
+            "status": "pending" if d in pending_dates else "past",
         })
 
     pending = [g for g in groups if g["status"] == "pending"]
     past_month = [g for g in groups if g["status"] == "past" and g["date"] >= month_start]
 
     pend_pos = set(); pend_files = set()
-    for d in by_date:
-        if d >= as_of:
-            pend_pos |= by_date[d]["pos"]; pend_files |= by_date[d]["files"]
+    for d in pending_dates:
+        pend_pos |= by_date[d]["pos"]; pend_files |= by_date[d]["files"]
     pend_qty = sum(g["qty"] for g in pending)
     pend_conf = sum(g["conf"] for g in pending)
     pend_amt = sum(g["amt"] for g in pending)
@@ -1335,7 +1390,7 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
             continue
         lb = sku_to_label.get(sh["sku"]) or sh["name"] or sh["sku"]
         extra_by_label[lb] += sh["qty"]
-        key = a if (a and a >= as_of) else ""
+        key = a if (a and (a in pending_dates or a > as_of)) else ""
         extra_by_due[key]["qty"] += sh["qty"]
         extra_by_due[key]["supply"] += sh["qty"] * unit_supply.get(lb, 0)
     extra_qty = sum(extra_by_label.values())
@@ -1469,7 +1524,7 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         else:
             recv_supply += r["recv"] * unit_supply.get(label(r["name"]), 0)
     recv_supply = int(round(recv_supply))
-    recv_month = sum(g["recv"] or 0 for g in groups if g["date"] >= month_start and g["date"][:7] == month and g["date"] < as_of)
+    recv_month = sum(g["recv"] or 0 for g in groups if g["date"] >= month_start and g["date"][:7] == month and g["status"] == "past")
     recv_by_label: dict = defaultdict(int)
     for g in groups:
         if g["date"][:7] == month:
@@ -1513,6 +1568,15 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         month_ship_supply = int(round(max(0.0, _tot))) if ship_fetch_ok else None
 
     core = sorted(pend_by_label.items(), key=lambda kv: -kv[1]["qty"])[:2]
+    # 경영진보고용 창 — 이달 1일~기준일 / 지난달 같은 기간, 그리고 지난달 1일 주부터 기준일까지 주별
+    _win = sku_windows(as_of, month)
+    _weeks = _week_windows(as_of, month)
+    _wins = {"mtd": _win["mtd"], "mtd_prev": _win["mtd_prev"]}
+    _wins.update({f"wk{i}": (w_["from"], w_["to"]) for i, w_ in enumerate(_weeks)})
+    _ws = _window_sums(sp, rows, _wins, vat=vat, unit_supply=unit_supply, label=label)
+    _brief_windows = ({"mtd": _ws["mtd"], "mtd_prev": _ws["mtd_prev"], "mtd_range": _win["mtd"], "mtd_prev_range": _win["mtd_prev"]},
+                      [dict(w_, **_ws[f"wk{i}"]) for i, w_ in enumerate(_weeks)])
+
     summary = {
         "channel": sp.key, "channel_name": sp.display, "has_conf": sp.has_conf, "conf_word": sp.conf_word,
         "amt_includes_vat": (sp.amt_includes_vat and not sp.supply_includes_vat), "has_amt": has_amt, "has_recv": sp.has_recv, "prices": price_meta,
@@ -1565,6 +1629,7 @@ def _build_summary(sp: ChannelSpec, as_of: str, month: str, refresh_bh: bool = F
         "all_groups": [{"date": g["date"], "md": g["md"], "qty": g["qty"], "amt": g["amt"], "supply": g["supply"], "status": g["status"]}
                        for g in groups],
         "history": _build_history(sp, rows, month, bh_monthly=bh_monthly, vat=vat, unit_supply=unit_supply, label=label),
+        "windows": _brief_windows[0], "weekly": _brief_windows[1],   # 경영진보고: 이달 1일~기준일 vs 지난달 같은 기간, 주별 합계
         "history_order_basis": ("order_date" if sp.history_by_order_date else "due"),   # 월별 추이 발주 수량 귀속 기준
         "unit_basis": sp.unit_basis,   # 세트 상품을 단품으로 풀어 집계했는지 (쿠팡)
         "exec_metric": sp.exec_metric,
@@ -1721,7 +1786,8 @@ def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
                 e["price"] = v.get("price") or e["price"]
                 e["promo"] = v.get("promo") or e["promo"]
     rows = []
-    prev = months[-2] if len(months) >= 2 else None
+    # 비교 기간은 최신 기간과 겹치지 않는 가장 최근 조회기간 — '10/1~11' 과 '10/1~15' 처럼 겹치는 파일을 올려도 지난달과 비교한다
+    prev = next((m for m in reversed(months[:-1]) if bounds[m][1] < bounds[latest][0]), (months[-2] if len(months) >= 2 else None))
     pdays = bounds[prev][2] if prev else None
     for lb, e in per_label.items():
         cur = e["sales"].get(latest, 0)
@@ -1754,7 +1820,7 @@ def _build_trend_monthly(up: dict, amap: dict, as_of: str, month: str) -> dict:
             "total_retail": sum(r["sales_retail"] for r in rows),
             "total_store": sum(r["sales_store"] for r in rows), "total_online": sum(r["sales_online"] for r in rows),
             "prev": prev, "prev_days": pdays, "prev_label": (bounds[prev][3] if prev else ""),
-            "total_sales_prev": (sum(r["sales_series"][-2] for r in rows) if prev else None)}
+            "total_sales_prev": (sum(per_label[r["label"]]["sales"].get(prev, 0) for r in rows) if prev else None)}   # 비교 기간(prev)의 합계 — sales_series[-2] 는 겹치는 파일일 수 있다
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1894,6 +1960,32 @@ def _render_text_detail(sp: ChannelSpec, s: dict) -> str:
     elif dv["groups"]:
         L.append("* 지난 납기분 미납 없음")
 
+    # 월별 추이 — 최근 4개월 발주·납품 수량(금액) 한 줄씩. 이달은 진행중 표시. 금액 없는 채널은 후처리(_strip_money)에서 금액이 빠진다
+    hist = [h for h in (s.get("history") or []) if h.get("order_qty") or h.get("delivered")]
+    if hist:
+        dword = sp.recv_word if sp.has_recv else "납품"
+        basis = "발주일" if sp.history_by_order_date else "납기"
+        L += ["", f"■ 월별 추이 (최근 {len(s['history'])}개월 · 발주는 {basis} 월 기준)", ""]
+        prev = None
+        for h in s["history"]:
+            if not (h.get("order_qty") or h.get("delivered")):
+                prev = h
+                continue
+            cur = h["ym"] == s["month"]
+            bits = []
+            if h.get("order_qty"):
+                pct = _pct_txt(_pct_of(h["order_qty"], (prev or {}).get("order_qty"))) if not cur else ""
+                bits.append(f"발주 {_n(h['order_qty'])}개" + (f" · 공급가 {_won(h['order_supply'])}" if h.get("order_supply") else "") + (f" {pct}" if pct else ""))
+            if h.get("delivered"):
+                pct = _pct_txt(_pct_of(h["delivered"], (prev or {}).get("delivered"))) if not cur else ""
+                bits.append(f"{dword} {_n(h['delivered'])}개" + (f" · 공급가 {_won(h['recv_supply'])}" if h.get("recv_supply") else "") + (f" {pct}" if pct else ""))
+            L.append(f"* {h['label']}{' (진행중)' if cur else ''} — " + " / ".join(bits) + (" · 수기 보정" if h.get("override") else ""))
+            prev = h
+        past = [h for h in s["history"] if h["ym"] != s["month"] and h.get("order_qty")]
+        if len(past) >= 2:
+            L.append("* 발주 흐름: " + " → ".join(f"{h['label']} {_n(h['order_qty'])}" for h in past) + "개"
+                     + (f" → {s['month_label']} {_n(next((h['order_qty'] for h in s['history'] if h['ym'] == s['month']), 0))}개(진행중)"))
+
     basis_txt = "아워박스 가용재고" if s.get("ob_connected") else "박스히어로 재고"
     L += ["", f"■ 자사 재고 및 납품 가능 ({basis_txt} 기준)", ""]
     if not s["bh_connected"]:
@@ -1964,6 +2056,13 @@ def _pct1(a: float, b: float) -> str:
         return "0%"
     v = a / b * 100
     return f"{round(v)}%" if abs(v - round(v)) < 0.05 else f"{v:.1f}%"
+
+
+def _pct_of(a, b):
+    """전월 대비 % (둘 다 있을 때만, 정수). 없으면 None"""
+    if not a or not b:
+        return None
+    return round((a - b) / b * 100)
 
 
 def _pct_txt(tp) -> str:
@@ -2104,6 +2203,60 @@ def _prev_months(month: str, n: int = 4) -> list:
         while mm <= 0:
             yy, mm = yy - 1, mm + 12
         out.append(f"{yy:04d}-{mm:02d}")
+    return out
+
+
+def _week_windows(as_of: str, month: str) -> list:
+    """지난달 1일이 속한 주(월요일 시작)부터 기준일이 속한 주까지 — [{label:'9/1주', from, to, current}]"""
+    d = datetime.fromisoformat(as_of[:10]).date()
+    if as_of[:7] != month:
+        d = datetime.fromisoformat(_month_end(month)).date()
+    prev = _prev_months(month, 2)[0]
+    start = datetime.fromisoformat(prev + "-01").date()
+    start = start - timedelta(days=start.weekday())
+    out = []
+    first = datetime.fromisoformat(prev + "-01").date()
+    while start <= d:
+        end = start + timedelta(days=6)
+        lb = max(start, first)   # 지난달 1일이 낀 첫 주는 '9/1주' 로 (8/31 월요일 시작이어도)
+        out.append({"label": f"{lb.month}/{lb.day}주", "from": start.isoformat(), "to": end.isoformat(), "current": end > d})
+        start = end + timedelta(days=1)
+    return out
+
+
+def _window_sums(sp: ChannelSpec, rows: list, windows: dict, vat: float = 1.0, unit_supply: Optional[dict] = None, label=None) -> dict:
+    """임의 날짜 창별 발주·납품 합계 — {name: {order_qty, order_supply, recv, recv_n, recv_supply}}.
+    귀속 규칙은 _build_history 와 같다: 발주는 발주일(history_by_order_date 채널) 또는 납기, 납품(입고)은 납기."""
+    unit_supply = unit_supply or {}
+    out = {k: {"order_qty": 0, "order_supply": 0.0, "recv": 0, "recv_n": 0, "recv_supply": 0.0} for k in windows}
+    for r in rows:
+        dt = (r["date"] or "")[:10]
+        if not dt:
+            continue
+        odt = ((r.get("order_date") or "")[:10] if sp.history_by_order_date else "") or dt
+        oamt = r.get("order_amt")
+        if oamt is None:
+            oamt = r.get("amt")
+        for k, (a, b) in windows.items():
+            e = out[k]
+            if a <= odt <= b:
+                e["order_qty"] += int(r.get("order_qty", r["qty"]) or 0)
+                if oamt is not None:
+                    e["order_supply"] += int(oamt) / vat
+            if a <= dt <= b and r.get("recv") is not None:
+                e["recv"] += int(r["recv"]); e["recv_n"] += 1
+                if r.get("recv_amt") and not sp.qty_is_conf:
+                    e["recv_supply"] += r["recv_amt"] / vat
+                elif sp.qty_is_conf and r.get("amt") and r["qty"]:
+                    e["recv_supply"] += r["recv"] * (r["amt"] / r["qty"]) / vat
+                elif label is not None:
+                    e["recv_supply"] += r["recv"] * unit_supply.get(label(r["name"]), 0)
+    for e in out.values():
+        e["order_supply"] = int(round(e["order_supply"]))
+        e["recv_supply"] = int(round(e["recv_supply"]))
+        if not sp.has_recv:
+            # 입고확정 절차가 없는 채널(컬리): 발주 = 납품
+            e["recv"], e["recv_n"], e["recv_supply"] = e["order_qty"], (1 if e["order_qty"] else 0), e["order_supply"]
     return out
 
 
@@ -2281,6 +2434,127 @@ def build_exec_text(specs: list, as_of: str, month: str = "", extra_blocks: Opti
     return {"as_of": as_of, "as_of_md": _md(as_of), "month": month, "text": "\n\n".join(blocks), "channels": channels}
 
 
+def sku_windows(as_of: str, month: str) -> dict:
+    """이달(진행중) 비교 창 — {mtd:(from,to), mtd_prev:(from,to), w1:(from,to), w0:(from,to), day:int}
+    mtd = 이달 1일~기준일, mtd_prev = 전월 1일~같은 날(전월이 짧으면 말일), w1 = 기준일 포함 최근 7일, w0 = 그 직전 7일."""
+    d = datetime.fromisoformat(as_of[:10]).date()
+    if as_of[:7] != month:   # 지난 달을 보는 경우: 그 달 전체를 '이달'로
+        d = datetime.fromisoformat(_month_end(month)).date()
+    prev = _prev_months(month, 2)[0]
+    pend = min(d.day, int(_month_end(prev)[8:10]))
+    return {"mtd": (f"{month}-01", d.isoformat()), "mtd_prev": (f"{prev}-01", f"{prev}-{pend:02d}"),
+            "w1": ((d - timedelta(days=6)).isoformat(), d.isoformat()),
+            "w0": ((d - timedelta(days=13)).isoformat(), (d - timedelta(days=7)).isoformat()), "day": d.day}
+
+
+def _win_add(e: dict, dt: str, q: int, win: dict) -> None:
+    for k in ("mtd", "mtd_prev", "w1", "w0"):
+        a, b = win[k]
+        if a <= dt <= b:
+            e["win"][k] = e["win"].get(k, 0) + q
+
+
+def channel_sku_monthly(sp: ChannelSpec, months: list, win: Optional[dict] = None, metric: Optional[str] = None) -> list:
+    """한 채널의 SKU별 월 수량 — 경영 요약 첫 줄과 같은 지표(exec_metric). [{sku, label, by_month{ym: qty}, win{mtd, mtd_prev, w1, w0}}]
+    recv 채널(쿠팡): 입고등록 수량(납기월). order 채널(올리브영): 발주 수량(납기월 또는 발주일 월).
+    입고확정이 없는 채널(컬리): 발주 수량(납기월) — 보고 관행대로 '발주'라 부르는 납품 물량.
+    win(sku_windows)이 있으면 같은 날짜 기준으로 이달 비교 창 수량도 붙인다."""
+    rows, _ = _channel_rows(sp)
+    amap = _alias_map(sp)
+    bmap = _barcode_map(sp)
+    use_recv = ((metric or sp.exec_metric) == "recv" and sp.has_recv)   # metric="order" 면 입고 채널도 발주 수량으로
+    agg: dict = {}
+    for r in rows:
+        dt = (r["date"] or "")[:10]
+        if use_recv:
+            q = r.get("recv")
+            if q is None:
+                continue
+        else:
+            if sp.history_by_order_date and r.get("order_date"):
+                dt = str(r["order_date"])[:10]
+            q = r.get("order_qty", r["qty"])
+        ym = dt[:7]
+        if ym not in months or not q:
+            continue
+        name = r["name"]
+        label = _label_of(name, amap)
+        sku = str(bmap.get(_nkey(name)) or "").strip()
+        key = sku or f"label:{label}"
+        e = agg.setdefault(key, {"sku": sku, "label": label, "by_month": {}, "win": {}})
+        e["by_month"][ym] = e["by_month"].get(ym, 0) + int(q)
+        if win:
+            _win_add(e, dt, int(q), win)
+    return list(agg.values())
+
+
+def build_sku_trend(specs: list, as_of: str, month: str = "", n: int = 4, extra: Optional[list] = None) -> dict:
+    """전 채널 SKU별 월별 추이 — 채널마다 channel_sku_monthly 를 돌려 바코드(없으면 라벨)로 합친다.
+    extra: [(key, name, metric_word, fn(months) → [{sku, label, by_month}])] 발주 엔진 밖 채널(네이버).
+    {months:[{ym,label,current}], channels:[{key,name,metric,error}], rows:[{key, sku, label, by:{ch:{ym:q}}, total:{ym:q}, sum}]}"""
+    month = (month or as_of[:7])[:7]
+    months = _prev_months(month, n)
+    win = sku_windows(as_of, month)
+    channels, per_ch = [], []
+    for sp in specs:
+        word = sp.exec_metric_word or ("납품" if sp.exec_metric == "recv" else "발주")
+        if sp.exec_metric == "recv" and sp.has_recv:
+            word = sp.recv_word
+        channels.append({"key": sp.key, "name": sp.exec_name or sp.display, "metric": word, "error": ""})
+        try:
+            per_ch.append(channel_sku_monthly(sp, months, win))
+        except Exception as e:
+            channels[-1]["error"] = str(e)[:200]
+            per_ch.append([])
+    for key, name, word, fn in (extra or []):
+        channels.append({"key": key, "name": name, "metric": word, "error": ""})
+        try:
+            per_ch.append(fn(months, win))
+        except Exception as e:
+            channels[-1]["error"] = str(e)[:200]
+            per_ch.append([])
+    rows: dict = {}
+    label_key: dict = {}   # 라벨 → 바코드 키 (바코드 없는 채널 행을 같은 라벨의 바코드 행에 붙이기)
+    for ch, items in zip(channels, per_ch):
+        for it in items:
+            key = it["sku"] or label_key.get(it["label"]) or f"label:{it['label']}"
+            if it["sku"]:
+                label_key.setdefault(it["label"], it["sku"])
+                lk = f"label:{it['label']}"
+                if lk in rows:   # 먼저 라벨로 들어온 행을 바코드 행으로 합친다
+                    old = rows.pop(lk)
+                    row = rows.setdefault(key, {"key": key, "sku": it["sku"], "label": old["label"], "by": {}, "win_by": {}})
+                    for c, bm in old["by"].items():
+                        for ym, q in bm.items():
+                            row["by"].setdefault(c, {})[ym] = row["by"].get(c, {}).get(ym, 0) + q
+                    for c, wm in old["win_by"].items():
+                        for k, q in wm.items():
+                            row["win_by"].setdefault(c, {})[k] = row["win_by"].get(c, {}).get(k, 0) + q
+            row = rows.setdefault(key, {"key": key, "sku": it["sku"], "label": it["label"], "by": {}, "win_by": {}})
+            bm = row["by"].setdefault(ch["key"], {})
+            for ym, q in it["by_month"].items():
+                bm[ym] = bm.get(ym, 0) + int(q)
+            wm = row["win_by"].setdefault(ch["key"], {})
+            for k, q in (it.get("win") or {}).items():
+                wm[k] = wm.get(k, 0) + int(q)
+    out = []
+    for row in rows.values():
+        tot = {ym: sum(bm.get(ym, 0) for bm in row["by"].values()) for ym in months}
+        row["total"] = tot
+        row["sum"] = sum(tot.values())
+        row["win"] = {k: sum(wm.get(k, 0) for wm in row["win_by"].values()) for k in ("mtd", "mtd_prev", "w1", "w0")}
+        out.append(row)
+    last_full = months[-2] if len(months) >= 2 else months[-1]
+    out.sort(key=lambda r: (-r["total"].get(last_full, 0), -r["sum"]))
+    wins = {k: v for k, v in win.items() if k != "day"}
+    windows = {k: {"from": a, "to": b, "label": f"{int(a[5:7])}/{int(a[8:10])}~{int(b[5:7])}/{int(b[8:10])}"} for k, (a, b) in wins.items()}
+    windows["day"] = win["day"]
+    return {"as_of": as_of, "month": month,
+            "months": [{"ym": ym, "label": f"{int(ym[5:7])}월", "current": ym == month} for ym in months],
+            "windows": windows,
+            "channels": channels, "rows": out}
+
+
 # ─────────────────────────────────────────────────────────────────
 # 라우터
 # ─────────────────────────────────────────────────────────────────
@@ -2378,9 +2652,16 @@ def make_router(sp: ChannelSpec) -> APIRouter:
                 elif low.endswith((".xlsx", ".xls")):
                     df = pd.read_excel(io.BytesIO(data), header=None)
                     if _is_oy_monthly(df):
-                        up["monthly"][period] = _parse_oy_monthly(df)
+                        # 조회기간은 파일명('9월 …' / '10월 1일 ~ 11일 …')에서 우선 읽고, 없으면 화면의 날짜 범위
+                        fperiod = _period_from_filename(fname)
+                        pkey = fperiod or period
+                        if len(pkey) == 7:   # 옛 방식 YYYY-MM → 1일~말일
+                            pkey = f"{pkey}-01~{_month_end(pkey)}"
+                        up["monthly"][pkey] = _parse_oy_monthly(df)
                         kind = "monthly"
-                        added.append({"filename": fname, "type": kind, "period": period, "items": len(up["monthly"][period])})
+                        period = pkey
+                        added.append({"filename": fname, "type": kind, "period": pkey, "items": len(up["monthly"][pkey]),
+                                      "period_from": "filename" if fperiod else "picker"})
                     else:
                         up["forecast"] = {**_parse_forecast_xlsx(df), "filename": fname, "uploaded_at": now}
                         kind = "forecast"
@@ -2388,7 +2669,9 @@ def make_router(sp: ChannelSpec) -> APIRouter:
                 else:
                     errors.append(f"{fname}: 지원하지 않는 형식(csv/xlsx만)")
                     continue
-                up["files"] = [x for x in up["files"] if x.get("filename") != fname]
+                # 같은 파일명, 또는 같은 조회기간의 이전 월별 파일은 목록에서 내린다 (기간당 최신 파일 하나만)
+                up["files"] = [x for x in up["files"] if x.get("filename") != fname
+                               and not (kind == "monthly" and x.get("period") == period)]
                 up["files"].append({"filename": fname, "uploaded_at": now, "type": kind,
                                     **({"period": period} if kind == "monthly" else {})})
             except Exception as e:
@@ -2559,3 +2842,207 @@ def make_router(sp: ChannelSpec) -> APIRouter:
         return {"ok": True, "overrides": st["aliases"]}
 
     return router
+
+
+# ─────────────────────────────────────────────────────────────────
+# 경영진보고(슬랙 붙이기용 짧은 양식) — 채널마다 '지난달 마감 · 다음 발주 · 재고 일수' 한두 줄
+# ─────────────────────────────────────────────────────────────────
+BRIEF_SHORT = {"coupang": "쿠팡", "oliveyoung": "올영", "kurly": "컬리", "naver": "네이버"}   # 한줄정리용 짧은 이름
+BRIEF_HEAD = {"coupang": "쿠팡", "oliveyoung": "올리브영", "kurly": "컬리", "naver": "네이버"}  # [섹션] 이름
+BRIEF_EMOJI = {"up": "📈", "down": "📉", "flat": "➡️"}   # 📈 📉 ➡️ — 유니코드라 앱 화면·슬랙 양쪽에서 그림으로 보인다
+
+
+def _vs_txt(pct, word: str = "전월대비") -> str:
+    """' (전월대비 +19%)' — 값이 있을 때만"""
+    if pct is None:
+        return ""
+    return " (%s %s%d%%)" % (word, "+" if pct > 0 else "", pct)
+
+
+def _sales_pct(t: dict) -> tuple:
+    """채널 판매 증감 — (pct, 설명). 쿠팡(daily): 최근 14일 일평균 vs 직전 14일. 올리브영(monthly): 이달 일평균 vs 지난달 일평균.
+    판매 자료가 없는 채널(컬리)은 (None, '')."""
+    if not t or not t.get("rows"):
+        return None, ""
+    if t.get("mode") == "monthly":
+        cur, el, pv, pd = t.get("total_sales"), t.get("elapsed_days") or 0, t.get("total_sales_prev"), t.get("prev_days") or 0
+        if cur and el and pv and pd:
+            return round((cur / el) / (pv / pd) * 100 - 100), f"{t.get('period_label', '이달')} 일평균 vs {t.get('prev_label', '지난달')}"
+        return None, ""
+    a = sum((r.get("avg_7d") or 0) for r in t["rows"]); b = sum((r.get("avg_prev_7d") or 0) for r in t["rows"])
+    if a and b:
+        return round((a - b) / b * 100), f"{t.get('period_label', '최근 14일')} 일평균 vs 직전"
+    return None, ""
+
+
+def _top_sku_txt(items: list, pl: str, n: int = 1, word: str = "발주", ml: str = "이달") -> str:
+    """대표 품목 한 줄 — 이달 많이 나간 순 n개 + 지난달엔 있었는데 이달 끊긴 품목 묶음.
+    '베지크리스프 660개 (-88%) · 머쉬룸 오리지널 180개 (-99%) · 스모크칠리·믹스드 10월 발주 없음'"""
+    rows = []
+    for it in items:
+        w = it.get("win") or {}
+        c, p = int(w.get("mtd") or 0), int(w.get("mtd_prev") or 0)
+        if c > 0 or p > 0:
+            rows.append((it["label"], c, p))
+    top = sorted([r for r in rows if r[1] > 0], key=lambda r: -r[1])[:n]
+    parts = []
+    for lb, c, p in top:
+        pct = _pct_of(c, p)
+        parts.append(f"{lb} {_n(c)}개" + (f" ({'+' if pct > 0 else ''}{pct}%)" if pct is not None else " (신규)"))
+    # 끊긴 품목 — 지난달 같은 기간 물량이 큰 순 3개까지 이름만
+    big = max((r[1] for r in top), default=0)   # 지난달 물량이 이달 1위의 20% 이상인 품목만 '끊김'으로 언급
+    gone = sorted([r for r in rows if r[1] == 0 and r[2] >= max(1, big * 0.2)], key=lambda r: -r[2])[:1]
+    if gone:
+        parts.append("·".join(r[0] for r in gone) + f" {word} 없음")
+    return " · ".join(parts)
+
+
+def _weekly_txt(word: str, vals: list) -> str:
+    """주별 추이 한 줄 — [(label '9/1주', qty, current)] → '주별 납품 — 9월 4,581 → 10,023 → 64,801 / 10월 693 → 1,754개(진행중)'
+    앞쪽 자료 없는 주는 생략. 월이 바뀌는 곳에 '/ 10월' 을 넣어 라벨을 줄인다."""
+    while vals and vals[0][1] == 0:
+        vals = vals[1:]
+    if not vals:
+        return ""
+    parts, cur_m = [], None
+    for i, (lb, q, c) in enumerate(vals):
+        m = int(lb.split("/")[0])
+        txt = _n(q)
+        if i == len(vals) - 1:
+            txt += "개" + ("(진행중)" if c else "")
+        if m != cur_m:
+            parts.append(("/ " if parts else "") + f"{m}월 {txt}")
+            cur_m = m
+        else:
+            parts.append("→ " + txt)
+    return f"주별 {word} — " + " ".join(parts)
+
+
+def _brief_channel(sp: ChannelSpec, s: dict, as_of: str) -> dict:
+    """한 채널의 경영진보고 재료 — 이달 누계(1일~기준일)와 지난달 같은 기간 비교, 주별 추이, 재고 일수.
+    {key, head, short, metric, mtd{...}, mtd_prev{...}, pct, weekly[], next{md, supply, qty, pending}, stock[{label, days}],
+     direction(up/down/flat), lines[], auto_opinion, error}"""
+    month = s["month"]; ml = s["month_label"]
+    has_amt = s.get("has_amt", True)
+    prev_ym = _prev_months(month, 2)[0]; pl = f"{int(prev_ym[5:7])}월"
+    w = s.get("windows") or {}
+    cur, prev = w.get("mtd") or {}, w.get("mtd_prev") or {}
+    rng = w.get("mtd_range") or (f"{month}-01", as_of[:10])
+    day = int(rng[1][8:10])
+    period = f"{ml} 1~{day}일" if day > 1 else f"{ml} 1일"
+    recv_word = sp.recv_word if sp.has_recv else "납품"
+
+    def amt_qty(amt, qty):
+        return f"{_won(amt)} ({_n(qty)}개)" if (has_amt and amt) else f"{_n(qty)}개"
+
+    # 다음 발주 — 납기 미도래 발주 중 가장 가까운 것 (가장 큰 미납 그룹의 10% 미만인 자투리는 건너뛴다)
+    pend = sorted([g for g in (s["orders"].get("groups") or []) if (g.get("qty") or 0) > 0], key=lambda g: g["date"])
+    nxt = None
+    if pend:
+        big = max(g["qty"] for g in pend)
+        g = next((g for g in pend if g["qty"] >= big * 0.1), pend[0])
+        nxt = {"md": g["md"], "supply": (g.get("supply") if has_amt else None), "qty": g.get("qty"), "pending": True, "more": len(pend) - 1}
+
+    # 재고 일수 — 채널 판매 추이 행의 '재고 ÷ 일평균 판매' (판매 많은 순 4개)
+    t = s.get("trend") or {}
+    stock = [{"label": r["label"], "days": int(round(r["days_of_supply"]))}
+             for r in (t.get("rows") or []) if r.get("days_of_supply") is not None][:4]
+    low = [x for x in stock if x["days"] <= 7]
+
+    lines = []
+    # 1) 이달 발주 누계 (지난달 같은 기간 대비 %) + 다음 납기 대기
+    o_pct = _pct_of(cur.get("order_supply"), prev.get("order_supply")) if (has_amt and cur.get("order_supply") and prev.get("order_supply")) \
+        else _pct_of(cur.get("order_qty"), prev.get("order_qty"))
+    r_pct = (_pct_of(cur.get("recv_supply"), prev.get("recv_supply")) if (has_amt and cur.get("recv_supply") and prev.get("recv_supply"))
+             else _pct_of(cur.get("recv"), prev.get("recv"))) if sp.has_recv else None
+    vs = f" (전월 동기 {'+' if o_pct > 0 else ''}{o_pct}%)" if o_pct is not None else (f" ({pl} 동기 실적 없음)" if not prev.get("order_qty") else "")
+    # 금액이 있으면 금액만, 없으면 수량만 — 둘 다 적지 않는다
+    val = _won(cur.get("order_supply")) if (has_amt and cur.get("order_supply")) else f"{_n(cur.get('order_qty'))}개"
+    line = (f"{period} 발주 {val}{vs}" if cur.get("order_qty") else f"{period} 발주 없음{vs}")
+    if nxt:
+        line += f" · {nxt['md']} 납기 {(_won(nxt['supply']) if nxt.get('supply') else _n(nxt['qty']) + '개')} 대기"
+    lines.append(line)
+    # 2) 대표 품목 — 발주 수량 기준 SKU별 이달 누계 vs 지난달 같은 기간 (위 발주 줄과 같은 모집단)
+    try:
+        skus = channel_sku_monthly(sp, [prev_ym, month], sku_windows(as_of, month), metric="order")
+        top = _top_sku_txt(skus, pl, word="발주", ml=ml)
+        if top:
+            lines.append(f"주요 품목 — {top}")
+    except Exception as e:   # 품목 집계 실패가 보고 전체를 막지 않게
+        lines.append(f"주요 품목 집계 실패 ({str(e)[:60]})")
+    weekly = s.get("weekly") or []   # 주별 합계는 API 로만 내보낸다 (보고문에서는 뺌)
+    # 4) 재고 일수
+    if stock:
+        lines.append("재고 — " + " · ".join(f"{x['label']} {x['days']}일분" for x in stock))
+
+    # 방향 — 이달 발주 누계를 지난달 같은 기간과 비교 (±10%). 재고 7일분 이하 품목이 있으면 '증가'
+    pct = o_pct
+    direction = "flat" if pct is None else ("up" if pct >= 10 else ("down" if pct <= -10 else "flat"))
+    if low:
+        direction = "up"
+    if low:
+        auto_opinion = " · ".join(f"{x['label']} 재고 {x['days']}일분" for x in low) + " — 발주 증가 예상"
+    else:
+        auto_opinion = {"up": "발주 증가 구간", "down": f"{sp.display} 보유재고 소진 전까지 발주 감소 구간", "flat": "발주 유지 구간"}[direction]
+    # 발주 증감과 별개로 소비자 판매 자체가 얼마나 움직였는지 — 쿠팡 로켓 판매 리포트 · 올리브영 매출 파일
+    sales_pct, sales_note = _sales_pct(t)
+    if sales_pct is not None:
+        auto_opinion = f"{sp.display} 판매 {'+' if sales_pct > 0 else ''}{sales_pct}% ({sales_note}) · " + auto_opinion
+    return {"key": sp.key, "head": BRIEF_HEAD.get(sp.key, sp.display), "short": BRIEF_SHORT.get(sp.key, sp.display), "metric": "발주",
+            "period": period, "mtd": cur, "mtd_prev": prev, "pct": pct, "recv_pct": r_pct, "weekly": weekly, "sales_pct": sales_pct, "sales_note": sales_note,
+            "next": nxt, "stock": stock, "direction": direction, "lines": lines, "auto_opinion": auto_opinion, "error": ""}
+
+
+BRIEF_WORDS = {"발주": {"down": "발주 감소", "up": "발주 증가", "flat": "발주 유지"},
+               "출고": {"down": "출고 둔화", "up": "출고 회복세", "flat": "출고 보합"}}
+
+
+def build_exec_brief(specs: list, as_of: str, month: str = "", extra: Optional[list] = None, notes: Optional[dict] = None) -> dict:
+    """경영진보고 양식 —
+        안녕하세요, 10/2 기준 DJ&A(수입제품) 발주·납품 현황 보고드립니다.
+        한줄정리 / [쿠팡] 의견·마감·재고 / … / 감사합니다.
+    extra: 발주 엔진 밖 채널의 블록 생성기 fn(as_of, month) → _brief_channel 과 같은 dict (네이버).
+    notes: {title, headline, opinions{key: str}} 사용자 입력. 비어 있으면 자동 문구."""
+    month = (month or as_of[:7])[:7]
+    notes = notes or {}
+    ops = notes.get("opinions") or {}
+
+    def failed(key, head, short, e):
+        return {"key": key, "head": head, "short": short, "closed": None, "next": None, "stock": [], "direction": "flat",
+                "metric": "발주", "lines": [], "auto_opinion": "", "error": str(e)[:200]}
+
+    chans = []
+    for sp in specs:
+        try:
+            chans.append(_brief_channel(sp, _build_summary(sp, as_of, month), as_of))
+        except Exception as e:
+            chans.append(failed(sp.key, BRIEF_HEAD.get(sp.key, sp.display), BRIEF_SHORT.get(sp.key, sp.display), e))
+    for fn in (extra or []):
+        key = getattr(fn, "exec_key", "extra")
+        try:
+            chans.append(fn(as_of, month))
+        except Exception as e:
+            chans.append(failed(key, BRIEF_HEAD.get(key, key), BRIEF_SHORT.get(key, key), e))
+    title = (notes.get("title") or "DJ&A(수입제품) 발주·납품 현황").strip()
+    L = ["안녕하세요, %s 기준 %s 보고드립니다." % (_md(as_of), title), "", "한줄정리"]
+    headline = (notes.get("headline") or "").strip()
+    if headline:
+        L += [ln.strip() if ln.lstrip().startswith("•") else "• " + ln.strip() for ln in headline.splitlines() if ln.strip()]
+    else:
+        # 같은 지표·방향끼리 묶어 '쿠팡·컬리 — 발주 감소' 식으로 (네이버는 출고 지표라 따로)
+        for metric in ("발주", "출고"):
+            for d in ("down", "up", "flat"):
+                grp = [c for c in chans if c["direction"] == d and c.get("metric", "발주") == metric and not c["error"]]
+                if grp:
+                    L.append("• %s — %s %s" % ("·".join(c["short"] for c in grp), BRIEF_WORDS[metric][d], BRIEF_EMOJI[d]))
+    for c in chans:
+        L += ["", "[%s]" % c["head"]]
+        if c["error"]:
+            L.append("• 집계 실패 (%s)" % c["error"][:80])
+            continue
+        op = (ops.get(c["key"]) or "").strip() or c["auto_opinion"]
+        if op:
+            L.append("• 의견 : " + op)
+        L += ["• " + ln for ln in c["lines"]]
+    L += ["", "감사합니다."]
+    return {"as_of": as_of, "as_of_md": _md(as_of), "month": month, "text": "\n".join(L), "channels": chans, "notes": notes}

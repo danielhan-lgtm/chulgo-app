@@ -331,7 +331,7 @@ def _notify_unmapped(unmapped: list):
             return
         ch = str(cfg.get("slack_outbound_channel") or "물류_출고").strip()
         channel_id = ch
-        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):
+        if not re.fullmatch(r"[CGDUW][A-Z0-9]{6,}", ch):
             channel_id = U.fetch_slack_channels(slack).get(ch, "")
         if not channel_id:
             return
@@ -695,7 +695,7 @@ def _prerun_session_check(slot: str):
             return
         ch = str(cfg.get("slack_outbound_channel") or "물류_출고").strip()
         channel_id = ch
-        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):
+        if not re.fullmatch(r"[CGDUW][A-Z0-9]{6,}", ch):
             channel_id = U.fetch_slack_channels(slack).get(ch, "")
         if not channel_id:
             return
@@ -814,15 +814,21 @@ def _launch_login_window() -> bool:
 
 
 def _notify_session_expired(detail: str, window_opened: bool = False):
-    """세션 만료를 슬랙으로 알림 (만료 이벤트당 1회)."""
+    """세션 만료를 슬랙으로 알림 (만료 이벤트당 1회).
+
+    기본은 비활성 — 슬랙 채널에 알림을 받으려면 config.json에 "ourbox_expiry_slack_notify": true.
+    (앱 내 로그 + 로그인 창 자동 실행은 이 설정과 무관하게 동작)
+    """
     try:
         cfg = _load_cfg()
+        if not cfg.get("ourbox_expiry_slack_notify", False):
+            return
         slack = cfg.get("slack_token", "")
         if not slack:
             return
         ch = str(cfg.get("slack_outbound_channel") or "물류_출고").strip()
         channel_id = ch
-        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):
+        if not re.fullmatch(r"[CGDUW][A-Z0-9]{6,}", ch):
             channel_id = U.fetch_slack_channels(slack).get(ch, "")
         if not channel_id:
             return

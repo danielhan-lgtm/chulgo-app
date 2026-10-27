@@ -57,3 +57,35 @@ def reset_report(page_key: str):
         del d[page_key]
         _save(d)
     return {"ok": True}
+
+
+
+# ── 경영진보고(짧은 양식) 사용자 입력 — 제목·한줄정리·채널별 의견. 비우면 자동 문구가 들어간다 ──
+_BRIEF_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "exec_brief_notes.json")
+
+
+class BriefNotes(BaseModel):
+    title: str = ""                 # '' = 기본 'DJ&A(수입제품) 발주·납품 현황'
+    headline: str = ""              # 한줄정리 (줄마다 한 항목, '•' 없이 써도 됨). '' = 자동
+    opinions: dict = {}             # {coupang|oliveyoung|kurly|naver: 의견}. '' = 자동
+    updated_at: str = ""
+
+
+def load_brief_notes() -> dict:
+    try:
+        if os.path.exists(_BRIEF_PATH):
+            with open(_BRIEF_PATH, "r", encoding="utf-8") as f:
+                return BriefNotes(**json.load(f)).model_dump()
+    except Exception:
+        pass
+    return BriefNotes().model_dump()
+
+
+def save_brief_notes(body: BriefNotes) -> dict:
+    d = body.model_dump()
+    d["opinions"] = {k: str(v or "") for k, v in (d.get("opinions") or {}).items()}
+    d["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    os.makedirs(os.path.dirname(_BRIEF_PATH), exist_ok=True)
+    with open(_BRIEF_PATH, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    return d

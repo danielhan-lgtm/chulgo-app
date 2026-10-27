@@ -7,6 +7,7 @@ import {
   getOBSessionStatus, startOBSessionLogin,
   type OBOverview, type OBOrder, type OBAutoConfig, type OBSessionStatus,
 } from '../services/api'
+import OBShippedPanel from '../components/OBShippedPanel'
 
 // 단계 파이프라인 순서
 const STAGE_ORDER = ['order', 'putOrder', 'outReady', 'shipReady', 'shipWait']
@@ -147,8 +148,11 @@ export default function OBOrders() {
     <div>
       <div className="page-header">
         <h1 className="page-title">OB 주문 (카페24·DJ&A·카카오·쿠팡)</h1>
-        <p className="page-desc">아워박스 수집 주문을 단계별로 추적하고 발송준비 시 BoxHero로 자동 출고등록</p>
+        <p className="page-desc">카페24·DJ&A는 아워박스 물류센터가 직접 출고 → 출고실적을 BoxHero에 전산처리 · 카카오·쿠팡은 수집→단계진행→BH 등록</p>
       </div>
+
+      {/* 아워박스 자동출고(카페24·DJ&A) → BH 전산처리 */}
+      <OBShippedPanel />
 
       {/* 무인 자동화 제어판 */}
       <div style={{
@@ -161,7 +165,7 @@ export default function OBOrders() {
             <ThunderboltOutlined style={{ fontSize: '1.3rem', color: auto?.ob_auto_enabled ? '#10b981' : '#9ca3af' }} />
             <div>
               <div style={{ fontWeight: 800, fontSize: '0.95rem' }}>무인 자동화</div>
-              <div style={{ fontSize: '0.72rem', color: '#6b7280' }}>수집 → 단계진행 → BH 출고등록 자동</div>
+              <div style={{ fontSize: '0.72rem', color: '#6b7280' }}>수집 → 단계진행 → BH 출고등록 자동 (OMS 세션 필요 · 카페24는 위 전산처리로 대체)</div>
             </div>
           </div>
           <Switch

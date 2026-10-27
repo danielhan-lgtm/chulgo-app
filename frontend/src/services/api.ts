@@ -859,6 +859,47 @@ export const getStockDiffTrace = (params: {
   bh_stock?: number; ob_total?: number; ob_unav?: number; tol_days?: number
 }): Promise<StockDiffTrace> => api.get('/reconcile/stock-diff-trace', { params, timeout: 600000 }).then(r => r.data)
 
+// ── 재고 차이 추적 (BH ↔ OB 전 품목 일괄: 무엇이·언제·왜) ─────────────────
+export type GapCauseType = { type: string; count: number; impact: number; items?: number }
+export type GapTopCause = { type: string; impact: number; date: string; qty: number; desc: string; memo?: string; channel?: string }
+export type GapObserved = { date: string; diff: number; bh: number; ob: number; src: 'weekly' | 'daily' }
+export type GapItem = {
+  key: string; name: string; bh_skus: string[]; ob_codes: string[]
+  bh_stock: number | null; ob_total: number | null; ob_avail?: number | null; ob_unav: number
+  diff: number | null; only_side?: 'bh' | 'ob' | null; manual?: unknown
+  opening_gap: number | null; flow_diff: number | null; explained: number | null; residual: number | null
+  first_gap_date: string; last_change_date: string; change_days: number; timing_days: number; n_changes: number
+  cause_types: GapCauseType[]; top_causes: GapTopCause[]; headline: string
+  bh_in?: number; bh_out?: number; ob_in?: number; ob_out?: number
+  observed: GapObserved[]
+}
+export type GapDayEvent = { type: string; dir: '+' | '-'; qty: number; memo: string; channel: string }
+export type GapChange = {
+  date: string; d_gap: number; gap_after: number; bh_net: number; ob_net: number
+  bh_events: GapDayEvent[]; ob_events: GapDayEvent[]
+  causes: { type: string; impact: number; desc: string }[]
+  verdict: string; kind: 'cause' | 'partial' | 'timing'
+}
+export type GapDetail = GapItem & {
+  trace: StockDiffTrace | null
+  changes: GapChange[]
+  series: { date: string; gap: number; bh: number; ob: number }[]
+}
+export type GapSummary = {
+  total: number; ok: number; diff: number; bh_more: number; ob_more: number; abs_gap: number
+  only_bh: number; only_ob: number; explained: number; opening: number; unresolved?: number; cause_summary: GapCauseType[]
+}
+export type GapResult = {
+  ran_at: string; from: string; to: string; months: number; tol_days: number; location_ids: string
+  ob_source: string; elapsed_sec: number; summary: GapSummary | null; errors: string[]; items: GapItem[]
+}
+export const runStockGap = (params: { token: string; location_ids?: string; months?: number; tol_days?: number }): Promise<GapResult> =>
+  api.get('/stock-gap/analyze', { params, timeout: 900000 }).then(r => r.data)
+export const getStockGapLast = (): Promise<GapResult> =>
+  api.get('/stock-gap/last', { timeout: 30000 }).then(r => r.data)
+export const getStockGapItem = (key: string): Promise<GapDetail> =>
+  api.get('/stock-gap/item', { params: { key }, timeout: 60000 }).then(r => r.data)
+
 // OB 가용외(할당) 스냅샷 시계열 — 가용→가용외 할당이 언제 떨어지는지 추적
 export type StockSnap = { captured_at: string; total: number; available: number; unavailable: number; codes: number; d_unavail: number; d_avail: number; d_total: number }
 export const getStockSnapshots = (params: {
@@ -1343,6 +1384,24 @@ export interface CpHistoryRow { ym: string; label: string; order_qty: number | n
 export interface ChannelExecReport { as_of: string; as_of_md: string; month: string; text: string; channels: { key: string; name: string; text: string; history: unknown[] | null; error: string }[] }
 export const getChannelExecReport = (asOf?: string, month?: string): Promise<ChannelExecReport> =>
   api.get('/channel-report/exec', { params: { as_of: asOf || '', month: month || '' }, timeout: 300000 }).then(r => r.data)
+
+// 경영진보고(짧은 슬랙 양식) — '한줄정리 / [채널] 의견·지난달 마감·다음 발주·재고 일수'
+export interface ExecBriefNotes { title: string; headline: string; opinions: Record<string, string>; updated_at: string }
+export interface ExecBriefChannel {
+  key: string; head: string; short: string; direction: 'up' | 'down' | 'flat'; metric: string
+  period?: string                          // '10월 1~15일'
+  pct?: number | null                      // 이달 누계 vs 지난달 같은 기간 (발주 / 네이버는 출고)
+  mtd?: Record<string, number>; mtd_prev?: Record<string, number>
+  weekly?: { label: string; from: string; to: string; current: boolean; order_qty?: number; recv?: number; qty?: number }[]
+  next: { md: string; supply: number | null; qty: number | null; pending: boolean; more: number } | null
+  stock: { label: string; days: number }[]; lines: string[]; auto_opinion: string; error: string
+}
+export interface ExecBrief { as_of: string; as_of_md: string; month: string; text: string; channels: ExecBriefChannel[]; notes: ExecBriefNotes }
+export const getExecBrief = (asOf?: string, month?: string): Promise<ExecBrief> =>
+  api.get('/channel-report/exec/brief', { params: { as_of: asOf || '', month: month || '' }, timeout: 300000 }).then(r => r.data)
+export const getExecBriefNotes = (): Promise<ExecBriefNotes> => api.get('/channel-report/exec/brief/notes').then(r => r.data)
+export const saveExecBriefNotes = (n: Partial<ExecBriefNotes>): Promise<ExecBriefNotes> =>
+  api.put('/channel-report/exec/brief/notes', n).then(r => r.data)
 export interface ChannelSkuTrend {
   as_of: string; month: string
   months: { ym: string; label: string; current: boolean }[]
@@ -1473,3 +1532,78 @@ export interface SalesTrend {
 }
 export const getSalesTrend = (channelKey: 'coupang' | 'oliveyoung', asOf?: string): Promise<SalesTrend> =>
   api.get(`/${channelKey}-report/sales-trend`, { params: asOf ? { as_of: asOf } : {} }).then(r => r.data)
+
+// ── 이알하나 통합 보고 — 아워박스 출고(채널별)·재고 + 컬리 발주 ──
+export interface ErhanaChannel { name: string; mtd: number; prev: number; pct: number | null; w1: number; w0: number; pay_mtd?: number | null; pay_prev?: number | null; pay_pct?: number | null }
+export interface ErhanaProduct { label: string; mtd: number; prev: number; pct: number | null; available: number | null; total_stock: number | null; days: number | null }
+export interface ErhanaNotes { title: string; headline: string; opinion: string; updated_at: string }
+export interface ErhanaReport {
+  as_of: string; as_of_md: string; month: string; month_label: string; prev_month: string; prev_month_label: string; period: string
+  windows: { mtd: [string, string]; mtd_prev: [string, string]; w1: [string, string]; w0: [string, string] }
+  channels: ErhanaChannel[]
+  total: { mtd: number; prev: number; pct: number | null; w1: number; w0: number; w1_pct: number | null; daily: number; pay_mtd?: number; pay_prev?: number; pay_pct?: number | null; pay_w1?: number; pay_w0?: number; pay_w1_pct?: number | null }
+  pay_error?: string
+  rg?: { mtd: { qty: number; amount: number }; prev: { qty: number; amount: number }; pct: number | null; qty_pct: number | null; items: { label: string; qty: number; amount: number }[]; error: string; fetched_at: string }
+  products: ErhanaProduct[]
+  kurly: { mtd: number; prev: number; pct: number | null; pending: { date: string; md: string; qty: number; items: { label: string; qty: number }[] }[]; error: string }
+  stock_error: string; ob: { from: string; to: string; fetched_at: string; cached: boolean; error: string }; ob_error: string
+  notes: ErhanaNotes; text: string
+}
+export const getErhanaReport = (asOf?: string, refresh = false): Promise<ErhanaReport> =>
+  api.get('/erhana-report/summary', { params: { as_of: asOf || '', refresh: refresh ? 1 : 0 }, timeout: 300000 }).then(r => r.data)
+export const saveErhanaNotes = (n: Partial<ErhanaNotes>): Promise<ErhanaNotes> => api.put('/erhana-report/notes', n).then(r => r.data)
+
+
+// ── 아워박스 자동출고(카페24·DJ&A) → BH 전산처리 ─────────────────
+export type OBShippedStatus = 'ready' | 'manual_found' | 'before_start' | 'registered' | 'unmapped_only'
+export interface OBShippedItem { sku: string; name: string; qty: number }
+export interface OBShippedGroup {
+  key: string                 // "cafe24_djna|2026-10-27"
+  channel: string
+  label: string
+  out_dt: string
+  order_count: number
+  qty_total: number
+  registered_count: number
+  registered_qty: number
+  new_count: number
+  new_qty: number
+  unmapped_count: number
+  unmapped: { prod_cd: string; prod_nm: string; ods: string[] }[]
+  status: OBShippedStatus
+  partner: { id: number; name: string } | null
+  items: OBShippedItem[]
+  diff_items: OBShippedItem[]
+  bh_manual: { tx_count: number; qty: number; sku_qty: Record<string, number>; txs: { tx_id: string; date: string; memo: string; qty: number; by: string }[] }
+  memo: string
+}
+export interface OBShippedRunStatus { last_run: string | null; last_result: Record<string, number> | null; last_error: string | null; running: boolean }
+export interface OBShippedPreview {
+  from_date: string; to_date: string; channels: string[]; start_date: string; record_count: number
+  groups: OBShippedGroup[]; status: OBShippedRunStatus
+}
+export const getOBShippedPreview = (days?: number): Promise<OBShippedPreview> =>
+  api.get('/ob-shipped/preview', { params: days ? { days } : {}, timeout: 300000 }).then(r => r.data)
+export interface OBShippedRegisterResult {
+  dry_run: boolean
+  registered: { key: string; tx_id?: string; dry_run?: boolean; od_count: number; qty: number; memo: string }[]
+  skipped: { key: string; status: string; new_count: number }[]
+  errors: { key: string; error: string }[]
+  summary: { tx_registered: number; orders_included: number; qty: number; skipped: number; errors: number }
+  groups: OBShippedGroup[]
+}
+export const registerOBShipped = (body: { days?: number; dry_run: boolean; force?: boolean; keys?: string[] }): Promise<OBShippedRegisterResult> =>
+  api.post('/ob-shipped/register', body, { timeout: 600000 }).then(r => r.data)
+export interface OBShippedConfig {
+  ob_shipped_auto_enabled: boolean
+  ob_shipped_auto_times: string
+  ob_shipped_channels: string
+  ob_shipped_days: number
+  ob_shipped_start_date: string
+  status: OBShippedRunStatus
+  channel_defs: Record<string, string>
+}
+export const getOBShippedConfig = (): Promise<OBShippedConfig> =>
+  api.get('/ob-shipped/config').then(r => r.data)
+export const setOBShippedConfig = (patch: { enabled?: boolean; times?: string; channels?: string; days?: number; start_date?: string }): Promise<OBShippedConfig> =>
+  api.post('/ob-shipped/config', patch).then(r => r.data)

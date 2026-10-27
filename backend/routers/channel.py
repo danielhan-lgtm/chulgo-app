@@ -10,6 +10,7 @@ import requests as _req
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import utils_core as U
+from utils_core import HTTP as _HTTP
 
 router = APIRouter()
 
@@ -23,7 +24,7 @@ def _bh_headers(token: str) -> dict:
 def _fetch_tx_detail(token: str, tx_id: int) -> list:
     """거래 상세 → items 리스트 반환."""
     try:
-        r = _req.get(
+        r = _HTTP.get(
             f"{BH_BASE}/v1/location-txs/{tx_id}",
             headers=_bh_headers(token),
             timeout=10,
@@ -55,7 +56,7 @@ def _fetch_location_txs(token: str, location_id: int, tx_type: str,
         params = {"type": tx_type, "location_id": location_id, "limit": 100}
         if cursor:
             params["cursor"] = cursor
-        r = _req.get(f"{BH_BASE}/v1/location-txs",
+        r = _HTTP.get(f"{BH_BASE}/v1/location-txs",
                      headers=_bh_headers(token), params=params, timeout=15)
         if not r.ok:
             break
@@ -97,7 +98,7 @@ def channel_summary(
     exclude_set = {n.strip() for n in exclude_locations.split(",") if n.strip()}
 
     # 1. 위치 목록
-    locs_r = _req.get(f"{BH_BASE}/v1/locations",
+    locs_r = _HTTP.get(f"{BH_BASE}/v1/locations",
                       headers=_bh_headers(token), timeout=15)
     if not locs_r.ok:
         raise HTTPException(502, "박스히어로 위치 조회 실패")

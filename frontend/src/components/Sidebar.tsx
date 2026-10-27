@@ -6,6 +6,7 @@ import {
   ImportOutlined, AuditOutlined, FileTextOutlined, DiffOutlined, BarChartOutlined, LinkOutlined,
   CalendarOutlined, DeleteOutlined, FilePptOutlined, TagsOutlined, LineChartOutlined,
   ShopOutlined, GiftOutlined, FundOutlined, SolutionOutlined,
+  MedicineBoxOutlined,
 } from '@ant-design/icons'
 import type { Page } from '../types'
 import { uploadMaster } from '../services/api'
@@ -31,6 +32,7 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
       { key: 'oliveyoungreport', icon: <ShopOutlined />, label: '올리브영 발주 보고' },
       { key: 'kurlyreport', icon: <GiftOutlined />, label: '컬리 발주 보고' },
       { key: 'naverreport', icon: <FundOutlined />, label: '네이버 출고 보고' },
+      { key: 'erhanareport', icon: <MedicineBoxOutlined />, label: '이알하나 통합 보고' },
     ],
   },
   {
@@ -66,6 +68,7 @@ const NAV_GROUPS: { title: string; items: { key: Page; icon: React.ReactNode; la
     items: [
       { key: 'inventory', icon: <FundOutlined />, label: '재고 분석' },
       { key: 'reconcile', icon: <DiffOutlined />, label: '재고 대사' },
+      { key: 'stockgap', icon: <LineChartOutlined />, label: '재고 차이 추적' },
       { key: 'mapping', icon: <LinkOutlined />, label: '상품 매핑' },
       { key: 'disposal', icon: <DeleteOutlined />, label: '폐기 리포트' },
       { key: 'expiry', icon: <GiftOutlined />, label: '기부 리포트 (소비기한)' },

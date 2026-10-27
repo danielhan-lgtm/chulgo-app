@@ -210,7 +210,7 @@ def post_daily_summary(dry_run: bool = False) -> dict:
             return {"reason": "no_outbound_today", "tx": txcount}
 
         channel_id = ch
-        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):
+        if not re.fullmatch(r"[CGDUW][A-Z0-9]{6,}", ch):
             try:
                 channel_id = U.fetch_slack_channels(slack).get(ch, "")
             except Exception:

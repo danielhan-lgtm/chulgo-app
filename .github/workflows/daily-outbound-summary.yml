@@ -1,12 +1,8 @@
 name: Daily outbound summary
 
 on:
-  schedule:
-    # 09:05 UTC = 18:05 KST (로컬 백엔드가 18:00에 먼저 올리면 이 실행은 자동 skip)
-    # 공개 저장소 cron은 1~2시간 지연이 흔함 + 1차가 API 오류로 실패할 수 있어 2회 예약
-    # (이미 올라간 날은 채널 확인 후 skip하므로 중복 없음)
-    - cron: "5 9 * * *"
-    - cron: "35 10 * * *"
+  # 2026-10-27 자동 발송 중단 — 예약(cron) 제거, 필요 시 수동 실행만 가능
+  # (복구하려면 schedule: cron "5 9 * * *" / "35 10 * * *" = 18:05 / 19:35 KST)
   workflow_dispatch:
 
 jobs:

@@ -98,7 +98,8 @@ def invalidate_bh_txlist_cache(from_date: str = "", to_date: str = ""):
         _bh_txlist_cache = {}
     _flush_bh_txlist_cache()
 
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send"]  # send: 슬랙 출고요청 → 물류센터 메일 발송용
 GMAIL_SENDERS = [
     "inn1246919@nate.com",
     "gy.lee12@cj.net",
@@ -643,12 +644,28 @@ def slack_join_channel(token: str, channel_id: str):
     client.conversations_join(channel=channel_id)
 
 
-def slack_post_message(token: str, channel_id: str, text: str) -> dict:
-    """봇으로 채널에 메시지 전송 (chat.postMessage)."""
+def slack_post_message(token: str, channel_id: str, text: str, thread_ts: str = None) -> dict:
+    """봇으로 채널에 메시지 전송 (chat.postMessage). thread_ts를 주면 그 메시지의 스레드 답글."""
     from slack_sdk import WebClient
     client = WebClient(token=token)
-    res = client.chat_postMessage(channel=channel_id, text=text)
+    kw = {"channel": channel_id, "text": text}
+    if thread_ts:
+        kw["thread_ts"] = thread_ts
+    res = client.chat_postMessage(**kw)
     return {"ts": res.get("ts"), "channel": res.get("channel")}
+
+
+def fetch_slack_message(token: str, channel_id: str, ts: str) -> dict:
+    """채널의 특정 메시지 1건 (conversations.history inclusive). 없으면 {}."""
+    from slack_sdk import WebClient
+    client = WebClient(token=token)
+    res = client.conversations_history(channel=channel_id, latest=ts, oldest=ts, inclusive=True, limit=1)
+    msgs = res.get("messages", []) or []
+    for m in msgs:
+        if m.get("ts") == ts:
+            m["text"] = _replace_user_mentions(client, m.get("text", ""))
+            return m
+    return {}
 
 
 def slack_delete_message(token: str, channel_id: str, ts: str) -> dict:
@@ -760,7 +777,7 @@ def notify_bh_outbound(items: list, memo: str = "", title: str = "", partner: st
         if not token:
             return {"posted": False, "reason": "no_token"}
         channel_id = ch
-        if not re.fullmatch(r"[CGD][A-Z0-9]{6,}", ch):  # 이름이면 id로 변환
+        if not re.fullmatch(r"[CGDUW][A-Z0-9]{6,}", ch):  # 이름이면 id로 변환 (U/W로 시작하는 사용자 ID면 봇이 그 사람에게 DM)
             try:
                 channel_id = fetch_slack_channels(token).get(ch, "")
             except Exception:
@@ -900,6 +917,37 @@ def download_gmail_attachment(token_info: dict, message_id: str, attachment_id: 
         userId="me", messageId=message_id, id=attachment_id
     ).execute()
     return base64.urlsafe_b64decode(att["data"])
+
+
+def gmail_can_send(token_info: dict) -> bool:
+    """저장된 Gmail 토큰에 보내기(gmail.send) 권한이 있는지."""
+    scopes = (token_info or {}).get("scopes") or []
+    return any(str(sc).endswith("gmail.send") or str(sc).endswith("mail.google.com/") for sc in scopes)
+
+
+def gmail_send_message(token_info: dict, to: list, cc: list, subject: str, body: str,
+                       attachments: list = None, html: str = None) -> dict:
+    """Gmail API로 메일 발송. attachments=[(filename, bytes), ...]. 반환 {id, threadId}."""
+    import base64 as _b64
+    import mimetypes
+    from email.message import EmailMessage
+    from email.utils import formataddr
+    service = gmail_get_service(token_info)
+    msg = EmailMessage()
+    msg["To"] = ", ".join(t for t in (to or []) if t)
+    if cc:
+        msg["Cc"] = ", ".join(c for c in cc if c)
+    msg["Subject"] = subject
+    msg.set_content(body or "")
+    if html:
+        msg.add_alternative(html, subtype="html")
+    for name, data in (attachments or []):
+        ctype, _ = mimetypes.guess_type(name)
+        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+    raw = _b64.urlsafe_b64encode(msg.as_bytes()).decode()
+    res = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return {"id": res.get("id"), "threadId": res.get("threadId")}
 
 
 # ── Excel Processing ──────────────────────────────────────────────────────────

@@ -570,6 +570,61 @@ def do_full_auto(oid: str, opw: str, start: str, end: str, channels=DEFAULT_CHAN
     return out
 
 
+def push_orders_by_codes(page, codes, channel_cd: str, start: str, end: str, max_passes: int = 4) -> dict:
+    """특정 주문번호(mall_od_no = API company_order_code)들만 주문(10)→주문서처리(20)→출고준비(30)→WMS 출고등록.
+
+    슬랙 출고요청 자동처리용: API 발주등록 직후 호출. 채널(sach_cd)로 좁혀 조회한 뒤 주문번호로 필터.
+    한 패스에 30→,20→,10→ 역순 1단계씩 (do_full_auto와 같은 규칙). ⚠️ 운영 OMS 쓰기.
+    반환: {advance:[...], sender:[...], final:{od_sno: stage}, ok, remaining}
+    """
+    want = {str(c) for c in codes}
+    out = {"advance": [], "sender": [], "codes": sorted(want)}
+
+    def _rows(stage):
+        d = list_orders(page, stage, start, end, channel_cd=channel_cd, size=500)
+        return [normalize_order(r) for r in (d.get("data") or []) if str(r.get("mall_od_no") or "") in want]
+
+    for p_ in range(max_passes):
+        moved = 0
+        for stage, code in [("outReady", "30"), ("putOrder", "20"), ("order", "10")]:
+            rows = _rows(stage)
+            osnos = sorted({str(r["od_sno"]) for r in rows})
+            if not osnos:
+                continue
+            if stage == "outReady":
+                res = wms_combine_outbound(page, rows)
+                ok = isinstance(res.get("body"), dict) and res["body"].get("success_fail_yn") == "Y"
+                if ok:
+                    moved += len(osnos)
+                out["advance"].append({"pass": p_, "stage": "outReady(WMS 출고등록)", "count": len(osnos),
+                                       "box_count": res.get("box_count"), "ok": ok,
+                                       "msg": (res.get("body") or {}).get("message", "") if isinstance(res.get("body"), dict) else str(res.get("body"))[:200]})
+                continue
+            if stage == "putOrder":
+                sres = assign_default_sender(page, osnos)
+                out["sender"].append({"pass": p_, "count": len(osnos), "sender_nm": sres.get("sender_nm"), "ok": sres.get("ok")})
+            res = advance_orders(page, osnos, code, "next")
+            ok = isinstance(res.get("body"), dict) and bool(res["body"].get("result"))
+            if ok:
+                moved += len(osnos)
+            out["advance"].append({"pass": p_, "stage": stage, "count": len(osnos), "ok": ok,
+                                   "msg": (res.get("body") or {}).get("message", "") if isinstance(res.get("body"), dict) else str(res.get("body"))[:200]})
+        if moved == 0:
+            break
+    # 최종 단계 확인
+    final = {}
+    for stage in STAGES:
+        for r in _rows(stage):
+            final[str(r["mall_od_no"])] = {"od_sno": r["od_sno"], "stage": r["stage"], "stage_nm": r["stage_nm"]}
+    out["final"] = final
+    remaining = [c for c, v in final.items() if v["stage"] in ("10", "20", "30")]
+    missing = sorted(want - set(final))
+    out["remaining"] = remaining
+    out["missing"] = missing
+    out["ok"] = not remaining and not missing and bool(final)
+    return out
+
+
 def do_collect(oid: str, opw: str, channels=DEFAULT_CHANNELS, date_range: str = None) -> dict:
     """대상 채널(카페24/카카오) 몰계정을 자동 탐지해 수집 실행."""
     with oms_session(oid, opw) as page:
@@ -651,6 +706,9 @@ def run_cli():
             data = do_full_auto(oid, opw, req["start"], req["end"],
                                 tuple(req.get("channels") or DEFAULT_CHANNELS),
                                 req.get("do_collect", True))
+        elif cmd == "push_codes":
+            with oms_session(oid, opw) as page:
+                data = push_orders_by_codes(page, req["codes"], req["channel_cd"], req["start"], req["end"])
         else:
             raise ValueError(f"알 수 없는 명령: {cmd}")
         print(_json.dumps({"ok": True, "data": data}, ensure_ascii=False))

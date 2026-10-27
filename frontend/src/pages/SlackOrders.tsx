@@ -7,6 +7,7 @@ import {
   base64ToBlob, convertGeneral, getGeneralColumns, convertNaver, sendToBoxhero, downloadBlob, updateConfig
 } from '../services/api'
 import { persistGet, persistSetDebounced } from '../lib/persist'
+import DispatchPanel from '../components/DispatchPanel'
 
 interface Props {
   config: AppConfig
@@ -632,6 +633,9 @@ export default function SlackOrders({ config, channels, locations }: Props) {
                     })}
                   </div>
                 </div>
+
+                {/* 출고 자동처리: 아워박스 발주등록 → BoxHero 출고 → 물류센터 메일 → 슬랙 ✅ */}
+                <DispatchPanel channelId={channelId} ts={order.ts} title={order.title} />
 
                 {/* Files */}
                 <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#374151', marginBottom: 8 }}>📎 첨부파일</div>

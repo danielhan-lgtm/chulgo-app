@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report, naver_report
+from routers import config_router, boxhero, convert, slack_router, gmail_router, logs, receiving, doc_review, invoice, reconcile, channel, mapping, order_plan, disposal, coupang_load, kurly_label, outbound, ob_orders, coupang_growth_load, slack_outbound, inventory, report, coupang_report, oliveyoung_report, kurly_report, naver_report, erhana_report, stock_gap, ob_shipped, slack_dispatch
 
 app = FastAPI(title="출고 라몬 API", version="2.0.0")
 
@@ -42,6 +42,10 @@ app.include_router(coupang_report.router, prefix="/api/coupang-report", tags=["c
 app.include_router(oliveyoung_report.router, prefix="/api/oliveyoung-report", tags=["oliveyoung-report"])
 app.include_router(kurly_report.router, prefix="/api/kurly-report", tags=["kurly-report"])
 app.include_router(naver_report.router, prefix="/api/naver-report", tags=["naver-report"])
+app.include_router(erhana_report.router, prefix="/api/erhana-report", tags=["erhana-report"])
+app.include_router(stock_gap.router, prefix="/api/stock-gap", tags=["stock-gap"])
+app.include_router(ob_shipped.router, prefix="/api/ob-shipped", tags=["ob-shipped"])
+app.include_router(slack_dispatch.router, prefix="/api/slack-dispatch", tags=["slack-dispatch"])
 
 
 # ── 4채널(쿠팡·올리브영·컬리 + 네이버) 경영 요약 보고문 — 채널별 보고 엔진을 한 번에 돌려 번호 붙여 묶는다 ──
@@ -58,6 +62,62 @@ def channel_exec_report(as_of: str = "", month: str = ""):
     # 네이버는 발주 엔진(ChannelSpec)이 아니라 BH 거래 내역 업로드 기반이므로 블록 생성기로 4번에 이어 붙인다
     return build_exec_text([coupang_report.SPEC, oliveyoung_report.SPEC, kurly_report.SPEC], as_of, month,
                            extra_blocks=[naver_report.build_exec_block])
+
+
+@app.get("/api/channel-report/exec/sku-trend", tags=["channel-report"])
+def channel_exec_sku_trend(as_of: str = "", month: str = ""):
+    """전 채널 SKU별 월별 추이 — 쿠팡(입고등록)·올리브영(발주)·컬리(발주=납품)·네이버(출고)를 바코드로 묶는다."""
+    from datetime import date, datetime
+    from routers.channel_report import build_sku_trend
+    as_of = (as_of or date.today().isoformat())[:10]
+    try:
+        datetime.fromisoformat(as_of)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(400, "as_of 형식 오류 (YYYY-MM-DD)")
+    return build_sku_trend([coupang_report.SPEC, oliveyoung_report.SPEC, kurly_report.SPEC], as_of, month,
+                           extra=[("naver", naver_report.EXEC_NAME, "출고", naver_report.sku_monthly)])
+
+
+# ── 경영진보고(짧은 슬랙 양식) — '한줄정리 / [채널] 의견·지난달 마감·다음 발주·재고 일수' ──
+@app.get("/api/channel-report/exec/brief", tags=["channel-report"])
+def channel_exec_brief(as_of: str = "", month: str = ""):
+    from datetime import date, datetime
+    from routers.channel_report import build_exec_brief
+    as_of = (as_of or date.today().isoformat())[:10]
+    try:
+        datetime.fromisoformat(as_of)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(400, "as_of 형식 오류 (YYYY-MM-DD)")
+    return build_exec_brief([coupang_report.SPEC, oliveyoung_report.SPEC, kurly_report.SPEC], as_of, month,
+                            extra=[naver_report.build_exec_brief_block], notes=report.load_brief_notes())
+
+
+@app.get("/api/channel-report/exec/brief/notes", tags=["channel-report"])
+def channel_exec_brief_notes():
+    return report.load_brief_notes()
+
+
+@app.put("/api/channel-report/exec/brief/notes", tags=["channel-report"])
+def channel_exec_brief_notes_save(body: report.BriefNotes):
+    return report.save_brief_notes(body)
+
+
+# ── 쿠팡 로켓그로스 Open API — 기간 판매량(결제일 기준)·재고 요약. 윙 키 + 등록된 공인 IP 필요 ──
+@app.get("/api/coupang-growth/sales", tags=["coupang-growth"])
+def coupang_growth_sales(from_date: str = "", to_date: str = ""):
+    from datetime import date, timedelta, datetime
+    import utils_core as U
+    import coupang_api as cp
+    to_date = (to_date or date.today().isoformat())[:10]
+    from_date = (from_date or (date.fromisoformat(to_date) - timedelta(days=29)).isoformat())[:10]
+    try:
+        datetime.fromisoformat(from_date); datetime.fromisoformat(to_date)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(400, "날짜 형식 오류 (YYYY-MM-DD)")
+    return cp.rg_sales_summary(U.load_config(), from_date, to_date)
 
 
 @app.get("/")
@@ -87,9 +147,21 @@ def _start_snapshot_scheduler():
 
 
 @app.on_event("startup")
+def _start_stock_gap_daily():
+    # BH·OB 양쪽 재고 일별 스냅샷 (재고 차이 추적의 '언제' 실측 근거) — 하루 1회, 07시 이후
+    stock_gap.start_daily_capture()
+
+
+@app.on_event("startup")
 def _start_ob_auto_scheduler():
     # OB 주문 완전자동화 스케줄러 (config의 ob_auto_enabled로 ON/OFF 제어)
     ob_orders.start_auto_scheduler()
+
+
+@app.on_event("startup")
+def _start_ob_shipped_scheduler():
+    # 아워박스 자동출고(카페24·DJ&A) → BH 전산처리 스케줄러 (config의 ob_shipped_auto_enabled로 ON/OFF)
+    ob_shipped.start_scheduler()
 
 
 @app.on_event("startup")
